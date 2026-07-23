@@ -57,7 +57,9 @@ The RUDE transform between coordinate systems, applied on import and inverted on
 
 ```
 UE = ( gta_x * 100,  -gta_y * 100,  gta_z * 100 )   // meters→cm, Y mirror
-triangle winding: reversed (the mirror flips handedness)
+triangle winding: PASS THROUGH as-is in the native importer (empirically pinned:
+  under the Y-mirror, RAGE winding already faces outward in UE). If you route
+  through OBJ instead, reverse it — UE's OBJ importer adds its own flip.
 UVs: passed through raw (both engines are V-down)
 rotations: identity-quat proven; full quaternion convention is open research
 ```

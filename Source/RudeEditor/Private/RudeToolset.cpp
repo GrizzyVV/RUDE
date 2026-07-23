@@ -269,10 +269,14 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		const int32 NumTris = Geo.Indices.Num() / 3;
 		for (int32 T = 0; T < NumTris; ++T)
 		{
-			// mirror flips handedness: reverse winding (2,1,0)
-			const int32 I0 = Geo.Indices[T * 3 + 2];
+			// Winding: pass through AS-IS. Empirically pinned 2026-07-24: with the
+			// Y-mirror applied to positions, RAGE's native winding already faces
+			// outward in UE ("inside-out spiner" incident - a reversal here double-
+			// flips). The OBJ lane still reverses because UE's OBJ importer adds
+			// its own handedness flip; net conventions differ per lane.
+			const int32 I0 = Geo.Indices[T * 3 + 0];
 			const int32 I1 = Geo.Indices[T * 3 + 1];
-			const int32 I2 = Geo.Indices[T * 3 + 0];
+			const int32 I2 = Geo.Indices[T * 3 + 2];
 			if (I0 >= VertexIDs.Num() || I1 >= VertexIDs.Num() || I2 >= VertexIDs.Num())
 			{
 				continue;

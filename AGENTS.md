@@ -15,9 +15,12 @@ All tools take/return JSON-friendly values; results are JSON strings with an `ok
 
 ## The conventions (violating these breaks round-trips)
 
-1. **Transform:** `UE = (gta_x*100, −gta_y*100, gta_z*100)`; triangle winding reversed;
-   UVs raw (both engines V-down); rotations identity-proven only — do not emit
-   non-identity quaternions until the convention is resolved and documented here.
+1. **Transform:** `UE = (gta_x*100, −gta_y*100, gta_z*100)`; triangle winding **as-is**
+   in the native importer (under the Y-mirror, RAGE winding already faces outward —
+   verified in-editor; reversing it renders inside-out). OBJ-lane exports reverse
+   winding because UE's OBJ importer adds its own flip. UVs raw (both engines V-down);
+   rotations identity-proven only — do not emit non-identity quaternions until the
+   convention is resolved and documented here.
 2. **XML payload parsing:** never rely on line structure inside XML text content
    (UE's FXmlFile does not preserve it). Parse token streams sliced by the vertex
    layout's semantic widths.
