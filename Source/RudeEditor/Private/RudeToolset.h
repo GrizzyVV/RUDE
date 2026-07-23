@@ -60,4 +60,11 @@ public:
 	// Returns JSON: {ok, xmlPath, vertices, triangles} or {ok:false, error}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYbn(const FString& AssetPath, const FString& OutXmlPath);
+
+	// Export a UTexture2D's source pixels to a PNG on disk (feeds the PBR->RAGE
+	// ytd pipeline). Reads the texture Source (BGRA8), writes PNG via ImageWrapper.
+	// TexturePath: content path of the Texture2D. OutPngPath: absolute *.png path.
+	// Returns JSON: {ok, pngPath, width, height} or {ok:false, error}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ExportTexture(const FString& TexturePath, const FString& OutPngPath);
 };

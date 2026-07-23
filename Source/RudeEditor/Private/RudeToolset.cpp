@@ -133,6 +133,82 @@ namespace RudeYdr
 	}
 }
 
+FString URudeToolset::ExportTexture(const FString& TexturePath, const FString& OutPngPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+
+	UTexture2D* Tex = LoadObject<UTexture2D>(nullptr, *TexturePath);
+	if (!Tex)
+	{
+		return Fail(TEXT("Texture2D not found"));
+	}
+#if WITH_EDITORONLY_DATA
+	FTextureSource& Src = Tex->Source;
+	if (!Src.IsValid())
+	{
+		return Fail(TEXT("texture has no editor source data"));
+	}
+	const int32 W = Src.GetSizeX();
+	const int32 H = Src.GetSizeY();
+	const ETextureSourceFormat Fmt = Src.GetFormat();
+
+	TArray64<uint8> Mip;
+	if (!Src.GetMipData(Mip, 0, 0, 0, nullptr))
+	{
+		return Fail(TEXT("GetMipData failed"));
+	}
+
+	// Normalise to BGRA8 for the PNG wrapper (UE stores most source as BGRA8)
+	TArray<uint8> BGRA;
+	BGRA.SetNumUninitialized(W * H * 4);
+	if (Fmt == TSF_BGRA8 || Fmt == TSF_BGRE8)
+	{
+		FMemory::Memcpy(BGRA.GetData(), Mip.GetData(), FMath::Min<int64>(Mip.Num(), BGRA.Num()));
+	}
+	else if (Fmt == TSF_G8)
+	{
+		for (int32 i = 0; i < W * H; ++i)
+		{
+			const uint8 G = Mip[i];
+			BGRA[i * 4 + 0] = G; BGRA[i * 4 + 1] = G; BGRA[i * 4 + 2] = G; BGRA[i * 4 + 3] = 255;
+		}
+	}
+	else if (Fmt == TSF_G16)
+	{
+		const uint16* Src16 = reinterpret_cast<const uint16*>(Mip.GetData());
+		for (int32 i = 0; i < W * H; ++i)
+		{
+			const uint8 G = (uint8)(Src16[i] >> 8);
+			BGRA[i * 4 + 0] = G; BGRA[i * 4 + 1] = G; BGRA[i * 4 + 2] = G; BGRA[i * 4 + 3] = 255;
+		}
+	}
+	else
+	{
+		return Fail(FString::Printf(TEXT("unsupported source format %d (want BGRA8/G8/G16)"), (int32)Fmt));
+	}
+
+	IImageWrapperModule& IWM =
+		FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	TSharedPtr<IImageWrapper> Png = IWM.CreateImageWrapper(EImageFormat::PNG);
+	if (!Png.IsValid() || !Png->SetRaw(BGRA.GetData(), BGRA.Num(), W, H, ERGBFormat::BGRA, 8))
+	{
+		return Fail(TEXT("PNG wrap failed"));
+	}
+	const TArray64<uint8>& Out = Png->GetCompressed();
+	if (!FFileHelper::SaveArrayToFile(TArray<uint8>(Out.GetData(), Out.Num()), *OutPngPath))
+	{
+		return Fail(TEXT("write PNG failed"));
+	}
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"pngPath\":\"%s\",\"width\":%d,\"height\":%d}"), *OutPngPath, W, H);
+#else
+	return Fail(TEXT("editor-only"));
+#endif
+}
+
 FString URudeToolset::ExportYbn(const FString& AssetPath, const FString& OutXmlPath)
 {
 	auto Fail = [](const FString& Why)
@@ -395,7 +471,8 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 		// -> RAGE-preset + PBR->RAGE-texture mapping is the P2 material lane.
 		FString SlotName = GroupSlots[GroupID].ToString();
 		int32 Sep = SlotName.Find(TEXT("__"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-		Geo.Preset = Sep != INDEX_NONE ? SlotName.Left(Sep) : TEXT("default");
+		const bool bRudeSlot = (Sep != INDEX_NONE);
+		Geo.Preset = bRudeSlot ? SlotName.Left(Sep) : TEXT("default");
 
 		// texture names from the slot's RUDE MaterialInstance, if any
 		// (manual scan: we author MaterialSlotName, not ImportedMaterialSlotName)
@@ -429,6 +506,15 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 					Geo.Specular = T->GetName();
 				}
 			}
+		}
+
+		// Non-RUDE slot: pick the preset from which textures are present, so a
+		// textured Fab mesh gets a normal-mapped shader instead of bare "default".
+		if (!bRudeSlot)
+		{
+			if (!Geo.Normal.IsEmpty())        { Geo.Preset = TEXT("normal_spec"); }
+			else if (!Geo.Diffuse.IsEmpty())  { Geo.Preset = TEXT("spec"); }
+			// else stays "default"
 		}
 
 		// weld corners into unique vertices per (vertexID, normal, uv)
