@@ -234,6 +234,238 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 		*TxdName, Imported, *Missing);
 }
 
+FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+
+	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *AssetPath);
+	if (!Mesh)
+	{
+		return Fail(TEXT("StaticMesh not found"));
+	}
+	const FMeshDescription* MeshDesc = Mesh->GetMeshDescription(0);
+	if (!MeshDesc)
+	{
+		return Fail(TEXT("no MeshDescription on LOD0"));
+	}
+	FStaticMeshConstAttributes Attributes(*MeshDesc);
+	TVertexAttributesConstRef<FVector3f> Positions = Attributes.GetVertexPositions();
+	TVertexInstanceAttributesConstRef<FVector3f> InstNormals = Attributes.GetVertexInstanceNormals();
+	TVertexInstanceAttributesConstRef<FVector2f> InstUVs = Attributes.GetVertexInstanceUVs();
+	TPolygonGroupAttributesConstRef<FName> GroupSlots = Attributes.GetPolygonGroupMaterialSlotNames();
+
+	const FString MeshName = Mesh->GetName();
+
+	// Per polygon group: gather welded (pos,normal,uv) vertices + index list
+	struct FOutGeo
+	{
+		FString Preset = TEXT("default");
+		FString Diffuse, Normal, Specular;
+		TArray<FVector3f> Pos;
+		TArray<FVector3f> Nrm;
+		TArray<FVector2f> UV;
+		TArray<int32> Indices;
+	};
+	TArray<FOutGeo> OutGeos;
+
+	for (const FPolygonGroupID GroupID : MeshDesc->PolygonGroups().GetElementIDs())
+	{
+		FOutGeo Geo;
+
+		// preset from slot name "<preset>__<n>"
+		FString SlotName = GroupSlots[GroupID].ToString();
+		int32 Sep = SlotName.Find(TEXT("__"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+		Geo.Preset = Sep != INDEX_NONE ? SlotName.Left(Sep) : SlotName;
+
+		// texture names from the slot's RUDE MaterialInstance, if any
+		// (manual scan: we author MaterialSlotName, not ImportedMaterialSlotName)
+		int32 SlotIdx = INDEX_NONE;
+		for (int32 i = 0; i < Mesh->GetStaticMaterials().Num(); ++i)
+		{
+			if (Mesh->GetStaticMaterials()[i].MaterialSlotName == GroupSlots[GroupID])
+			{
+				SlotIdx = i;
+				break;
+			}
+		}
+		if (Mesh->GetStaticMaterials().IsValidIndex(SlotIdx))
+		{
+			if (const UMaterialInstanceConstant* MIC =
+				Cast<UMaterialInstanceConstant>(Mesh->GetStaticMaterials()[SlotIdx].MaterialInterface))
+			{
+				UTexture* T = nullptr;
+				if (MIC->GetTextureParameterValue(FMaterialParameterInfo(TEXT("Diffuse")), T) && T)
+				{
+					Geo.Diffuse = T->GetName();
+				}
+				T = nullptr;
+				if (MIC->GetTextureParameterValue(FMaterialParameterInfo(TEXT("Normal")), T) && T)
+				{
+					Geo.Normal = T->GetName();
+				}
+				T = nullptr;
+				if (MIC->GetTextureParameterValue(FMaterialParameterInfo(TEXT("Specular")), T) && T)
+				{
+					Geo.Specular = T->GetName();
+				}
+			}
+		}
+
+		// weld corners into unique vertices per (vertexID, normal, uv)
+		TMap<FString, int32> Weld;
+		for (const FPolygonID PolyID : MeshDesc->GetPolygonGroupPolygonIDs(GroupID))
+		{
+			for (const FTriangleID TriID : MeshDesc->GetPolygonTriangles(PolyID))
+			{
+				for (const FVertexInstanceID Inst : MeshDesc->GetTriangleVertexInstances(TriID))
+				{
+					const FVertexID VID = MeshDesc->GetVertexInstanceVertex(Inst);
+					const FVector3f P = Positions[VID];
+					const FVector3f N = InstNormals[Inst];
+					const FVector2f UV = InstUVs.Get(Inst, 0);
+					const FString Key = FString::Printf(TEXT("%d|%.3f,%.3f,%.3f|%.4f,%.4f"),
+						VID.GetValue(), N.X, N.Y, N.Z, UV.X, UV.Y);
+					int32 Index;
+					if (const int32* Found = Weld.Find(Key))
+					{
+						Index = *Found;
+					}
+					else
+					{
+						Index = Geo.Pos.Num();
+						// inverse RUDE transform: cm -> meters, Y mirror back
+						Geo.Pos.Add(FVector3f(P.X / 100.f, -P.Y / 100.f, P.Z / 100.f));
+						Geo.Nrm.Add(FVector3f(N.X, -N.Y, N.Z));
+						Geo.UV.Add(UV);
+						Weld.Add(Key, Index);
+					}
+					Geo.Indices.Add(Index);   // winding: pass-through (involution)
+				}
+			}
+		}
+		if (Geo.Pos.Num() > 0 && Geo.Indices.Num() >= 3)
+		{
+			OutGeos.Add(MoveTemp(Geo));
+		}
+	}
+	if (OutGeos.Num() == 0)
+	{
+		return Fail(TEXT("no polygon groups with geometry"));
+	}
+
+	// bounds in gta space
+	FVector3f BMin(FLT_MAX), BMax(-FLT_MAX);
+	for (const FOutGeo& G : OutGeos)
+	{
+		for (const FVector3f& P : G.Pos)
+		{
+			BMin = BMin.ComponentMin(P);
+			BMax = BMax.ComponentMax(P);
+		}
+	}
+	const FVector3f Center = (BMin + BMax) * 0.5f;
+	const float Radius = (BMax - Center).Size();
+
+	FString Xml;
+	Xml += TEXT("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Drawable>\n");
+	Xml += FString::Printf(TEXT(" <Name>%s</Name>\n"), *MeshName);
+	Xml += FString::Printf(TEXT(" <BoundingSphereCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"),
+		Center.X, Center.Y, Center.Z);
+	Xml += FString::Printf(TEXT(" <BoundingSphereRadius value=\"%f\" />\n"), Radius);
+	Xml += FString::Printf(TEXT(" <BoundingBoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"), BMin.X, BMin.Y, BMin.Z);
+	Xml += FString::Printf(TEXT(" <BoundingBoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), BMax.X, BMax.Y, BMax.Z);
+	Xml += TEXT(" <LodDistHigh value=\"9998\" />\n <LodDistMed value=\"9998\" />\n");
+	Xml += TEXT(" <LodDistLow value=\"9998\" />\n <LodDistVlow value=\"9998\" />\n");
+	Xml += TEXT(" <FlagsHigh value=\"1\" />\n <FlagsMed value=\"0\" />\n");
+	Xml += TEXT(" <FlagsLow value=\"0\" />\n <FlagsVlow value=\"0\" />\n");
+
+	// ShaderGroup: one shader per geometry (census-standard param block)
+	Xml += TEXT(" <ShaderGroup>\n  <Shaders>\n");
+	for (const FOutGeo& G : OutGeos)
+	{
+		Xml += TEXT("   <Item>\n");
+		Xml += FString::Printf(TEXT("    <Name>%s</Name>\n"), *G.Preset);
+		Xml += FString::Printf(TEXT("    <FileName>%s.sps</FileName>\n"), *G.Preset);
+		Xml += TEXT("    <RenderBucket value=\"0\" />\n    <Parameters>\n");
+		if (!G.Diffuse.IsEmpty())
+		{
+			Xml += FString::Printf(TEXT("     <Item name=\"DiffuseSampler\" type=\"Texture\">\n      <Name>%s</Name>\n     </Item>\n"), *G.Diffuse);
+		}
+		if (!G.Normal.IsEmpty())
+		{
+			Xml += FString::Printf(TEXT("     <Item name=\"BumpSampler\" type=\"Texture\">\n      <Name>%s</Name>\n     </Item>\n"), *G.Normal);
+		}
+		if (!G.Specular.IsEmpty())
+		{
+			Xml += FString::Printf(TEXT("     <Item name=\"SpecSampler\" type=\"Texture\">\n      <Name>%s</Name>\n     </Item>\n"), *G.Specular);
+		}
+		Xml += TEXT("     <Item name=\"specularFresnel\" type=\"Vector\" x=\"0.9\" y=\"0\" z=\"0\" w=\"0\" />\n");
+		Xml += TEXT("     <Item name=\"specularFalloffMult\" type=\"Vector\" x=\"40\" y=\"0\" z=\"0\" w=\"0\" />\n");
+		Xml += TEXT("     <Item name=\"specularIntensityMult\" type=\"Vector\" x=\"0.3\" y=\"0\" z=\"0\" w=\"0\" />\n");
+		if (!G.Normal.IsEmpty())
+		{
+			Xml += TEXT("     <Item name=\"bumpiness\" type=\"Vector\" x=\"1\" y=\"0\" z=\"0\" w=\"0\" />\n");
+		}
+		Xml += TEXT("     <Item name=\"wetnessMultiplier\" type=\"Vector\" x=\"1\" y=\"0\" z=\"0\" w=\"0\" />\n");
+		Xml += TEXT("     <Item name=\"useTessellation\" type=\"Vector\" x=\"0\" y=\"0\" z=\"0\" w=\"0\" />\n");
+		Xml += TEXT("     <Item name=\"HardAlphaBlend\" type=\"Vector\" x=\"1\" y=\"0\" z=\"0\" w=\"0\" />\n");
+		Xml += TEXT("    </Parameters>\n   </Item>\n");
+	}
+	Xml += TEXT("  </Shaders>\n </ShaderGroup>\n");
+
+	// Geometry
+	int32 TotalVerts = 0, TotalTris = 0;
+	Xml += TEXT(" <DrawableModelsHigh>\n  <Item>\n   <RenderMask value=\"255\" />\n");
+	Xml += TEXT("   <Flags value=\"0\" />\n   <HasSkin value=\"0\" />\n");
+	Xml += TEXT("   <BoneIndex value=\"0\" />\n   <Unknown1 value=\"0\" />\n   <Geometries>\n");
+	for (int32 GeoIdx = 0; GeoIdx < OutGeos.Num(); ++GeoIdx)
+	{
+		const FOutGeo& G = OutGeos[GeoIdx];
+		FVector3f GMin(FLT_MAX), GMax(-FLT_MAX);
+		for (const FVector3f& P : G.Pos)
+		{
+			GMin = GMin.ComponentMin(P);
+			GMax = GMax.ComponentMax(P);
+		}
+		Xml += TEXT("    <Item>\n");
+		Xml += FString::Printf(TEXT("     <ShaderIndex value=\"%d\" />\n"), GeoIdx);
+		Xml += FString::Printf(TEXT("     <BoundingBoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"), GMin.X, GMin.Y, GMin.Z);
+		Xml += FString::Printf(TEXT("     <BoundingBoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), GMax.X, GMax.Y, GMax.Z);
+		Xml += TEXT("     <VertexBuffer>\n      <Flags value=\"89\" />\n");
+		Xml += TEXT("      <Layout type=\"GTAV1\">\n       <Position />\n       <Normal />\n       <Colour0 />\n       <TexCoord0 />\n      </Layout>\n");
+		Xml += TEXT("      <Data>\n");
+		for (int32 V = 0; V < G.Pos.Num(); ++V)
+		{
+			Xml += FString::Printf(TEXT("       %f %f %f   %f %f %f   255 255 255 255   %f %f\n"),
+				G.Pos[V].X, G.Pos[V].Y, G.Pos[V].Z,
+				G.Nrm[V].X, G.Nrm[V].Y, G.Nrm[V].Z,
+				G.UV[V].X, G.UV[V].Y);
+		}
+		Xml += TEXT("      </Data>\n     </VertexBuffer>\n     <IndexBuffer>\n      <Data>\n");
+		for (int32 I = 0; I < G.Indices.Num(); I += 3)
+		{
+			Xml += FString::Printf(TEXT("       %d %d %d\n"),
+				G.Indices[I], G.Indices[I + 1], G.Indices[I + 2]);
+		}
+		Xml += TEXT("      </Data>\n     </IndexBuffer>\n    </Item>\n");
+		TotalVerts += G.Pos.Num();
+		TotalTris += G.Indices.Num() / 3;
+	}
+	Xml += TEXT("   </Geometries>\n  </Item>\n </DrawableModelsHigh>\n <Lights />\n</Drawable>\n");
+
+	if (!FFileHelper::SaveStringToFile(Xml, *OutXmlPath,
+		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		return Fail(TEXT("failed to write output file"));
+	}
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"xmlPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d}"),
+		*OutXmlPath, OutGeos.Num(), TotalVerts, TotalTris);
+}
+
 FString URudeToolset::Ping()
 {
 	return TEXT("RUDE 0.1.0 - RAGE <-> Unreal Development Environment. Toolset alive.");

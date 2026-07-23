@@ -41,4 +41,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ImportYtd(const FString& XmlPath, const FString& PixelFolder,
 	                         const FString& DestFolder);
+
+	// Export a UStaticMesh as a CodeWalker-compatible ydr XML file (the reverse
+	// lane). Positions/normals/UVs inverse-transformed per the RUDE convention;
+	// shader presets recovered from material slot names; texture names recovered
+	// from bound RUDE MaterialInstances where present.
+	// AssetPath: content path of the StaticMesh (e.g. "/Game/RUDE/Meshes/Props/prop_x").
+	// OutXmlPath: absolute file path for the emitted *.ydr.xml.
+	// Returns JSON: {ok, xmlPath, geometries, vertices, triangles} or {ok:false, error}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ExportYdr(const FString& AssetPath, const FString& OutXmlPath);
 };
