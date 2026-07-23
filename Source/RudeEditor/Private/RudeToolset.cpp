@@ -2,8 +2,11 @@
 #include "RudeToolset.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/ARFilter.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/Texture2D.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialInstanceConstant.h"
 #include "MeshDescription.h"
 #include "Misc/PackageName.h"
 #include "StaticMeshAttributes.h"
@@ -166,16 +169,45 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		}
 	}
 
-	// Shader preset names (for material slot naming)
-	TArray<FString> Shaders;
+	// Shader presets + their texture parameter bindings
+	struct FShaderDef
+	{
+		FString Preset = TEXT("default");
+		FString Diffuse, Normal, Specular;   // texture NAMES from the ydr
+	};
+	TArray<FShaderDef> Shaders;
 	if (const FXmlNode* SG = Root->FindChildNode(TEXT("ShaderGroup")))
 	{
 		if (const FXmlNode* Sh = SG->FindChildNode(TEXT("Shaders")))
 		{
 			for (const FXmlNode* Item : Sh->GetChildrenNodes())
 			{
-				const FXmlNode* SName = Item->FindChildNode(TEXT("Name"));
-				Shaders.Add(SName ? SName->GetContent().TrimStartAndEnd() : TEXT("default"));
+				FShaderDef Def;
+				if (const FXmlNode* SName = Item->FindChildNode(TEXT("Name")))
+				{
+					Def.Preset = SName->GetContent().TrimStartAndEnd();
+				}
+				if (const FXmlNode* Params = Item->FindChildNode(TEXT("Parameters")))
+				{
+					for (const FXmlNode* P : Params->GetChildrenNodes())
+					{
+						if (P->GetAttribute(TEXT("type")) != TEXT("Texture"))
+						{
+							continue;
+						}
+						const FXmlNode* TexName = P->FindChildNode(TEXT("Name"));
+						if (!TexName)
+						{
+							continue;
+						}
+						const FString Tex = TexName->GetContent().TrimStartAndEnd();
+						const FString Sampler = P->GetAttribute(TEXT("name"));
+						if (Sampler == TEXT("DiffuseSampler"))       { Def.Diffuse = Tex; }
+						else if (Sampler == TEXT("BumpSampler"))     { Def.Normal = Tex; }
+						else if (Sampler == TEXT("SpecSampler"))     { Def.Specular = Tex; }
+					}
+				}
+				Shaders.Add(MoveTemp(Def));
 			}
 		}
 	}
@@ -249,7 +281,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	{
 		const RudeYdr::FGeo& Geo = Geos[GeoIdx];
 		const FString ShaderName = Geo.ShaderIndex < Shaders.Num()
-			? Shaders[Geo.ShaderIndex] : TEXT("default");
+			? Shaders[Geo.ShaderIndex].Preset : TEXT("default");
 		const FString SlotName = FString::Printf(TEXT("%s__%d"), *ShaderName, GeoIdx);
 		SlotNames.Add(SlotName);
 
@@ -300,10 +332,92 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 
 	Mesh->CommitMeshDescription(0);
 
-	// One material slot per geometry, named after its RAGE shader preset
-	for (const FString& Slot : SlotNames)
+	// --- Material auto-derive: family master -> MaterialInstanceConstant per slot ---
+	// Texture lookup table: every UTexture2D under /Game/RUDE/Textures by lowercase name
+	TMap<FString, FAssetData> TextureByName;
 	{
-		FStaticMaterial Mat(UMaterial::GetDefaultMaterial(MD_Surface), FName(*Slot));
+		FAssetRegistryModule& ARM =
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		FARFilter Filter;
+		Filter.PackagePaths.Add(TEXT("/Game/RUDE/Textures"));
+		Filter.bRecursivePaths = true;
+		Filter.ClassPaths.Add(UTexture2D::StaticClass()->GetClassPathName());
+		TArray<FAssetData> Found;
+		ARM.Get().GetAssets(Filter, Found);
+		for (const FAssetData& AD : Found)
+		{
+			TextureByName.Add(AD.AssetName.ToString().ToLower(), AD);
+		}
+	}
+
+	auto MasterForPreset = [](const FString& Preset) -> UMaterialInterface*
+	{
+		const FString P = Preset.ToLower();
+		const TCHAR* Path = TEXT("/RUDE/Masters/M_RUDE_Opaque.M_RUDE_Opaque");
+		if (P.Contains(TEXT("decal")))       { Path = TEXT("/RUDE/Masters/M_RUDE_Decal.M_RUDE_Decal"); }
+		else if (P.Contains(TEXT("cutout"))) { Path = TEXT("/RUDE/Masters/M_RUDE_Cutout.M_RUDE_Cutout"); }
+		return LoadObject<UMaterialInterface>(nullptr, Path);
+	};
+
+	auto FindTexture = [&TextureByName](const FString& TexName) -> UTexture2D*
+	{
+		if (TexName.IsEmpty())
+		{
+			return nullptr;
+		}
+		if (const FAssetData* AD = TextureByName.Find(TexName.ToLower()))
+		{
+			return Cast<UTexture2D>(AD->GetAsset());
+		}
+		return nullptr;
+	};
+
+	int32 BoundTextures = 0;
+	for (int32 GeoIdx = 0; GeoIdx < Geos.Num(); ++GeoIdx)
+	{
+		const FString& Slot = SlotNames[GeoIdx];
+		const int32 ShaderIdx = Geos[GeoIdx].ShaderIndex;
+		const FShaderDef* Def = Shaders.IsValidIndex(ShaderIdx) ? &Shaders[ShaderIdx] : nullptr;
+
+		UMaterialInterface* SlotMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
+		UMaterialInterface* Master = Def ? MasterForPreset(Def->Preset) : nullptr;
+		if (Master)
+		{
+			// MI per slot: /Game/RUDE/Materials/Instances/<prop>/MI_<prop>_<idx>
+			const FString MIName = FString::Printf(TEXT("MI_%s_%d"), *Name, GeoIdx);
+			const FString MIPackageName =
+				FString::Printf(TEXT("/Game/RUDE/Materials/Instances/%s/%s"), *Name, *MIName);
+			if (UPackage* MIPackage = CreatePackage(*MIPackageName))
+			{
+				UMaterialInstanceConstant* MIC = NewObject<UMaterialInstanceConstant>(
+					MIPackage, FName(*MIName), RF_Public | RF_Standalone);
+				MIC->SetParentEditorOnly(Master);
+				if (UTexture2D* T = FindTexture(Def->Diffuse))
+				{
+					MIC->SetTextureParameterValueEditorOnly(
+						FMaterialParameterInfo(TEXT("Diffuse")), T);
+					++BoundTextures;
+				}
+				if (UTexture2D* T = FindTexture(Def->Normal))
+				{
+					MIC->SetTextureParameterValueEditorOnly(
+						FMaterialParameterInfo(TEXT("Normal")), T);
+					++BoundTextures;
+				}
+				if (UTexture2D* T = FindTexture(Def->Specular))
+				{
+					MIC->SetTextureParameterValueEditorOnly(
+						FMaterialParameterInfo(TEXT("Specular")), T);
+					++BoundTextures;
+				}
+				MIC->PostEditChange();
+				MIPackage->MarkPackageDirty();
+				FAssetRegistryModule::AssetCreated(MIC);
+				SlotMaterial = MIC;
+			}
+		}
+
+		FStaticMaterial Mat(SlotMaterial, FName(*Slot));
 		Mat.UVChannelData.bInitialized = true;
 		Mesh->GetStaticMaterials().Add(Mat);
 	}
@@ -319,6 +433,6 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		SlotsJson += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(",") : TEXT(""), *SlotNames[i]);
 	}
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"slots\":[%s]}"),
-		*PackageName, Geos.Num(), TotalVerts, TotalTris, *SlotsJson);
+		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"boundTextures\":%d,\"slots\":[%s]}"),
+		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures, *SlotsJson);
 }
