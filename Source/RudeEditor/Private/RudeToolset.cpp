@@ -200,8 +200,16 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 			continue;
 		}
 		UPackage* Package = CreatePackage(*PackageName);
-		UTexture2D* Tex = NewObject<UTexture2D>(Package, FName(*TexName), RF_Public | RF_Standalone);
-
+		// TRUE edit-in-place: reuse the existing object if the package already
+		// holds one. NewObject-over-existing displaces the old object and
+		// corrupts its bulkdata registration ("invalid payload" save failures,
+		// 2026-07-24) - the texture becomes unsaveable.
+		UTexture2D* Tex = FindObject<UTexture2D>(Package, *TexName);
+		if (!Tex)
+		{
+			Tex = NewObject<UTexture2D>(Package, FName(*TexName), RF_Public | RF_Standalone);
+		}
+		Tex->PreEditChange(nullptr);
 		Tex->Source.Init(W, H, 1, 1, TSF_BGRA8, BGRA.GetData());
 
 		// Semantics from the ytd's own Usage - the thing generic importers can't know
