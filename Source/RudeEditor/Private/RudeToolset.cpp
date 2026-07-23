@@ -8,7 +8,11 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "MeshDescription.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
+#include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
+#include "Modules/ModuleManager.h"
 #include "StaticMeshAttributes.h"
 #include "UObject/Package.h"
 #include "XmlFile.h"
@@ -127,6 +131,107 @@ namespace RudeYdr
 		}
 		return true;
 	}
+}
+
+FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFolder,
+                                const FString& DestFolder)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+
+	FXmlFile Xml(XmlPath);
+	if (!Xml.IsValid())
+	{
+		return Fail(FString::Printf(TEXT("XML load failed: %s"), *Xml.GetLastError()));
+	}
+	const FXmlNode* Root = Xml.GetRootNode();
+	if (!Root || Root->GetTag() != TEXT("TextureDictionary"))
+	{
+		return Fail(TEXT("root is not <TextureDictionary>"));
+	}
+
+	FString TxdName = FPaths::GetBaseFilename(XmlPath);
+	TxdName.RemoveFromEnd(TEXT(".ytd"));
+
+	IImageWrapperModule& ImageWrapper =
+		FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+
+	int32 Imported = 0;
+	FString Missing;
+	for (const FXmlNode* Item : Root->GetChildrenNodes())
+	{
+		const FXmlNode* NameNode = Item->FindChildNode(TEXT("Name"));
+		if (!NameNode || NameNode->GetContent().TrimStartAndEnd().IsEmpty())
+		{
+			continue;
+		}
+		const FString TexName = NameNode->GetContent().TrimStartAndEnd();
+		const FXmlNode* UsageNode = Item->FindChildNode(TEXT("Usage"));
+		const FString Usage = UsageNode ? UsageNode->GetContent().TrimStartAndEnd() : TEXT("DIFFUSE");
+
+		// decoded pixels (offline BC-decode bridge until native decode lands)
+		const FString PngPath = PixelFolder / (TexName + TEXT(".png"));
+		TArray<uint8> PngBytes;
+		if (!FFileHelper::LoadFileToArray(PngBytes, *PngPath))
+		{
+			Missing += FString::Printf(TEXT("%s\"%s\""), Missing.IsEmpty() ? TEXT("") : TEXT(","), *TexName);
+			continue;
+		}
+		TSharedPtr<IImageWrapper> Png = ImageWrapper.CreateImageWrapper(EImageFormat::PNG);
+		if (!Png.IsValid() || !Png->SetCompressed(PngBytes.GetData(), PngBytes.Num()))
+		{
+			Missing += FString::Printf(TEXT("%s\"%s\""), Missing.IsEmpty() ? TEXT("") : TEXT(","), *TexName);
+			continue;
+		}
+		TArray<uint8> BGRA;
+		if (!Png->GetRaw(ERGBFormat::BGRA, 8, BGRA))
+		{
+			Missing += FString::Printf(TEXT("%s\"%s\""), Missing.IsEmpty() ? TEXT("") : TEXT(","), *TexName);
+			continue;
+		}
+		const int32 W = Png->GetWidth();
+		const int32 H = Png->GetHeight();
+
+		const FString PackageName = DestFolder / TxdName / TexName;
+		if (!FPackageName::IsValidLongPackageName(PackageName))
+		{
+			continue;
+		}
+		UPackage* Package = CreatePackage(*PackageName);
+		UTexture2D* Tex = NewObject<UTexture2D>(Package, FName(*TexName), RF_Public | RF_Standalone);
+
+		Tex->Source.Init(W, H, 1, 1, TSF_BGRA8, BGRA.GetData());
+
+		// Semantics from the ytd's own Usage - the thing generic importers can't know
+		if (Usage == TEXT("NORMAL"))
+		{
+			Tex->CompressionSettings = TC_Normalmap;
+			Tex->SRGB = false;
+			Tex->LODGroup = TEXTUREGROUP_WorldNormalMap;
+		}
+		else if (Usage == TEXT("SPECULAR"))
+		{
+			Tex->CompressionSettings = TC_Default;
+			Tex->SRGB = false;
+		}
+		else
+		{
+			Tex->CompressionSettings = TC_Default;
+			Tex->SRGB = true;
+		}
+
+		Tex->UpdateResource();
+		Tex->PostEditChange();
+		Package->MarkPackageDirty();
+		FAssetRegistryModule::AssetCreated(Tex);
+		++Imported;
+	}
+
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"txd\":\"%s\",\"imported\":%d,\"missingPixels\":[%s]}"),
+		*TxdName, Imported, *Missing);
 }
 
 FString URudeToolset::Ping()
@@ -379,6 +484,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	};
 
 	int32 BoundTextures = 0;
+	TMap<FString, UMaterialInstanceConstant*> MIByConfig;   // dedupe: same shader config -> shared MI
 	for (int32 GeoIdx = 0; GeoIdx < Geos.Num(); ++GeoIdx)
 	{
 		const FString& Slot = SlotNames[GeoIdx];
@@ -387,9 +493,16 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 
 		UMaterialInterface* SlotMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
 		UMaterialInterface* Master = Def ? MasterForPreset(Def->Preset) : nullptr;
-		if (Master)
+		const FString ConfigKey = Def
+			? (Def->Preset + TEXT("|") + Def->Diffuse + TEXT("|") + Def->Normal + TEXT("|") + Def->Specular).ToLower()
+			: FString();
+		if (Master && MIByConfig.Contains(ConfigKey))
 		{
-			// MI per slot: /Game/RUDE/Materials/Instances/<prop>/MI_<prop>_<idx>
+			SlotMaterial = MIByConfig[ConfigKey];
+		}
+		else if (Master)
+		{
+			// MI per unique shader CONFIG: /Game/RUDE/Materials/Instances/<prop>/MI_<prop>_<idx>
 			const FString MIName = FString::Printf(TEXT("MI_%s_%d"), *Name, GeoIdx);
 			const FString MIPackageName =
 				FString::Printf(TEXT("/Game/RUDE/Materials/Instances/%s/%s"), *Name, *MIName);
@@ -420,6 +533,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 				MIPackage->MarkPackageDirty();
 				FAssetRegistryModule::AssetCreated(MIC);
 				SlotMaterial = MIC;
+				MIByConfig.Add(ConfigKey, MIC);
 			}
 		}
 

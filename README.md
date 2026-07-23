@@ -61,7 +61,8 @@ triangle winding: PASS THROUGH as-is in the native importer (empirically pinned:
   under the Y-mirror, RAGE winding already faces outward in UE). If you route
   through OBJ instead, reverse it — UE's OBJ importer adds its own flip.
 UVs: passed through raw (both engines are V-down)
-rotations: identity-quat proven; full quaternion convention is open research
+rotations: CEntityDef quats are STANDARD right-handed Z-up (empirically pinned
+  in-game). UE<->GTA under the Y-mirror: gta_quat = (-ue_x, ue_y, -ue_z, ue_w).
 ```
 
 FiveM manifest law for emitted placement resources: `this_is_a_map 'yes'` is **required**

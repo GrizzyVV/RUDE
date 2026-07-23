@@ -19,8 +19,9 @@ All tools take/return JSON-friendly values; results are JSON strings with an `ok
    in the native importer (under the Y-mirror, RAGE winding already faces outward —
    verified in-editor; reversing it renders inside-out). OBJ-lane exports reverse
    winding because UE's OBJ importer adds its own flip. UVs raw (both engines V-down);
-   rotations identity-proven only — do not emit non-identity quaternions until the
-   convention is resolved and documented here.
+   rotations: CEntityDef quats are STANDARD right-handed Z-up (pinned in-game via
+   directional-prop experiment). UE<->GTA under the Y-mirror:
+   `gta_quat = (-ue_x, ue_y, -ue_z, ue_w)` — an involution, same map both directions.
 2. **XML payload parsing:** never rely on line structure inside XML text content
    (UE's FXmlFile does not preserve it). Parse token streams sliced by the vertex
    layout's semantic widths.

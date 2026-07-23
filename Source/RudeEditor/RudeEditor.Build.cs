@@ -22,6 +22,7 @@ public class RudeEditor : ModuleRules
 			"StaticMeshDescription",
 			"AssetRegistry",
 			"ToolsetRegistry",
+			"ImageWrapper",
 		});
 	}
 }
