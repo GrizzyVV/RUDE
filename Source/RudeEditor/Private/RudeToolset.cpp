@@ -133,6 +133,111 @@ namespace RudeYdr
 	}
 }
 
+FString URudeToolset::ExportYbn(const FString& AssetPath, const FString& OutXmlPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+
+	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *AssetPath);
+	if (!Mesh)
+	{
+		return Fail(TEXT("StaticMesh not found"));
+	}
+	const FMeshDescription* MeshDesc = Mesh->GetMeshDescription(0);
+	if (!MeshDesc)
+	{
+		return Fail(TEXT("no MeshDescription on LOD0"));
+	}
+	FStaticMeshConstAttributes Attributes(*MeshDesc);
+	TVertexAttributesConstRef<FVector3f> Positions = Attributes.GetVertexPositions();
+
+	// Merge ALL triangles into one collision soup, welded by position (gta space)
+	TArray<FVector3f> Verts;
+	TArray<int32> Indices;
+	TMap<FString, int32> Weld;
+	for (const FTriangleID TriID : MeshDesc->Triangles().GetElementIDs())
+	{
+		for (const FVertexID VID : MeshDesc->GetTriangleVertices(TriID))
+		{
+			const FVector3f P = Positions[VID];
+			// inverse RUDE transform: cm->m, Y mirror
+			const FVector3f G(P.X / 100.f, -P.Y / 100.f, P.Z / 100.f);
+			const FString Key = FString::Printf(TEXT("%.4f,%.4f,%.4f"), G.X, G.Y, G.Z);
+			int32 Idx;
+			if (const int32* F = Weld.Find(Key)) { Idx = *F; }
+			else { Idx = Verts.Num(); Verts.Add(G); Weld.Add(Key, Idx); }
+			Indices.Add(Idx);
+		}
+	}
+	if (Verts.Num() == 0 || Indices.Num() < 3)
+	{
+		return Fail(TEXT("no collision geometry"));
+	}
+
+	FVector3f BMin(FLT_MAX), BMax(-FLT_MAX);
+	for (const FVector3f& V : Verts) { BMin = BMin.ComponentMin(V); BMax = BMax.ComponentMax(V); }
+	const FVector3f Center = (BMin + BMax) * 0.5f;
+	const float Radius = (BMax - Center).Size();
+
+	auto Header = [&](const FString& Ind, float Margin)
+	{
+		FString H;
+		H += FString::Printf(TEXT("%s<BoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"), *Ind, BMin.X, BMin.Y, BMin.Z);
+		H += FString::Printf(TEXT("%s<BoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), *Ind, BMax.X, BMax.Y, BMax.Z);
+		H += FString::Printf(TEXT("%s<BoxCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), *Ind, Center.X, Center.Y, Center.Z);
+		H += FString::Printf(TEXT("%s<SphereCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), *Ind, Center.X, Center.Y, Center.Z);
+		H += FString::Printf(TEXT("%s<SphereRadius value=\"%f\" />\n"), *Ind, Radius);
+		H += FString::Printf(TEXT("%s<Margin value=\"%f\" />\n"), *Ind, Margin);
+		H += FString::Printf(TEXT("%s<Volume value=\"1\" />\n"), *Ind);
+		H += FString::Printf(TEXT("%s<Inertia x=\"1\" y=\"1\" z=\"1\" />\n"), *Ind);
+		H += FString::Printf(TEXT("%s<MaterialIndex value=\"0\" />\n"), *Ind);
+		H += FString::Printf(TEXT("%s<MaterialColourIndex value=\"0\" />\n"), *Ind);
+		H += FString::Printf(TEXT("%s<ProceduralID value=\"0\" />\n"), *Ind);
+		H += FString::Printf(TEXT("%s<RoomID value=\"0\" />\n"), *Ind);
+		H += FString::Printf(TEXT("%s<PedDensity value=\"0\" />\n"), *Ind);
+		H += FString::Printf(TEXT("%s<UnkFlags value=\"0\" />\n"), *Ind);
+		H += FString::Printf(TEXT("%s<PolyFlags value=\"0\" />\n"), *Ind);
+		H += FString::Printf(TEXT("%s<UnkType value=\"1\" />\n"), *Ind);
+		return H;
+	};
+
+	FString Xml = TEXT("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<BoundsFile>\n");
+	Xml += TEXT(" <Bounds type=\"Composite\">\n");
+	Xml += Header(TEXT("  "), 0.f);
+	Xml += TEXT("  <Children>\n   <Item type=\"GeometryBVH\">\n");
+	Xml += Header(TEXT("    "), 0.005f);
+	Xml += TEXT("    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     0 0 0 1\n    </CompositeTransform>\n");
+	Xml += TEXT("    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n");
+	Xml += TEXT("    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n");
+	Xml += FString::Printf(TEXT("    <GeometryCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Center.X, Center.Y, Center.Z);
+	Xml += TEXT("    <UnkFloat1 value=\"7.62962742E-08\" />\n    <UnkFloat2 value=\"0.0025\" />\n");
+	Xml += TEXT("    <Materials>\n     <Item>\n      <Type value=\"0\" />\n      <ProceduralID value=\"0\" />\n      <RoomID value=\"0\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>\n    </Materials>\n");
+	// Vertices are relative to GeometryCenter
+	Xml += TEXT("    <Vertices>\n");
+	for (const FVector3f& V : Verts)
+	{
+		Xml += FString::Printf(TEXT("     %f, %f, %f\n"), V.X - Center.X, V.Y - Center.Y, V.Z - Center.Z);
+	}
+	Xml += TEXT("    </Vertices>\n    <Polygons>\n");
+	for (int32 i = 0; i + 2 < Indices.Num(); i += 3)
+	{
+		Xml += FString::Printf(TEXT("     <Triangle m=\"0\" v1=\"%d\" v2=\"%d\" v3=\"%d\" f1=\"0\" f2=\"0\" f3=\"0\" />\n"),
+			Indices[i], Indices[i + 1], Indices[i + 2]);
+	}
+	Xml += TEXT("    </Polygons>\n   </Item>\n  </Children>\n </Bounds>\n</BoundsFile>\n");
+
+	if (!FFileHelper::SaveStringToFile(Xml, *OutXmlPath,
+		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		return Fail(TEXT("failed to write output file"));
+	}
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"xmlPath\":\"%s\",\"vertices\":%d,\"triangles\":%d}"),
+		*OutXmlPath, Verts.Num(), Indices.Num() / 3);
+}
+
 FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFolder,
                                 const FString& DestFolder)
 {
@@ -283,10 +388,14 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 	{
 		FOutGeo Geo;
 
-		// preset from slot name "<preset>__<n>"
+		// preset from slot name "<preset>__<n>" (RUDE-imported). A raw non-RUDE
+		// mesh (e.g. a Fab import) has an arbitrary material name with no "__"
+		// convention (e.g. "lambert1") which is NOT a valid RAGE shader preset -
+		// fall back to "default" so the drawable is valid. The full UE-material
+		// -> RAGE-preset + PBR->RAGE-texture mapping is the P2 material lane.
 		FString SlotName = GroupSlots[GroupID].ToString();
 		int32 Sep = SlotName.Find(TEXT("__"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-		Geo.Preset = Sep != INDEX_NONE ? SlotName.Left(Sep) : SlotName;
+		Geo.Preset = Sep != INDEX_NONE ? SlotName.Left(Sep) : TEXT("default");
 
 		// texture names from the slot's RUDE MaterialInstance, if any
 		// (manual scan: we author MaterialSlotName, not ImportedMaterialSlotName)
@@ -462,7 +571,33 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 		TotalVerts += G.Pos.Num();
 		TotalTris += G.Indices.Num() / 3;
 	}
-	Xml += TEXT("   </Geometries>\n  </Item>\n </DrawableModelsHigh>\n <Lights />\n</Drawable>\n");
+	Xml += TEXT("   </Geometries>\n  </Item>\n </DrawableModelsHigh>\n");
+
+	// Embedded Box collision (gta space). Box collision matches how many props
+	// (crates, suitcases) actually collide, and gives a RUDE-authored prop
+	// working collision with no external physicsDictionary (92% of props). A
+	// mesh-accurate GeometryBVH bound is a future refinement for complex shapes.
+	const FVector3f Ext = BMax - BMin;              // full extents (m)
+	const float Vol = Ext.X * Ext.Y * Ext.Z;
+	// box inertia, unit density (m = Vol): I = (1/12)*m*(a^2+b^2)
+	const float Ix = (Vol / 12.f) * (Ext.Y * Ext.Y + Ext.Z * Ext.Z);
+	const float Iy = (Vol / 12.f) * (Ext.X * Ext.X + Ext.Z * Ext.Z);
+	const float Iz = (Vol / 12.f) * (Ext.X * Ext.X + Ext.Y * Ext.Y);
+	Xml += TEXT(" <Bounds type=\"Box\">\n");
+	Xml += FString::Printf(TEXT("  <BoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"), BMin.X, BMin.Y, BMin.Z);
+	Xml += FString::Printf(TEXT("  <BoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), BMax.X, BMax.Y, BMax.Z);
+	Xml += FString::Printf(TEXT("  <BoxCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Center.X, Center.Y, Center.Z);
+	Xml += FString::Printf(TEXT("  <SphereCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Center.X, Center.Y, Center.Z);
+	Xml += FString::Printf(TEXT("  <SphereRadius value=\"%f\" />\n"), Radius);
+	Xml += TEXT("  <Margin value=\"0.04\" />\n");
+	Xml += FString::Printf(TEXT("  <Volume value=\"%f\" />\n"), Vol);
+	Xml += FString::Printf(TEXT("  <Inertia x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Ix, Iy, Iz);
+	Xml += TEXT("  <MaterialIndex value=\"0\" />\n  <MaterialColourIndex value=\"0\" />\n");
+	Xml += TEXT("  <ProceduralID value=\"0\" />\n  <RoomID value=\"0\" />\n  <PedDensity value=\"0\" />\n");
+	Xml += TEXT("  <UnkFlags value=\"2\" />\n  <PolyFlags value=\"0\" />\n  <UnkType value=\"1\" />\n");
+	Xml += TEXT(" </Bounds>\n");
+
+	Xml += TEXT(" <Lights />\n</Drawable>\n");
 
 	if (!FFileHelper::SaveStringToFile(Xml, *OutXmlPath,
 		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))

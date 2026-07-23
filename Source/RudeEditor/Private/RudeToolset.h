@@ -51,4 +51,13 @@ public:
 	// Returns JSON: {ok, xmlPath, geometries, vertices, triangles} or {ok:false, error}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYdr(const FString& AssetPath, const FString& OutXmlPath);
+
+	// Export a UStaticMesh's collision as a CodeWalker .ybn XML (physics bounds).
+	// Mesh-accurate GeometryBVH from the render triangles. Drawable props get
+	// collision from an EXTERNAL physics dict (proven in-game) - reference this
+	// via the archetype's physicsDictionary + flag bit 0x20000. Verts inverse-
+	// transformed per the RUDE convention.
+	// Returns JSON: {ok, xmlPath, vertices, triangles} or {ok:false, error}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ExportYbn(const FString& AssetPath, const FString& OutXmlPath);
 };
