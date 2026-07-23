@@ -12,6 +12,8 @@
 #include "IImageWrapperModule.h"
 #include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
+#include "PhysicsEngine/BodySetup.h"
+#include "PhysicsEngine/AggregateGeom.h"
 #include "Modules/ModuleManager.h"
 #include "StaticMeshAttributes.h"
 #include "UObject/Package.h"
@@ -659,29 +661,114 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 	}
 	Xml += TEXT("   </Geometries>\n  </Item>\n </DrawableModelsHigh>\n");
 
-	// Embedded Box collision (gta space). Box collision matches how many props
-	// (crates, suitcases) actually collide, and gives a RUDE-authored prop
-	// working collision with no external physicsDictionary (92% of props). A
-	// mesh-accurate GeometryBVH bound is a future refinement for complex shapes.
-	const FVector3f Ext = BMax - BMin;              // full extents (m)
-	const float Vol = Ext.X * Ext.Y * Ext.Z;
-	// box inertia, unit density (m = Vol): I = (1/12)*m*(a^2+b^2)
-	const float Ix = (Vol / 12.f) * (Ext.Y * Ext.Y + Ext.Z * Ext.Z);
-	const float Iy = (Vol / 12.f) * (Ext.X * Ext.X + Ext.Z * Ext.Z);
-	const float Iz = (Vol / 12.f) * (Ext.X * Ext.X + Ext.Y * Ext.Y);
-	Xml += TEXT(" <Bounds type=\"Box\">\n");
-	Xml += FString::Printf(TEXT("  <BoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"), BMin.X, BMin.Y, BMin.Z);
-	Xml += FString::Printf(TEXT("  <BoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), BMax.X, BMax.Y, BMax.Z);
-	Xml += FString::Printf(TEXT("  <BoxCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Center.X, Center.Y, Center.Z);
-	Xml += FString::Printf(TEXT("  <SphereCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Center.X, Center.Y, Center.Z);
-	Xml += FString::Printf(TEXT("  <SphereRadius value=\"%f\" />\n"), Radius);
-	Xml += TEXT("  <Margin value=\"0.04\" />\n");
-	Xml += FString::Printf(TEXT("  <Volume value=\"%f\" />\n"), Vol);
-	Xml += FString::Printf(TEXT("  <Inertia x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Ix, Iy, Iz);
-	Xml += TEXT("  <MaterialIndex value=\"0\" />\n  <MaterialColourIndex value=\"0\" />\n");
-	Xml += TEXT("  <ProceduralID value=\"0\" />\n  <RoomID value=\"0\" />\n  <PedDensity value=\"0\" />\n");
-	Xml += TEXT("  <UnkFlags value=\"2\" />\n  <PolyFlags value=\"0\" />\n  <UnkType value=\"1\" />\n");
-	Xml += TEXT(" </Bounds>\n");
+	// EMBEDDED collision. CORRECTED 2026-07-24 (Matt in-game + census): prop collision
+	// comes from the ydr's EMBEDDED <Bounds> + archetype flag bit 0x20000 - NOT an
+	// external physicsDictionary/.ybn (props share NAMED-bound dicts; a standalone
+	// bound never matches). Real props embed a Composite of PRIMITIVES (Box/Capsule).
+	// Here we embed a mesh-accurate Composite>GeometryBVH (exact triangles - RAGE
+	// supports BVH; reuses ExportYbn's proven, CW-valid bound structure). If the game
+	// rejects BVH for a prop, fall back to an AggGeom primitive composite (see
+	// docs/ENGINEERING_LOG "Collision - CORRECTED MODEL").
+	// Merge all geometries into one collision soup (gta space).
+	TArray<FVector3f> CVerts; TArray<int32> CIdx;
+	{
+		int32 Off = 0;
+		for (const FOutGeo& G : OutGeos)
+		{
+			for (const FVector3f& P : G.Pos) { CVerts.Add(P); }
+			for (int32 I : G.Indices) { CIdx.Add(I + Off); }
+			Off += G.Pos.Num();
+		}
+	}
+	auto BHdr = [&](const FString& I, float Margin)
+	{
+		FString H;
+		H += FString::Printf(TEXT("%s<BoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"), *I, BMin.X, BMin.Y, BMin.Z);
+		H += FString::Printf(TEXT("%s<BoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), *I, BMax.X, BMax.Y, BMax.Z);
+		H += FString::Printf(TEXT("%s<BoxCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), *I, Center.X, Center.Y, Center.Z);
+		H += FString::Printf(TEXT("%s<SphereCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), *I, Center.X, Center.Y, Center.Z);
+		H += FString::Printf(TEXT("%s<SphereRadius value=\"%f\" />\n"), *I, Radius);
+		H += FString::Printf(TEXT("%s<Margin value=\"%f\" />\n"), *I, Margin);
+		H += FString::Printf(TEXT("%s<Volume value=\"1\" />\n"), *I);
+		H += FString::Printf(TEXT("%s<Inertia x=\"1\" y=\"1\" z=\"1\" />\n"), *I);
+		H += FString::Printf(TEXT("%s<MaterialIndex value=\"0\" />\n"), *I);
+		H += FString::Printf(TEXT("%s<MaterialColourIndex value=\"0\" />\n"), *I);
+		H += FString::Printf(TEXT("%s<ProceduralID value=\"0\" />\n"), *I);
+		H += FString::Printf(TEXT("%s<RoomID value=\"0\" />\n"), *I);
+		H += FString::Printf(TEXT("%s<PedDensity value=\"0\" />\n"), *I);
+		H += FString::Printf(TEXT("%s<UnkFlags value=\"0\" />\n"), *I);
+		H += FString::Printf(TEXT("%s<PolyFlags value=\"0\" />\n"), *I);
+		H += FString::Printf(TEXT("%s<UnkType value=\"1\" />\n"), *I);
+		return H;
+	};
+	const TCHAR* CFlags =
+		TEXT("    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     0 0 0 1\n    </CompositeTransform>\n")
+		TEXT("    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n")
+		TEXT("    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n");
+
+	// Build collision CHILDREN: prefer the mesh's simple collision (AggGeom
+	// Box/Sphere primitives - how real props collide, Matt's design) and fall
+	// back to a whole-mesh GeometryBVH when there's no simple collision set up.
+	// TODO(next agent): AggGeom box ROTATION (v1 axis-aligned + translation),
+	// Sphyl(capsule) + Convex elements. See ENGINEERING_LOG "Collision".
+	FString Children;
+	int32 NumPrims = 0;
+	if (UBodySetup* BS = Mesh->GetBodySetup())
+	{
+		const FKAggregateGeom& Agg = BS->AggGeom;
+		for (const FKBoxElem& B : Agg.BoxElems)
+		{
+			// UE cm -> gta m, Y mirror; half-extents; rotation ignored (v1)
+			const FVector3f C(B.Center.X / 100.f, -B.Center.Y / 100.f, B.Center.Z / 100.f);
+			const float hx = B.X / 200.f, hy = B.Y / 200.f, hz = B.Z / 200.f;
+			const float r = FMath::Sqrt(hx*hx + hy*hy + hz*hz);
+			Children += TEXT("   <Item type=\"Box\">\n");
+			Children += FString::Printf(TEXT("    <BoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"), -hx, -hy, -hz);
+			Children += FString::Printf(TEXT("    <BoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), hx, hy, hz);
+			Children += FString::Printf(TEXT("    <BoxCenter x=\"0\" y=\"0\" z=\"0\" />\n    <SphereCenter x=\"0\" y=\"0\" z=\"0\" />\n    <SphereRadius value=\"%f\" />\n"), r);
+			Children += TEXT("    <Margin value=\"0.04\" />\n    <Volume value=\"1\" />\n    <Inertia x=\"1\" y=\"1\" z=\"1\" />\n");
+			Children += TEXT("    <MaterialIndex value=\"0\" />\n    <MaterialColourIndex value=\"0\" />\n    <ProceduralID value=\"0\" />\n    <RoomID value=\"0\" />\n    <PedDensity value=\"0\" />\n    <UnkFlags value=\"0\" />\n    <PolyFlags value=\"0\" />\n    <UnkType value=\"1\" />\n");
+			Children += FString::Printf(TEXT("    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     %f %f %f 1\n    </CompositeTransform>\n"), C.X, C.Y, C.Z);
+			Children += TEXT("    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n   </Item>\n");
+			++NumPrims;
+		}
+		for (const FKSphereElem& S : Agg.SphereElems)
+		{
+			const FVector3f C(S.Center.X / 100.f, -S.Center.Y / 100.f, S.Center.Z / 100.f);
+			const float rad = S.Radius / 100.f;
+			Children += TEXT("   <Item type=\"Sphere\">\n");
+			Children += FString::Printf(TEXT("    <BoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n    <BoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), -rad, -rad, -rad, rad, rad, rad);
+			Children += FString::Printf(TEXT("    <BoxCenter x=\"0\" y=\"0\" z=\"0\" />\n    <SphereCenter x=\"0\" y=\"0\" z=\"0\" />\n    <SphereRadius value=\"%f\" />\n"), rad);
+			Children += TEXT("    <Margin value=\"0.04\" />\n    <Volume value=\"1\" />\n    <Inertia x=\"1\" y=\"1\" z=\"1\" />\n    <MaterialIndex value=\"0\" />\n    <MaterialColourIndex value=\"0\" />\n    <ProceduralID value=\"0\" />\n    <RoomID value=\"0\" />\n    <PedDensity value=\"0\" />\n    <UnkFlags value=\"0\" />\n    <PolyFlags value=\"0\" />\n    <UnkType value=\"1\" />\n");
+			Children += FString::Printf(TEXT("    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     %f %f %f 1\n    </CompositeTransform>\n"), C.X, C.Y, C.Z);
+			Children += TEXT("    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n   </Item>\n");
+			++NumPrims;
+		}
+	}
+	if (NumPrims == 0)
+	{
+		// no simple collision -> exact whole-mesh GeometryBVH
+		Children += TEXT("   <Item type=\"GeometryBVH\">\n");
+		Children += BHdr(TEXT("    "), 0.005f);
+		Children += CFlags;
+		Children += FString::Printf(TEXT("    <GeometryCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Center.X, Center.Y, Center.Z);
+		Children += TEXT("    <UnkFloat1 value=\"7.62962742E-08\" />\n    <UnkFloat2 value=\"0.0025\" />\n");
+		Children += TEXT("    <Materials>\n     <Item>\n      <Type value=\"0\" />\n      <ProceduralID value=\"0\" />\n      <RoomID value=\"0\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>\n    </Materials>\n    <Vertices>\n");
+		for (const FVector3f& V : CVerts)
+		{
+			Children += FString::Printf(TEXT("     %f, %f, %f\n"), V.X - Center.X, V.Y - Center.Y, V.Z - Center.Z);
+		}
+		Children += TEXT("    </Vertices>\n    <Polygons>\n");
+		for (int32 i = 0; i + 2 < CIdx.Num(); i += 3)
+		{
+			Children += FString::Printf(TEXT("     <Triangle m=\"0\" v1=\"%d\" v2=\"%d\" v3=\"%d\" f1=\"0\" f2=\"0\" f3=\"0\" />\n"),
+				CIdx[i], CIdx[i + 1], CIdx[i + 2]);
+		}
+		Children += TEXT("    </Polygons>\n   </Item>\n");
+	}
+	Xml += TEXT(" <Bounds type=\"Composite\">\n");
+	Xml += BHdr(TEXT("  "), 0.f);
+	Xml += TEXT("  <Children>\n") + Children + TEXT("  </Children>\n </Bounds>\n");
 
 	Xml += TEXT(" <Lights />\n</Drawable>\n");
 
