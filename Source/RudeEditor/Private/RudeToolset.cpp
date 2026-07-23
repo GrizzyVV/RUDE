@@ -254,6 +254,12 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		return Fail(TEXT("NewObject<UStaticMesh> failed"));
 	}
 
+	// Reimport-over-existing must RESET prior state - appending to a mesh that
+	// already has slots/LODs leaves stale slot 0 winning section resolution
+	// (the WorldGridMaterial crate incident, 2026-07-24).
+	Mesh->SetNumSourceModels(0);
+	Mesh->GetStaticMaterials().Empty();
+
 	Mesh->AddSourceModel();
 	FStaticMeshSourceModel& SourceModel = Mesh->GetSourceModel(0);
 	SourceModel.BuildSettings.bRecomputeNormals = false;
