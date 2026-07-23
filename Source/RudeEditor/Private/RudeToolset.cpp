@@ -664,12 +664,11 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 	// EMBEDDED collision. CORRECTED 2026-07-24 (Matt in-game + census): prop collision
 	// comes from the ydr's EMBEDDED <Bounds> + archetype flag bit 0x20000 - NOT an
 	// external physicsDictionary/.ybn (props share NAMED-bound dicts; a standalone
-	// bound never matches). Real props embed a Composite of PRIMITIVES (Box/Capsule).
-	// Here we embed a mesh-accurate Composite>GeometryBVH (exact triangles - RAGE
-	// supports BVH; reuses ExportYbn's proven, CW-valid bound structure). If the game
-	// rejects BVH for a prop, fall back to an AggGeom primitive composite (see
-	// docs/ENGINEERING_LOG "Collision - CORRECTED MODEL").
-	// Merge all geometries into one collision soup (gta space).
+	// bound never matches). Real props embed a Composite of PRIMITIVES (Box/Sphere/
+	// Capsule) when simple collision exists, else a per-triangle GeometryBVH. We MIRROR
+	// the mesh's AggGeom below (primitives-first, whole-mesh BVH fallback); the BVH
+	// path is the rock-wall's in-game-proven structure (shared with ExportYbn).
+	// Merge all geometries into one collision soup (gta space) for the BVH fallback.
 	TArray<FVector3f> CVerts; TArray<int32> CIdx;
 	{
 		int32 Off = 0;
@@ -701,70 +700,135 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 		H += FString::Printf(TEXT("%s<UnkType value=\"1\" />\n"), *I);
 		return H;
 	};
-	const TCHAR* CFlags =
-		TEXT("    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     0 0 0 1\n    </CompositeTransform>\n")
+	// ----- Collision children (Composite): mirror the mesh's actual collision -----
+	// A RAGE Composite child set == UE BodySetup.AggGeom (both = a set of collision
+	// primitives - Matt's design). Census-verified field schema
+	// (reports/schema_registry.json): Item[Box|Sphere|Capsule] share the SAME fields
+	// (BoxMin/Max/Center, SphereCenter/Radius, Margin, Volume, Inertia, Material*,
+	// CompositeTransform, CompositeFlags1/2) - the shape is the local AABB inscribed by
+	// the <type>, positioned+oriented by CompositeTransform. Convex hulls -> a per-hull
+	// GeometryBVH child. No simple collision at all -> one whole-mesh GeometryBVH (the
+	// rock-wall's in-game-proven path). Rotation: UE quat -> GTA under the Y-mirror is
+	// the PINNED involution gta_quat = (-x, y, -z, w) (ENGINEERING_LOG "Rotation
+	// quaternions", Matt-witnessed for entity placement; identical similarity transform).
+	const TCHAR* PrimFlags =
 		TEXT("    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n")
 		TEXT("    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n");
 
-	// Build collision CHILDREN: prefer the mesh's simple collision (AggGeom
-	// Box/Sphere primitives - how real props collide, Matt's design) and fall
-	// back to a whole-mesh GeometryBVH when there's no simple collision set up.
-	// TODO(next agent): AggGeom box ROTATION (v1 axis-aligned + translation),
-	// Sphyl(capsule) + Convex elements. See ENGINEERING_LOG "Collision".
+	// 4x4 row-major CompositeTransform from a GTA-space rotation quat + center.
+	// UE FMatrix / RAGE bounds are both row-vector (p' = p*M): the rows are the
+	// rotated basis vectors (GetAxisX/Y/Z), translation in the last row.
+	auto XformRows = [](const FQuat& Q, const FVector& C) -> FString
+	{
+		const FVector X = Q.GetAxisX(), Y = Q.GetAxisY(), Z = Q.GetAxisZ();
+		return FString::Printf(TEXT(
+			"    <CompositeTransform>\n     %f %f %f 0\n     %f %f %f 0\n     %f %f %f 0\n     %f %f %f 1\n    </CompositeTransform>\n"),
+			X.X, X.Y, X.Z, Y.X, Y.Y, Y.Z, Z.X, Z.Y, Z.Z, C.X, C.Y, C.Z);
+	};
+	auto ToGtaQuat = [](const FQuat& Q) { return FQuat(-Q.X, Q.Y, -Q.Z, Q.W); };          // pinned Y-mirror involution
+	auto ToGtaPos  = [](const FVector& P) { return FVector(P.X / 100.0, -P.Y / 100.0, P.Z / 100.0); };
+
+	// Box / Sphere / Capsule share one emitter (identical schema; local AABB + xform).
+	auto EmitAABBChild = [&](const TCHAR* Type, const FVector& Half, double SphereRad,
+	                         const FQuat& Qgta, const FVector& Cgta) -> FString
+	{
+		FString S = FString::Printf(TEXT("   <Item type=\"%s\">\n"), Type);
+		S += FString::Printf(TEXT("    <BoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"), -Half.X, -Half.Y, -Half.Z);
+		S += FString::Printf(TEXT("    <BoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Half.X, Half.Y, Half.Z);
+		S += TEXT("    <BoxCenter x=\"0\" y=\"0\" z=\"0\" />\n    <SphereCenter x=\"0\" y=\"0\" z=\"0\" />\n");
+		S += FString::Printf(TEXT("    <SphereRadius value=\"%f\" />\n"), SphereRad);
+		S += TEXT("    <Margin value=\"0.04\" />\n    <Volume value=\"1\" />\n    <Inertia x=\"1\" y=\"1\" z=\"1\" />\n");
+		S += TEXT("    <MaterialIndex value=\"0\" />\n    <MaterialColourIndex value=\"0\" />\n    <ProceduralID value=\"0\" />\n    <RoomID value=\"0\" />\n    <PedDensity value=\"0\" />\n    <UnkFlags value=\"0\" />\n    <PolyFlags value=\"0\" />\n    <UnkType value=\"1\" />\n");
+		S += XformRows(Qgta, Cgta);
+		S += PrimFlags;
+		S += TEXT("   </Item>\n");
+		return S;
+	};
+
+	// One GeometryBVH child from gta-space verts + triangle indices (convex hulls
+	// and the whole-mesh fallback). Verts stored relative to the child's own
+	// GeometryCenter (RAGE convention); identity CompositeTransform.
+	auto EmitBVHChild = [&](const TArray<FVector3f>& V, const TArray<int32>& I) -> FString
+	{
+		FVector3f Mn(FLT_MAX), Mx(-FLT_MAX);
+		for (const FVector3f& P : V) { Mn = Mn.ComponentMin(P); Mx = Mx.ComponentMax(P); }
+		const FVector3f Ctr = (Mn + Mx) * 0.5f;
+		const float Rad = (Mx - Ctr).Size();
+		FString S = TEXT("   <Item type=\"GeometryBVH\">\n");
+		S += FString::Printf(TEXT("    <BoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Mn.X, Mn.Y, Mn.Z);
+		S += FString::Printf(TEXT("    <BoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Mx.X, Mx.Y, Mx.Z);
+		S += FString::Printf(TEXT("    <BoxCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Ctr.X, Ctr.Y, Ctr.Z);
+		S += FString::Printf(TEXT("    <SphereCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Ctr.X, Ctr.Y, Ctr.Z);
+		S += FString::Printf(TEXT("    <SphereRadius value=\"%f\" />\n"), Rad);
+		S += TEXT("    <Margin value=\"0.005\" />\n    <Volume value=\"1\" />\n    <Inertia x=\"1\" y=\"1\" z=\"1\" />\n");
+		S += TEXT("    <MaterialIndex value=\"0\" />\n    <MaterialColourIndex value=\"0\" />\n    <ProceduralID value=\"0\" />\n    <RoomID value=\"0\" />\n    <PedDensity value=\"0\" />\n    <UnkFlags value=\"0\" />\n    <PolyFlags value=\"0\" />\n    <UnkType value=\"1\" />\n");
+		S += TEXT("    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     0 0 0 1\n    </CompositeTransform>\n");
+		S += PrimFlags;
+		S += FString::Printf(TEXT("    <GeometryCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Ctr.X, Ctr.Y, Ctr.Z);
+		S += TEXT("    <UnkFloat1 value=\"7.62962742E-08\" />\n    <UnkFloat2 value=\"0.0025\" />\n");
+		S += TEXT("    <Materials>\n     <Item>\n      <Type value=\"0\" />\n      <ProceduralID value=\"0\" />\n      <RoomID value=\"0\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>\n    </Materials>\n    <Vertices>\n");
+		for (const FVector3f& P : V)
+		{
+			S += FString::Printf(TEXT("     %f, %f, %f\n"), P.X - Ctr.X, P.Y - Ctr.Y, P.Z - Ctr.Z);
+		}
+		S += TEXT("    </Vertices>\n    <Polygons>\n");
+		for (int32 k = 0; k + 2 < I.Num(); k += 3)
+		{
+			S += FString::Printf(TEXT("     <Triangle m=\"0\" v1=\"%d\" v2=\"%d\" v3=\"%d\" f1=\"0\" f2=\"0\" f3=\"0\" />\n"),
+				I[k], I[k + 1], I[k + 2]);
+		}
+		S += TEXT("    </Polygons>\n   </Item>\n");
+		return S;
+	};
+
 	FString Children;
-	int32 NumPrims = 0;
+	int32 NumChildren = 0;
 	if (UBodySetup* BS = Mesh->GetBodySetup())
 	{
 		const FKAggregateGeom& Agg = BS->AggGeom;
 		for (const FKBoxElem& B : Agg.BoxElems)
 		{
-			// UE cm -> gta m, Y mirror; half-extents; rotation ignored (v1)
-			const FVector3f C(B.Center.X / 100.f, -B.Center.Y / 100.f, B.Center.Z / 100.f);
-			const float hx = B.X / 200.f, hy = B.Y / 200.f, hz = B.Z / 200.f;
-			const float r = FMath::Sqrt(hx*hx + hy*hy + hz*hz);
-			Children += TEXT("   <Item type=\"Box\">\n");
-			Children += FString::Printf(TEXT("    <BoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"), -hx, -hy, -hz);
-			Children += FString::Printf(TEXT("    <BoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), hx, hy, hz);
-			Children += FString::Printf(TEXT("    <BoxCenter x=\"0\" y=\"0\" z=\"0\" />\n    <SphereCenter x=\"0\" y=\"0\" z=\"0\" />\n    <SphereRadius value=\"%f\" />\n"), r);
-			Children += TEXT("    <Margin value=\"0.04\" />\n    <Volume value=\"1\" />\n    <Inertia x=\"1\" y=\"1\" z=\"1\" />\n");
-			Children += TEXT("    <MaterialIndex value=\"0\" />\n    <MaterialColourIndex value=\"0\" />\n    <ProceduralID value=\"0\" />\n    <RoomID value=\"0\" />\n    <PedDensity value=\"0\" />\n    <UnkFlags value=\"0\" />\n    <PolyFlags value=\"0\" />\n    <UnkType value=\"1\" />\n");
-			Children += FString::Printf(TEXT("    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     %f %f %f 1\n    </CompositeTransform>\n"), C.X, C.Y, C.Z);
-			Children += TEXT("    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n   </Item>\n");
-			++NumPrims;
+			const FVector Half(B.X / 200.0, B.Y / 200.0, B.Z / 200.0);   // full-extent cm -> half-extent m
+			Children += EmitAABBChild(TEXT("Box"), Half, Half.Size(),
+				ToGtaQuat(B.Rotation.Quaternion()), ToGtaPos(B.Center));
+			++NumChildren;
 		}
-		for (const FKSphereElem& S : Agg.SphereElems)
+		for (const FKSphereElem& Sp : Agg.SphereElems)
 		{
-			const FVector3f C(S.Center.X / 100.f, -S.Center.Y / 100.f, S.Center.Z / 100.f);
-			const float rad = S.Radius / 100.f;
-			Children += TEXT("   <Item type=\"Sphere\">\n");
-			Children += FString::Printf(TEXT("    <BoxMin x=\"%f\" y=\"%f\" z=\"%f\" />\n    <BoxMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"), -rad, -rad, -rad, rad, rad, rad);
-			Children += FString::Printf(TEXT("    <BoxCenter x=\"0\" y=\"0\" z=\"0\" />\n    <SphereCenter x=\"0\" y=\"0\" z=\"0\" />\n    <SphereRadius value=\"%f\" />\n"), rad);
-			Children += TEXT("    <Margin value=\"0.04\" />\n    <Volume value=\"1\" />\n    <Inertia x=\"1\" y=\"1\" z=\"1\" />\n    <MaterialIndex value=\"0\" />\n    <MaterialColourIndex value=\"0\" />\n    <ProceduralID value=\"0\" />\n    <RoomID value=\"0\" />\n    <PedDensity value=\"0\" />\n    <UnkFlags value=\"0\" />\n    <PolyFlags value=\"0\" />\n    <UnkType value=\"1\" />\n");
-			Children += FString::Printf(TEXT("    <CompositeTransform>\n     1 0 0 0\n     0 1 0 0\n     0 0 1 0\n     %f %f %f 1\n    </CompositeTransform>\n"), C.X, C.Y, C.Z);
-			Children += TEXT("    <CompositeFlags1>MAP_WEAPON, MAP_DYNAMIC, MAP_ANIMAL, MAP_COVER, MAP_VEHICLE</CompositeFlags1>\n    <CompositeFlags2>VEHICLE_NOT_BVH, VEHICLE_BVH, PED, RAGDOLL, ANIMAL, ANIMAL_RAGDOLL, OBJECT, PLANT, PROJECTILE, EXPLOSION, FORKLIFT_FORKS, TEST_WEAPON, TEST_CAMERA, TEST_AI, TEST_SCRIPT, TEST_VEHICLE_WHEEL, GLASS</CompositeFlags2>\n   </Item>\n");
-			++NumPrims;
+			const double R = Sp.Radius / 100.0;
+			Children += EmitAABBChild(TEXT("Sphere"), FVector(R, R, R), R,
+				FQuat::Identity, ToGtaPos(Sp.Center));   // sphere: rotation irrelevant
+			++NumChildren;
+		}
+		for (const FKSphylElem& Cap : Agg.SphylElems)
+		{
+			// UE sphyl is Z-aligned: Radius + Length (cylinder segment, hemispheres extra).
+			// Local AABB half-extents = (R, R, L/2 + R). RAGE infers the capsule long axis
+			// from the box's dominant extent (Z here). ** Axis mapping pending Matt's
+			// in-game check ** - if the capsule reads sideways, swap the local axis order.
+			const double R = Cap.Radius / 100.0;
+			const double HZ = Cap.Length / 200.0 + R;
+			Children += EmitAABBChild(TEXT("Capsule"), FVector(R, R, HZ), HZ,
+				ToGtaQuat(Cap.Rotation.Quaternion()), ToGtaPos(Cap.Center));
+			++NumChildren;
+		}
+		for (const FKConvexElem& Cx : Agg.ConvexElems)
+		{
+			if (Cx.IndexData.Num() < 3 || Cx.VertexData.Num() == 0) { continue; }   // uncooked hull -> skip
+			const FTransform T = Cx.GetTransform();
+			TArray<FVector3f> V; V.Reserve(Cx.VertexData.Num());
+			for (const FVector& P : Cx.VertexData)
+			{
+				const FVector W = T.TransformPosition(P);   // hull-local -> body space (UE cm)
+				V.Add(FVector3f(W.X / 100.f, -W.Y / 100.f, W.Z / 100.f));
+			}
+			Children += EmitBVHChild(V, Cx.IndexData);
+			++NumChildren;
 		}
 	}
-	if (NumPrims == 0)
+	if (NumChildren == 0)
 	{
-		// no simple collision -> exact whole-mesh GeometryBVH
-		Children += TEXT("   <Item type=\"GeometryBVH\">\n");
-		Children += BHdr(TEXT("    "), 0.005f);
-		Children += CFlags;
-		Children += FString::Printf(TEXT("    <GeometryCenter x=\"%f\" y=\"%f\" z=\"%f\" />\n"), Center.X, Center.Y, Center.Z);
-		Children += TEXT("    <UnkFloat1 value=\"7.62962742E-08\" />\n    <UnkFloat2 value=\"0.0025\" />\n");
-		Children += TEXT("    <Materials>\n     <Item>\n      <Type value=\"0\" />\n      <ProceduralID value=\"0\" />\n      <RoomID value=\"0\" />\n      <PedDensity value=\"0\" />\n      <Flags>NONE</Flags>\n      <MaterialColourIndex value=\"0\" />\n      <Unk value=\"0\" />\n     </Item>\n    </Materials>\n    <Vertices>\n");
-		for (const FVector3f& V : CVerts)
-		{
-			Children += FString::Printf(TEXT("     %f, %f, %f\n"), V.X - Center.X, V.Y - Center.Y, V.Z - Center.Z);
-		}
-		Children += TEXT("    </Vertices>\n    <Polygons>\n");
-		for (int32 i = 0; i + 2 < CIdx.Num(); i += 3)
-		{
-			Children += FString::Printf(TEXT("     <Triangle m=\"0\" v1=\"%d\" v2=\"%d\" v3=\"%d\" f1=\"0\" f2=\"0\" f3=\"0\" />\n"),
-				CIdx[i], CIdx[i + 1], CIdx[i + 2]);
-		}
-		Children += TEXT("    </Polygons>\n   </Item>\n");
+		Children += EmitBVHChild(CVerts, CIdx);   // no simple collision -> exact whole-mesh BVH
 	}
 	Xml += TEXT(" <Bounds type=\"Composite\">\n");
 	Xml += BHdr(TEXT("  "), 0.f);

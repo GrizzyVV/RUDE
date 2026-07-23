@@ -52,11 +52,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYdr(const FString& AssetPath, const FString& OutXmlPath);
 
-	// Export a UStaticMesh's collision as a CodeWalker .ybn XML (physics bounds).
-	// Mesh-accurate GeometryBVH from the render triangles. Drawable props get
-	// collision from an EXTERNAL physics dict (proven in-game) - reference this
-	// via the archetype's physicsDictionary + flag bit 0x20000. Verts inverse-
-	// transformed per the RUDE convention.
+	// Export a UStaticMesh's collision as a standalone CodeWalker .ybn XML (physics
+	// bounds) - a valid, CW-previewable BoundsFile. NOTE (corrected 2026-07-24):
+	// PROP collision actually comes from the ydr's EMBEDDED <Bounds> + archetype flag
+	// bit 0x20000, NOT a standalone .ybn (props share NAMED-bound dictionaries; a
+	// standalone unnamed bound never matches). ExportYdr embeds the real collider;
+	// this tool remains for shared/world collision-dictionary work later. Verts
+	// inverse-transformed per the RUDE convention.
 	// Returns JSON: {ok, xmlPath, vertices, triangles} or {ok:false, error}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYbn(const FString& AssetPath, const FString& OutXmlPath);
