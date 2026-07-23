@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "RUDE",
+	"Description": "RAGE <-> Unreal Development Environment. Unreal as a first-class FiveM mapping DCC: import GTA V map context, author natively, export to FiveM. Free forever.",
+	"Category": "RUDE",
+	"CreatedBy": "Grizzy",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"Modules": [
+		{
+			"Name": "RudeEditor",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ToolsetRegistry",
+			"Enabled": true
+		}
+	]
+}

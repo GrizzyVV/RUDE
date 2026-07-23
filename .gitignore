@@ -1,0 +1,26 @@
+# UE build artifacts
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+
+# OS / editor noise
+.vs/
+.vscode/
+*.pdb
+*.suo
+*.user
+Thumbs.db
+.DS_Store
+
+# Never commit game-derived data (see AGENTS.md hard walls)
+*.ydr*
+*.ybn*
+*.ytd*
+*.ytyp*
+*.ymap*
+*.ydd*
+*.yft*
+*.ymt*
+*.dds
+*.rpf
