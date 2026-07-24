@@ -10,6 +10,7 @@
 #include "MeshDescription.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
+#include "Misc/Compression.h"
 #include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
 #include "PhysicsEngine/BodySetup.h"
@@ -1167,4 +1168,234 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"boundTextures\":%d,\"slots\":[%s]}"),
 		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures, *SlotsJson);
+}
+
+// ======================= ExportYtdBinary - clean-room .ytd (RSC7 v13) =======================
+// Reverse-engineered from our own CW-roundtripped diff pair + verified byte-identical
+// (tools/write_ytd.py, docs/ENGINEERING_LOG "RSC7 binary container"). No CodeWalker code read.
+// RSC7 header (16B: 'RSC7' | u32 version=13 | u32 sysFlags | u32 gfxFlags) + raw DEFLATE of
+// [ system-segment | graphics-pages ]. System = pgDictionary<grcTexture>; graphics = pixel pages.
+// Pointers are tagged fixups: 0x50000000|off -> system, 0x60000000|off -> graphics.
+namespace RudeYtd
+{
+	// Jenkins one-at-a-time over the lowercased name (RAGE joaat). CONFIRMED against
+	// the observed dictionary hashes (0x97f2c7c3 / 0x9a5d45aa).
+	static uint32 Joaat(const FString& S)
+	{
+		uint32 H = 0;
+		const FString L = S.ToLower();
+		for (int32 i = 0; i < L.Len(); ++i)
+		{
+			H += (uint8)L[i];
+			H += (H << 10);
+			H ^= (H >> 6);
+		}
+		H += (H << 3);
+		H ^= (H >> 11);
+		H += (H << 15);
+		return H;
+	}
+
+	// Low-28 RSC7 flag bits for a segment size: tile into power-of-two pages (largest
+	// first, capped 4MB), base = smallest page / 16, class k holds pages of base*(1<<k).
+	// Also returns the page count (for the blockmap). The segment-type high nibble
+	// (system 0x0 / graphics 0xd, verified vs 400 real ytds) is OR'd in by the caller.
+	static uint32 FlagsFromSize(uint32 Size, int32& OutPageCount)
+	{
+		const uint32 MAXPAGE = 0x400000;
+		TArray<uint32> Pages;
+		uint32 Rem = Size;
+		while (Rem > 0)
+		{
+			uint32 P = MAXPAGE;
+			while (P > Rem) { P >>= 1; }
+			Pages.Add(P);
+			Rem -= P;
+		}
+		OutPageCount = Pages.Num();
+		uint32 Smallest = 0xFFFFFFFFu;
+		for (uint32 P : Pages) { Smallest = FMath::Min(Smallest, P); }
+		const uint32 Base = Smallest / 16;
+		int32 ss = 0; { uint32 b = Base; while (b > 0x200) { b >>= 1; ++ss; } }
+		static const int32 BitPos[9] = { 27, 26, 25, 24, 17, 11, 7, 5, 4 };
+		int32 Counts[9] = { 0 };
+		for (uint32 P : Pages)
+		{
+			int32 k = 0; uint32 r = P / Base; while (r > 1) { r >>= 1; ++k; }
+			if (k >= 0 && k < 9) { Counts[k]++; }
+		}
+		uint32 Flag = (uint32)ss;
+		for (int32 k = 0; k < 9; ++k) { Flag |= ((uint32)Counts[k]) << BitPos[k]; }
+		return Flag;
+	}
+
+	static void PutU32(TArray<uint8>& B, int32 Off, uint32 V)
+	{
+		B[Off] = V & 0xFF; B[Off + 1] = (V >> 8) & 0xFF; B[Off + 2] = (V >> 16) & 0xFF; B[Off + 3] = (V >> 24) & 0xFF;
+	}
+	static void PutU16(TArray<uint8>& B, int32 Off, uint16 V) { B[Off] = V & 0xFF; B[Off + 1] = (V >> 8) & 0xFF; }
+}
+
+FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+#if WITH_EDITORONLY_DATA
+	struct FTexIn { FString Name; uint32 Hash = 0; int32 W = 0; int32 H = 0; uint32 U40 = 20; TArray<uint8> BGRA; };
+	TArray<FTexIn> Texs;
+
+	TArray<FString> Entries;
+	TextureSpecs.ParseIntoArray(Entries, TEXT(","), true);
+	if (Entries.Num() == 0) { return Fail(TEXT("no texture specs (want ContentPath;RageName;Usage , ...)")); }
+
+	for (const FString& E : Entries)
+	{
+		TArray<FString> Fld;
+		E.ParseIntoArray(Fld, TEXT(";"), true);
+		if (Fld.Num() < 2) { return Fail(TEXT("each spec needs ContentPath;RageName[;Usage]")); }
+		const FString Path = Fld[0].TrimStartAndEnd();
+		const FString Name = Fld[1].TrimStartAndEnd();
+		const FString Usage = (Fld.Num() > 2) ? Fld[2].TrimStartAndEnd().ToUpper() : TEXT("DIFFUSE");
+
+		UTexture2D* Tex = LoadObject<UTexture2D>(nullptr, *Path);
+		if (!Tex) { return Fail(FString::Printf(TEXT("texture not found: %s"), *Path)); }
+		FTextureSource& Src = Tex->Source;
+		if (!Src.IsValid()) { return Fail(FString::Printf(TEXT("no editor source: %s"), *Path)); }
+		const int32 W = Src.GetSizeX();
+		const int32 H = Src.GetSizeY();
+		const ETextureSourceFormat SF = Src.GetFormat();
+		TArray64<uint8> Mip;
+		if (!Src.GetMipData(Mip, 0, 0, 0, nullptr)) { return Fail(FString::Printf(TEXT("GetMipData failed: %s"), *Path)); }
+
+		FTexIn T;
+		T.Name = Name; T.W = W; T.H = H;
+		T.U40 = (Usage == TEXT("NORMAL")) ? 22u : 20u;   // 🧠 usage-derived (reproduced; pending in-game confirm)
+		T.BGRA.SetNumUninitialized(W * H * 4);
+		if (SF == TSF_BGRA8 || SF == TSF_BGRE8)
+		{
+			FMemory::Memcpy(T.BGRA.GetData(), Mip.GetData(), FMath::Min<int64>(Mip.Num(), T.BGRA.Num()));
+		}
+		else if (SF == TSF_G8)
+		{
+			for (int32 i = 0; i < W * H; ++i)
+			{
+				const uint8 G = Mip[i];
+				T.BGRA[i * 4] = G; T.BGRA[i * 4 + 1] = G; T.BGRA[i * 4 + 2] = G; T.BGRA[i * 4 + 3] = 255;
+			}
+		}
+		else
+		{
+			return Fail(FString::Printf(TEXT("unsupported source fmt %d (want BGRA8/G8): %s"), (int32)SF, *Path));
+		}
+		T.Hash = RudeYtd::Joaat(Name);
+		Texs.Add(MoveTemp(T));
+	}
+
+	// hash-sorted dictionary order (RAGE stores entries sorted by name hash)
+	Texs.Sort([](const FTexIn& A, const FTexIn& B) { return A.Hash < B.Hash; });
+	const int32 N = Texs.Num();
+
+	// ---- graphics segment: pixel data, each texture 4MB-page-aligned (v1: uniform pages
+	// -> always-valid flags; the rock case is byte-identical to CW). Tight small-texture
+	// packing is a v2 streaming-budget optimization (needs a mixed-size diff pair). ----
+	const uint32 GP = 0x400000;
+	TArray<uint8> Gfx;
+	TArray<uint32> GfxOff; GfxOff.SetNum(N);
+	for (int32 i = 0; i < N; ++i)
+	{
+		if (Gfx.Num() % GP) { Gfx.AddZeroed(GP - (Gfx.Num() % GP)); }
+		GfxOff[i] = (uint32)Gfx.Num();
+		Gfx.Append(Texs[i].BGRA);
+	}
+	if (Gfx.Num() % GP) { Gfx.AddZeroed(GP - (Gfx.Num() % GP)); }
+
+	// ---- system segment: pgDictionary<grcTexture> at CW's observed offsets ----
+	const int32 TEX_BASE = 0x450, TEX_SZ = 0x90, NAME_SLOT = 0x20;
+	TArray<int32> TexOff, NameOff;
+	for (int32 i = 0; i < N; ++i) { TexOff.Add(TEX_BASE + i * TEX_SZ); }
+	const int32 NamesStart = TEX_BASE + N * TEX_SZ;
+	for (int32 i = 0; i < N; ++i) { NameOff.Add(NamesStart + i * NAME_SLOT); }
+	const int32 PtrArr = NamesStart + N * NAME_SLOT;
+	const int32 HashArr = PtrArr + N * 8;
+	const int32 SysEnd = HashArr + N * 4;
+	uint32 SysSize = 0x2000;
+	while (SysSize < (uint32)SysEnd) { SysSize <<= 1; }
+
+	TArray<uint8> Sys; Sys.AddZeroed(SysSize);
+	auto Sptr = [](int32 Off) { return 0x50000000u | (uint32)Off; };
+	auto Gptr = [](uint32 Off) { return 0x60000000u | Off; };
+
+	// pgDictionary header
+	RudeYtd::PutU32(Sys, 0x00, 0); RudeYtd::PutU32(Sys, 0x04, 1);              // VFT const 0x100000000
+	RudeYtd::PutU32(Sys, 0x08, Sptr(0x40));                                    // BlockMap*
+	RudeYtd::PutU32(Sys, 0x18, 1);                                            // RefCount
+	RudeYtd::PutU32(Sys, 0x20, Sptr(HashArr)); RudeYtd::PutU32(Sys, 0x28, (uint32)((N << 16) | N));
+	RudeYtd::PutU32(Sys, 0x30, Sptr(PtrArr));  RudeYtd::PutU32(Sys, 0x38, (uint32)((N << 16) | N));
+
+	// grcTexture structs
+	for (int32 i = 0; i < N; ++i)
+	{
+		const int32 b = TexOff[i];
+		const FTexIn& T = Texs[i];
+		RudeYtd::PutU32(Sys, b + 0x00, 0); RudeYtd::PutU32(Sys, b + 0x04, 1);  // VFT
+		RudeYtd::PutU32(Sys, b + 0x28, Sptr(NameOff[i]));                      // name*
+		RudeYtd::PutU32(Sys, b + 0x30, 1);
+		RudeYtd::PutU32(Sys, b + 0x40, T.U40);
+		RudeYtd::PutU16(Sys, b + 0x50, (uint16)T.W); RudeYtd::PutU16(Sys, b + 0x52, (uint16)T.H);
+		RudeYtd::PutU16(Sys, b + 0x54, 1); RudeYtd::PutU16(Sys, b + 0x56, (uint16)(T.W * 4));   // depth, stride
+		RudeYtd::PutU32(Sys, b + 0x58, 21);                                    // D3DFMT_A8R8G8B8
+		Sys[b + 0x5d] = 1;                                                     // mip level count
+		RudeYtd::PutU32(Sys, b + 0x70, Gptr(GfxOff[i]));                       // pixel data*
+	}
+	// names (ASCII, null-terminated)
+	for (int32 i = 0; i < N; ++i)
+	{
+		const FString& Nm = Texs[i].Name;
+		for (int32 k = 0; k < Nm.Len() && (NameOff[i] + k) < (int32)SysSize; ++k)
+		{
+			Sys[NameOff[i] + k] = (uint8)Nm[k];
+		}
+	}
+	// parallel hash + pointer arrays
+	for (int32 i = 0; i < N; ++i)
+	{
+		RudeYtd::PutU32(Sys, PtrArr + i * 8, Sptr(TexOff[i]));
+		RudeYtd::PutU32(Sys, HashArr + i * 4, Texs[i].Hash);
+	}
+
+	// flags + blockmap page counts
+	int32 SysPages = 0, GfxPages = 0;
+	const uint32 SysFlag = RudeYtd::FlagsFromSize(SysSize, SysPages);
+	const uint32 GfxFlag = 0xd0000000u | RudeYtd::FlagsFromSize((uint32)Gfx.Num(), GfxPages);
+	RudeYtd::PutU32(Sys, 0x48, (uint32)(((GfxPages & 0xFF) << 8) | (SysPages & 0xFF)));
+
+	// ---- raw DEFLATE of [sys | gfx] (RSC7 uses headerless deflate) ----
+	TArray<uint8> Payload;
+	Payload.Append(Sys);
+	Payload.Append(Gfx);
+	int32 ZSize = FCompression::CompressMemoryBound(NAME_Zlib, Payload.Num());
+	TArray<uint8> Z; Z.SetNumUninitialized(ZSize);
+	if (!FCompression::CompressMemory(NAME_Zlib, Z.GetData(), ZSize, Payload.GetData(), Payload.Num()))
+	{
+		return Fail(TEXT("zlib compress failed"));
+	}
+	if (ZSize < 7 || Z[0] != 0x78) { return Fail(TEXT("unexpected zlib stream (need standard 2-byte header)")); }
+	const int32 RawStart = 2, RawLen = ZSize - 6;   // strip 2-byte zlib header + 4-byte adler32
+
+	// ---- assemble RSC7 file ----
+	TArray<uint8> Out;
+	auto AddU32 = [&](uint32 V) { Out.Add(V & 0xFF); Out.Add((V >> 8) & 0xFF); Out.Add((V >> 16) & 0xFF); Out.Add((V >> 24) & 0xFF); };
+	Out.Add('R'); Out.Add('S'); Out.Add('C'); Out.Add('7');
+	AddU32(13); AddU32(SysFlag); AddU32(GfxFlag);
+	Out.Append(Z.GetData() + RawStart, RawLen);
+
+	if (!FFileHelper::SaveArrayToFile(Out, *OutYtdPath)) { return Fail(TEXT("write .ytd failed")); }
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"ytdPath\":\"%s\",\"textures\":%d,\"bytes\":%d,\"sysFlags\":\"0x%08x\",\"gfxFlags\":\"0x%08x\"}"),
+		*OutYtdPath, N, Out.Num(), SysFlag, GfxFlag);
+#else
+	return Fail(TEXT("editor-only"));
+#endif
 }

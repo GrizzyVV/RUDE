@@ -69,4 +69,17 @@ public:
 	// Returns JSON: {ok, pngPath, width, height} or {ok:false, error}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportTexture(const FString& TexturePath, const FString& OutPngPath);
+
+	// Export UTexture2D(s) directly to a binary FiveM .ytd (RSC7 v13) - CLEAN-ROOM,
+	// no CodeWalker. The RSC7 container (pgDictionary<grcTexture> system segment +
+	// page-aligned graphics segment + segment flags + raw deflate) was reversed from
+	// our own CW diff pair and byte-verified (tools/write_ytd.py; ENGINEERING_LOG
+	// "RSC7 binary container"). This is P5 step 1 - deleting CodeWalker for textures.
+	// TextureSpecs: comma-separated entries "ContentPath;RageName[;Usage]" (Usage in
+	// DIFFUSE|NORMAL|SPECULAR; drives grcTexture semantics). OutYtdPath: absolute *.ytd.
+	// v1 emits A8R8G8B8 (uncompressed, the in-game-proven path), 1 mip, 4MB-page-aligned
+	// graphics; DXT/BC + tight packing follow. Returns JSON:
+	// {ok, ytdPath, textures, bytes, sysFlags, gfxFlags} or {ok:false, error}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath);
 };
