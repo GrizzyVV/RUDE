@@ -1547,3 +1547,333 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 	return Fail(TEXT("editor-only"));
 #endif
 }
+
+// ======================= ExportYbnBinary - clean-room .ybn (RSC7 v43) =======================
+// UStaticMesh -> phBoundComposite[ phBoundGeometryBVH ], binary, no CodeWalker. P5 step 2.
+// Format reversed from our own CW diff pair; every struct is CONSTRUCTED from pinned field
+// offsets (docs/ENGINEERING_LOG "ybn binary format") - no template bytes, so it generalizes.
+// Validated offline against the rock (2097v/4073t) + a synthetic cube: vertices round-trip
+// within quantum, polys in range, BVH covers every poly exactly once.
+namespace RudeYbn
+{
+	static const float UNK_F1 = 7.62962742e-08f;   // child+0x9c (constant in our emitter)
+	static const float UNK_F2 = 0.0025f;           // child+0xac
+	static const float CHILD_MARGIN = 0.005f;      // child+0x2c ; composite margin = 0
+	static const uint32 CHILD_FLAGS1 = 0x3e;       // composite ChildrenFlags1 (single child)
+	static const uint32 CHILD_FLAGS2 = 0x3e;       // composite ChildrenFlags2
+	static const int32 POLYS_PER_LEAF = 4;
+
+	static void PU32(TArray<uint8>& B, int32 O, uint32 V)
+	{ B[O] = V & 0xFF; B[O+1] = (V>>8) & 0xFF; B[O+2] = (V>>16) & 0xFF; B[O+3] = (V>>24) & 0xFF; }
+	static void PU16(TArray<uint8>& B, int32 O, uint16 V) { B[O] = V & 0xFF; B[O+1] = (V>>8) & 0xFF; }
+	static void PS16(TArray<uint8>& B, int32 O, int16 V) { PU16(B, O, (uint16)V); }
+	static void PF32(TArray<uint8>& B, int32 O, float V)
+	{ uint32 U; FMemory::Memcpy(&U, &V, 4); PU32(B, O, U); }
+	// 8-byte tagged fixup into the system segment (0x50000000 | offset); high 4 bytes zero.
+	static void PPTR(TArray<uint8>& B, int32 O, int32 Target)
+	{ PU32(B, O, 0x50000000u | (uint32)Target); PU32(B, O + 4, 0); }
+	static void PVEC3(TArray<uint8>& B, int32 O, const float V[3])
+	{ PF32(B, O, V[0]); PF32(B, O+4, V[1]); PF32(B, O+8, V[2]); }
+
+	struct FBvhNode
+	{
+		float Lo[3]; float Hi[3];
+		int32 PolyStart = 0; int32 PolyCount = 0;
+		bool bLeaf = false; int32 Escape = 0;
+	};
+
+	// Recursive median split over Idx[Lo,Hi). Nodes appended DFS pre-order; polygons
+	// recorded in LEAF order so each leaf owns a CONTIGUOUS poly range.
+	static int32 BuildBvh(const TArray<FVector3f>& Rel, const TArray<int32>& Indices,
+		const TArray<FVector3f>& TriCtr, TArray<int32>& Idx, int32 Lo, int32 Hi,
+		TArray<FBvhNode>& Nodes, TArray<int32>& PolyOrder)
+	{
+		const int32 NI = Nodes.Num();
+		FBvhNode N;
+		float lo[3] = { FLT_MAX, FLT_MAX, FLT_MAX }, hi[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+		for (int32 k = Lo; k < Hi; ++k)
+		{
+			const int32 T = Idx[k];
+			for (int32 c = 0; c < 3; ++c)
+			{
+				const FVector3f& V = Rel[Indices[T * 3 + c]];
+				for (int32 a = 0; a < 3; ++a)
+				{ lo[a] = FMath::Min(lo[a], V[a]); hi[a] = FMath::Max(hi[a], V[a]); }
+			}
+		}
+		for (int32 a = 0; a < 3; ++a) { N.Lo[a] = lo[a]; N.Hi[a] = hi[a]; }
+
+		if (Hi - Lo <= POLYS_PER_LEAF)
+		{
+			N.bLeaf = true; N.PolyStart = PolyOrder.Num(); N.PolyCount = Hi - Lo;
+			for (int32 k = Lo; k < Hi; ++k) { PolyOrder.Add(Idx[k]); }
+			Nodes.Add(N);
+			return NI;
+		}
+		N.bLeaf = false; Nodes.Add(N);
+
+		int32 Axis = 0; float Best = hi[0] - lo[0];
+		for (int32 a = 1; a < 3; ++a) { const float E = hi[a] - lo[a]; if (E > Best) { Best = E; Axis = a; } }
+		{
+			TArray<int32> Tmp; Tmp.Append(Idx.GetData() + Lo, Hi - Lo);
+			Tmp.Sort([&TriCtr, Axis](const int32& A, const int32& B) { return TriCtr[A][Axis] < TriCtr[B][Axis]; });
+			FMemory::Memcpy(Idx.GetData() + Lo, Tmp.GetData(), sizeof(int32) * (Hi - Lo));
+		}
+		const int32 Mid = Lo + (Hi - Lo) / 2;
+		BuildBvh(Rel, Indices, TriCtr, Idx, Lo, Mid, Nodes, PolyOrder);
+		BuildBvh(Rel, Indices, TriCtr, Idx, Mid, Hi, Nodes, PolyOrder);
+		return NI;
+	}
+
+	// Escape index = the node AFTER this node's whole subtree (stackless skip). RELATIVE
+	// for internal nodes when serialized.
+	static int32 SetEscape(TArray<FBvhNode>& Nodes, int32 i)
+	{
+		if (Nodes[i].bLeaf) { Nodes[i].Escape = i + 1; return i + 1; }
+		int32 n = SetEscape(Nodes, i + 1);
+		n = SetEscape(Nodes, n);
+		Nodes[i].Escape = n;
+		return n;
+	}
+}
+
+FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& OutYbnPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+#if WITH_EDITORONLY_DATA
+	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *AssetPath);
+	if (!Mesh) { return Fail(TEXT("StaticMesh not found")); }
+	const FMeshDescription* MeshDesc = Mesh->GetMeshDescription(0);
+	if (!MeshDesc) { return Fail(TEXT("no MeshDescription on LOD0")); }
+	FStaticMeshConstAttributes Attributes(*MeshDesc);
+	TVertexAttributesConstRef<FVector3f> Positions = Attributes.GetVertexPositions();
+
+	// --- collision soup, welded by position, inverse RUDE transform (cm->m, Y mirror) ---
+	TArray<FVector3f> Verts;
+	TArray<int32> Indices;
+	TMap<FString, int32> Weld;
+	for (const FTriangleID TriID : MeshDesc->Triangles().GetElementIDs())
+	{
+		for (const FVertexID VID : MeshDesc->GetTriangleVertices(TriID))
+		{
+			const FVector3f P = Positions[VID];
+			const FVector3f G(P.X / 100.f, -P.Y / 100.f, P.Z / 100.f);
+			const FString Key = FString::Printf(TEXT("%.4f,%.4f,%.4f"), G.X, G.Y, G.Z);
+			int32 Idx;
+			if (const int32* F = Weld.Find(Key)) { Idx = *F; }
+			else { Idx = Verts.Num(); Verts.Add(G); Weld.Add(Key, Idx); }
+			Indices.Add(Idx);
+		}
+	}
+	const int32 NV = Verts.Num(), NP = Indices.Num() / 3;
+	if (NV == 0 || NP == 0) { return Fail(TEXT("no collision geometry")); }
+	if (NV > 65535) { return Fail(TEXT("vertex count exceeds 65535 (u16 poly indices) - split the mesh")); }
+
+	// --- WORLD aabb + center; vertices are stored RELATIVE to CenterGeom ---
+	FVector3f WMin(FLT_MAX), WMax(-FLT_MAX);
+	for (const FVector3f& V : Verts) { WMin = WMin.ComponentMin(V); WMax = WMax.ComponentMax(V); }
+	const FVector3f Center = (WMin + WMax) * 0.5f;
+	TArray<FVector3f> Rel; Rel.Reserve(NV);
+	for (const FVector3f& V : Verts) { Rel.Add(V - Center); }
+
+	float RMin[3] = { FLT_MAX, FLT_MAX, FLT_MAX }, RMax[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+	for (const FVector3f& R : Rel)
+	{
+		for (int32 a = 0; a < 3; ++a) { RMin[a] = FMath::Min(RMin[a], R[a]); RMax[a] = FMath::Max(RMax[a], R[a]); }
+	}
+	float Quant[3], Half[3];
+	for (int32 a = 0; a < 3; ++a)
+	{
+		Half[a] = FMath::Max(FMath::Abs(RMin[a]), FMath::Abs(RMax[a]));
+		Quant[a] = (Half[a] > 0.f) ? (Half[a] / 32767.0f) : 1.0f;
+	}
+	const float CornerR = FMath::Sqrt(Half[0]*Half[0] + Half[1]*Half[1] + Half[2]*Half[2]);  // +0x14
+	float VertR = 0.f;                                                                       // +0x00
+	for (const FVector3f& R : Rel) { VertR = FMath::Max(VertR, R.Size()); }
+	const float WorldMin[3] = { WMin.X, WMin.Y, WMin.Z };
+	const float WorldMax[3] = { WMax.X, WMax.Y, WMax.Z };
+	const float WorldCtr[3] = { Center.X, Center.Y, Center.Z };
+
+	// --- BVH ---
+	TArray<FVector3f> TriCtr; TriCtr.Reserve(NP);
+	for (int32 j = 0; j < NP; ++j)
+	{
+		TriCtr.Add((Rel[Indices[j*3]] + Rel[Indices[j*3+1]] + Rel[Indices[j*3+2]]) / 3.0f);
+	}
+	TArray<int32> Order; Order.Reserve(NP);
+	for (int32 j = 0; j < NP; ++j) { Order.Add(j); }
+	TArray<RudeYbn::FBvhNode> Nodes; TArray<int32> PolyOrder;
+	RudeYbn::BuildBvh(Rel, Indices, TriCtr, Order, 0, NP, Nodes, PolyOrder);
+	RudeYbn::SetEscape(Nodes, 0);
+	if (PolyOrder.Num() != NP) { return Fail(TEXT("BVH leaf coverage broken")); }
+
+	// node quantization (relative to center, same frame as the stored vertices)
+	float NBMin[3] = { FLT_MAX, FLT_MAX, FLT_MAX }, NBMax[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+	for (const RudeYbn::FBvhNode& N : Nodes)
+	{
+		for (int32 a = 0; a < 3; ++a) { NBMin[a] = FMath::Min(NBMin[a], N.Lo[a]); NBMax[a] = FMath::Max(NBMax[a], N.Hi[a]); }
+	}
+	float NQ[3], NInv[3];
+	for (int32 a = 0; a < 3; ++a)
+	{
+		const float M = FMath::Max(FMath::Abs(NBMin[a]), FMath::Abs(NBMax[a]));
+		NQ[a] = (M > 0.f) ? (M / 32767.0f) : 1.0f;
+		NInv[a] = (NQ[a] > 0.f) ? (1.0f / NQ[a]) : 0.f;
+	}
+	auto QuantS16 = [](float V, float Q) -> int16
+	{ return (int16)FMath::Clamp<int32>(FMath::RoundToInt(V / Q), -32768, 32767); };
+
+	// --- geometry blocks ---
+	TArray<uint8> PolyBytes; PolyBytes.AddZeroed(NP * 16);
+	for (int32 k = 0; k < NP; ++k)
+	{
+		const int32 j = PolyOrder[k];
+		const FVector3f& A = Rel[Indices[j*3]];
+		const FVector3f& B = Rel[Indices[j*3+1]];
+		const FVector3f& C = Rel[Indices[j*3+2]];
+		const float Area = 0.5f * FVector3f::CrossProduct(B - A, C - A).Size();
+		uint32 AreaBits; FMemory::Memcpy(&AreaBits, &Area, 4);
+		AreaBits &= 0xFFFFFFF8u;                       // low 3 bits = polygon TYPE (0 = triangle)
+		RudeYbn::PU32(PolyBytes, k*16, AreaBits);
+		RudeYbn::PU16(PolyBytes, k*16+4, (uint16)Indices[j*3]);
+		RudeYbn::PU16(PolyBytes, k*16+6, (uint16)Indices[j*3+1]);
+		RudeYbn::PU16(PolyBytes, k*16+8, (uint16)Indices[j*3+2]);
+		// +10/+12/+14 = edge-neighbour indices (0 = none; adjacency is a later refinement)
+	}
+	TArray<uint8> VertBytes; VertBytes.AddZeroed(NV * 6);
+	for (int32 i = 0; i < NV; ++i)
+	{
+		for (int32 a = 0; a < 3; ++a) { RudeYbn::PS16(VertBytes, i*6 + a*2, QuantS16(Rel[i][a], Quant[a])); }
+	}
+	TArray<uint8> MatIdxBytes; MatIdxBytes.AddZeroed(NP);          // u8 material index per poly (0)
+	TArray<uint8> NodeBytes; NodeBytes.AddZeroed(Nodes.Num() * 16);
+	for (int32 i = 0; i < Nodes.Num(); ++i)
+	{
+		const RudeYbn::FBvhNode& N = Nodes[i];
+		for (int32 a = 0; a < 3; ++a)
+		{
+			RudeYbn::PS16(NodeBytes, i*16 + a*2,     QuantS16(N.Lo[a], NQ[a]));
+			RudeYbn::PS16(NodeBytes, i*16 + 6 + a*2, QuantS16(N.Hi[a], NQ[a]));
+		}
+		// leaf: (polyStart, polyCount) ; internal: (RELATIVE escape, 0)
+		RudeYbn::PU16(NodeBytes, i*16 + 12, (uint16)(N.bLeaf ? N.PolyStart : (N.Escape - i)));
+		RudeYbn::PU16(NodeBytes, i*16 + 14, (uint16)(N.bLeaf ? N.PolyCount : 0));
+	}
+
+	// --- system segment: composite header reserved @0, then blocks, then structs ---
+	TArray<uint8> Seg; Seg.AddZeroed(0xb0);
+	auto Emit = [&Seg](const TArray<uint8>& D, int32 Align = 16) -> int32
+	{
+		if (Seg.Num() % Align) { Seg.AddZeroed(Align - (Seg.Num() % Align)); }
+		const int32 O = Seg.Num(); Seg.Append(D); return O;
+	};
+	const int32 OPoly = Emit(PolyBytes);
+	const int32 ONode = Emit(NodeBytes);
+	const int32 OVert = Emit(VertBytes);
+	const int32 OMidx = Emit(MatIdxBytes);
+
+	TArray<uint8> Bvh; Bvh.AddZeroed(0x60);                       // phOptimizedBvh header
+	RudeYbn::PPTR(Bvh, 0x00, ONode);
+	RudeYbn::PU32(Bvh, 0x08, (uint32)Nodes.Num()); RudeYbn::PU32(Bvh, 0x0c, (uint32)Nodes.Num());
+	{
+		const float WB0[3] = { NBMin[0]+WorldCtr[0], NBMin[1]+WorldCtr[1], NBMin[2]+WorldCtr[2] };
+		const float WB1[3] = { NBMax[0]+WorldCtr[0], NBMax[1]+WorldCtr[1], NBMax[2]+WorldCtr[2] };
+		RudeYbn::PVEC3(Bvh, 0x20, WB0); RudeYbn::PU32(Bvh, 0x2c, 0xffc00000u);
+		RudeYbn::PVEC3(Bvh, 0x30, WB1); RudeYbn::PU32(Bvh, 0x3c, 0xffc00000u);
+		RudeYbn::PVEC3(Bvh, 0x40, WorldCtr); RudeYbn::PU32(Bvh, 0x4c, 0xffc00000u);
+		RudeYbn::PVEC3(Bvh, 0x50, NInv); RudeYbn::PU32(Bvh, 0x5c, 0xffc00000u);
+	}
+	const int32 OBvh = Emit(Bvh);
+
+	TArray<uint8> Xf; Xf.AddZeroed(0x40);                         // child transform = identity
+	RudeYbn::PF32(Xf, 0x00, 1.f); RudeYbn::PF32(Xf, 0x14, 1.f); RudeYbn::PU32(Xf, 0x1c, 1);
+	RudeYbn::PF32(Xf, 0x28, 1.f); RudeYbn::PU32(Xf, 0x2c, 1);
+	const int32 OXf = Emit(Xf);
+
+	TArray<uint8> F0; F0.AddZeroed(0x20);                          // child+0xf0 block (zero)
+	const int32 OF0 = Emit(F0);
+	TArray<uint8> BlockMap; BlockMap.AddZeroed(0x40); RudeYbn::PU32(BlockMap, 0x08, 2);
+	const int32 OBm = Emit(BlockMap);
+
+	TArray<uint8> ChildBox; ChildBox.AddZeroed(0x20);              // [BoxMin.vec4, BoxMax.vec4] WORLD
+	RudeYbn::PVEC3(ChildBox, 0x00, WorldMin); RudeYbn::PU32(ChildBox, 0x0c, 1);
+	RudeYbn::PVEC3(ChildBox, 0x10, WorldMax); RudeYbn::PF32(ChildBox, 0x1c, RudeYbn::CHILD_MARGIN);
+	const int32 OBbox = Emit(ChildBox);
+	TArray<uint8> Fl1; Fl1.AddZeroed(4); RudeYbn::PU32(Fl1, 0, RudeYbn::CHILD_FLAGS1);
+	const int32 OFl1 = Emit(Fl1);
+	TArray<uint8> Fl2; Fl2.AddZeroed(4); RudeYbn::PU32(Fl2, 0, RudeYbn::CHILD_FLAGS2);
+	const int32 OFl2 = Emit(Fl2);
+
+	// --- phBoundGeometryBVH child header (0x140) ---
+	TArray<uint8> Ch; Ch.AddZeroed(0x140);
+	RudeYbn::PF32(Ch, 0x00, VertR); RudeYbn::PU32(Ch, 0x04, 1);
+	Ch[0x10] = 0x08;                                               // BoundType = GeometryBVH
+	RudeYbn::PF32(Ch, 0x14, CornerR);
+	RudeYbn::PVEC3(Ch, 0x20, WorldMax); RudeYbn::PF32(Ch, 0x2c, RudeYbn::CHILD_MARGIN);
+	RudeYbn::PVEC3(Ch, 0x30, WorldMin); RudeYbn::PU32(Ch, 0x3c, 1);
+	RudeYbn::PVEC3(Ch, 0x40, WorldCtr);
+	RudeYbn::PVEC3(Ch, 0x50, WorldCtr);
+	RudeYbn::PF32(Ch, 0x60, 1.f); RudeYbn::PF32(Ch, 0x64, 1.f);
+	RudeYbn::PF32(Ch, 0x68, 1.f); RudeYbn::PF32(Ch, 0x6c, 1.f);    // Inertia + Volume
+	RudeYbn::PU32(Ch, 0x84, (uint32)NV);
+	RudeYbn::PPTR(Ch, 0x88, OPoly);
+	RudeYbn::PVEC3(Ch, 0x90, Quant); RudeYbn::PF32(Ch, 0x9c, RudeYbn::UNK_F1);
+	RudeYbn::PVEC3(Ch, 0xa0, WorldCtr); RudeYbn::PF32(Ch, 0xac, RudeYbn::UNK_F2);  // CenterGeom
+	RudeYbn::PPTR(Ch, 0xb0, OVert);
+	RudeYbn::PU32(Ch, 0xd0, (uint32)NV); RudeYbn::PU32(Ch, 0xd4, (uint32)NP);
+	RudeYbn::PPTR(Ch, 0xf0, OF0);
+	RudeYbn::PPTR(Ch, 0x118, OMidx);
+	RudeYbn::PPTR(Ch, 0x130, OBvh);
+	const int32 OChild = Emit(Ch);
+
+	TArray<uint8> CArr; CArr.AddZeroed(8); RudeYbn::PPTR(CArr, 0, OChild);
+	const int32 OCArr = Emit(CArr);
+
+	// --- phBoundComposite header @0 ---
+	RudeYbn::PF32(Seg, 0x00, VertR); RudeYbn::PU32(Seg, 0x04, 1);
+	RudeYbn::PPTR(Seg, 0x08, OBm);
+	Seg[0x10] = 0x0a;                                              // BoundType = Composite
+	RudeYbn::PF32(Seg, 0x14, CornerR);
+	RudeYbn::PVEC3(Seg, 0x20, WorldMax); RudeYbn::PF32(Seg, 0x2c, 0.f);   // composite margin = 0
+	RudeYbn::PVEC3(Seg, 0x30, WorldMin); RudeYbn::PU32(Seg, 0x3c, 1);
+	RudeYbn::PVEC3(Seg, 0x40, WorldCtr);
+	RudeYbn::PVEC3(Seg, 0x50, WorldCtr);
+	RudeYbn::PF32(Seg, 0x60, 1.f); RudeYbn::PF32(Seg, 0x64, 1.f);
+	RudeYbn::PF32(Seg, 0x68, 1.f); RudeYbn::PF32(Seg, 0x6c, 1.f);
+	RudeYbn::PPTR(Seg, 0x70, OCArr);
+	RudeYbn::PPTR(Seg, 0x78, OXf); RudeYbn::PPTR(Seg, 0x80, OXf);
+	RudeYbn::PPTR(Seg, 0x88, OBbox);
+	RudeYbn::PPTR(Seg, 0x90, OFl1); RudeYbn::PPTR(Seg, 0x98, OFl2);
+	RudeYbn::PU16(Seg, 0xa0, 1); RudeYbn::PU16(Seg, 0xa2, 1);      // NumChildren, capacity
+
+	// --- container: pad, flags, raw deflate, RSC7 v43 (system segment only) ---
+	if (Seg.Num() % 0x2000) { Seg.AddZeroed(0x2000 - (Seg.Num() % 0x2000)); }
+	int32 SysPages = 0;
+	const uint32 SysFlag = 0x20000000u | RudeYtd::FlagsFromSize((uint32)Seg.Num(), SysPages);
+	const uint32 GfxFlag = 0xb0000000u;
+
+	int32 ZSize = FCompression::CompressMemoryBound(NAME_Zlib, Seg.Num());
+	TArray<uint8> Z; Z.SetNumUninitialized(ZSize);
+	if (!FCompression::CompressMemory(NAME_Zlib, Z.GetData(), ZSize, Seg.GetData(), Seg.Num()))
+	{
+		return Fail(TEXT("zlib compress failed"));
+	}
+	if (ZSize < 7 || Z[0] != 0x78) { return Fail(TEXT("unexpected zlib stream (need standard 2-byte header)")); }
+
+	TArray<uint8> Out;
+	auto AddU32 = [&](uint32 V) { Out.Add(V & 0xFF); Out.Add((V>>8) & 0xFF); Out.Add((V>>16) & 0xFF); Out.Add((V>>24) & 0xFF); };
+	Out.Add('R'); Out.Add('S'); Out.Add('C'); Out.Add('7');
+	AddU32(43); AddU32(SysFlag); AddU32(GfxFlag);
+	Out.Append(Z.GetData() + 2, ZSize - 6);                        // strip zlib header + adler32
+
+	if (!FFileHelper::SaveArrayToFile(Out, *OutYbnPath)) { return Fail(TEXT("write .ybn failed")); }
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"ybnPath\":\"%s\",\"vertices\":%d,\"triangles\":%d,\"bvhNodes\":%d,\"bytes\":%d,\"segSize\":%d,\"sysFlags\":\"0x%08x\"}"),
+		*OutYbnPath, NV, NP, Nodes.Num(), Out.Num(), Seg.Num(), SysFlag);
+#else
+	return Fail(TEXT("editor-only"));
+#endif
+}

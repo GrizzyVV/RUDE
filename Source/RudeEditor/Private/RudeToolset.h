@@ -85,4 +85,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath,
 	                               const FString& MaxDim);
+
+	// Export a UStaticMesh's collision directly to a binary FiveM .ybn (RSC7 v43) -
+	// CLEAN-ROOM, no CodeWalker. P5 step 2. Emits a phBoundComposite wrapping one
+	// phBoundGeometryBVH: quantized vertices, 16-byte triangles, u8 material indices,
+	// and a CONSTRUCTED stackless phOptimizedBvh (escape-index tree). Every phBound
+	// struct is built from pinned field offsets (docs/ENGINEERING_LOG "ybn binary
+	// format") - no template bytes, so it generalizes to any mesh.
+	// FRAME CONVENTION (pinned against the real ybn): header boxes, CenterGeom and the
+	// BVH header boxes are WORLD space; stored vertices are s16 quantized RELATIVE to
+	// CenterGeom, so a reader recovers world = s16*Quantum + CenterGeom.
+	// AssetPath: content path of the StaticMesh. OutYbnPath: absolute *.ybn path.
+	// Returns JSON: {ok, ybnPath, vertices, triangles, bvhNodes, bytes, sysFlags}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ExportYbnBinary(const FString& AssetPath, const FString& OutYbnPath);
 };
