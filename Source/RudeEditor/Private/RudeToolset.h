@@ -96,7 +96,11 @@ public:
 	// BVH header boxes are WORLD space; stored vertices are s16 quantized RELATIVE to
 	// CenterGeom, so a reader recovers world = s16*Quantum + CenterGeom.
 	// AssetPath: content path of the StaticMesh. OutYbnPath: absolute *.ybn path.
+	// WorldOffset: optional "x,y,z" in GTA world metres, ADDED to the mesh's gta-space
+	// vertices. Static world collision (map tiles) stores geometry in ABSOLUTE world
+	// coordinates, so this places the bound where it belongs on the map; empty = none.
 	// Returns JSON: {ok, ybnPath, vertices, triangles, bvhNodes, bytes, sysFlags}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
-	static FString ExportYbnBinary(const FString& AssetPath, const FString& OutYbnPath);
+	static FString ExportYbnBinary(const FString& AssetPath, const FString& OutYbnPath,
+	                               const FString& WorldOffset);
 };

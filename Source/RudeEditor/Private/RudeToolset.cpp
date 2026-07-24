@@ -1635,9 +1635,45 @@ namespace RudeYbn
 		Nodes[i].Escape = n;
 		return n;
 	}
+
+	// RSC7 system-segment page flags, reverse-engineered from CW's KNOWN-GOOD ybn output.
+	// RAGE caps a system page at 0x10000 (64KB) - a single 128KB page is rejected at load
+	// with "Invalid fixup, address is neither virtual nor physical". So:
+	//   - segment <= 64KB : one page, size rounded up to a power of two (>=0x2000), base=size/16
+	//     (matches real small ybns, e.g. itzmapz 0x4000 -> 0x20020001).
+	//   - segment  > 64KB : rounded up to a 64KB multiple, N equal 64KB pages, base 0x200,
+	//     class k7 (matches CW: 0x20000 -> two 64KB pages -> 0x20000040).
+	// Returns the low-28 flag bits (caller ORs the 0x2 segment-type nibble) and the padded size.
+	static uint32 SysPageFlags(uint32 RawSize, uint32& OutSize)
+	{
+		if (RawSize <= 0x10000u)
+		{
+			uint32 S = 0x2000u; while (S < RawSize) { S <<= 1; }
+			OutSize = S;
+			const uint32 Base = S / 16u;              // one k4 page of size S
+			int32 ss = 0; { uint32 b = Base; while (b > 0x200u) { b >>= 1; ++ss; } }
+			return (uint32)ss | (1u << 17);           // s4 = 1 (one page, class k4)
+		}
+		const uint32 S = (RawSize + 0xFFFFu) & ~0xFFFFu;   // ceil to 64KB
+		OutSize = S;
+		const uint32 NPages = S / 0x10000u;
+		// 64KB page = (0x200<<ss) * 2^k ; pick the smallest ss whose count field holds NPages
+		//   ss=0->k7(bit5,max3)  ss=1->k6(bit7,max15)  ss=2->k5(bit11,max63)  ss=3->k4(bit17,max127)
+		const int32 SsT[4] = {0, 1, 2, 3};
+		const int32 BitT[4] = {5, 7, 11, 17};
+		const uint32 MaxT[4] = {3, 15, 63, 127};
+		for (int32 t = 0; t < 4; ++t)
+		{
+			if (NPages <= MaxT[t]) { return (uint32)SsT[t] | (NPages << BitT[t]); }
+		}
+		// >8MB collision (unlikely): fall back to the 4MB-cap tiler (best effort)
+		int32 dummy = 0;
+		return RudeYtd::FlagsFromSize(S, dummy);
+	}
 }
 
-FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& OutYbnPath)
+FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& OutYbnPath,
+                                      const FString& WorldOffset)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -1651,6 +1687,16 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	FStaticMeshConstAttributes Attributes(*MeshDesc);
 	TVertexAttributesConstRef<FVector3f> Positions = Attributes.GetVertexPositions();
 
+	// Optional world placement: static map collision stores ABSOLUTE world coords.
+	FVector3f Offset(0.f, 0.f, 0.f);
+	if (!WorldOffset.TrimStartAndEnd().IsEmpty())
+	{
+		TArray<FString> C;
+		WorldOffset.ParseIntoArray(C, TEXT(","), true);
+		if (C.Num() != 3) { return Fail(TEXT("WorldOffset must be \"x,y,z\" (gta world metres)")); }
+		Offset = FVector3f(FCString::Atof(*C[0]), FCString::Atof(*C[1]), FCString::Atof(*C[2]));
+	}
+
 	// --- collision soup, welded by position, inverse RUDE transform (cm->m, Y mirror) ---
 	TArray<FVector3f> Verts;
 	TArray<int32> Indices;
@@ -1660,7 +1706,7 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 		for (const FVertexID VID : MeshDesc->GetTriangleVertices(TriID))
 		{
 			const FVector3f P = Positions[VID];
-			const FVector3f G(P.X / 100.f, -P.Y / 100.f, P.Z / 100.f);
+			const FVector3f G = FVector3f(P.X / 100.f, -P.Y / 100.f, P.Z / 100.f) + Offset;
 			const FString Key = FString::Printf(TEXT("%.4f,%.4f,%.4f"), G.X, G.Y, G.Z);
 			int32 Idx;
 			if (const int32* F = Weld.Find(Key)) { Idx = *F; }
@@ -1773,6 +1819,9 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	const int32 OPoly = Emit(PolyBytes);
 	const int32 ONode = Emit(NodeBytes);
 	const int32 OVert = Emit(VertBytes);
+	// NOTE: child +0xb8 (m_CompressedShrunkVertices) is left NULL - CW's known-good binary
+	// leaves it null and loads fine, so it is NOT required (an earlier theory that it caused
+	// the fixup crash was disproven by diffing CW's working output).
 	const int32 OMidx = Emit(MatIdxBytes);
 
 	TArray<uint8> Bvh; Bvh.AddZeroed(0x60);                       // phOptimizedBvh header
@@ -1822,7 +1871,7 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	RudeYbn::PPTR(Ch, 0x88, OPoly);
 	RudeYbn::PVEC3(Ch, 0x90, Quant); RudeYbn::PF32(Ch, 0x9c, RudeYbn::UNK_F1);
 	RudeYbn::PVEC3(Ch, 0xa0, WorldCtr); RudeYbn::PF32(Ch, 0xac, RudeYbn::UNK_F2);  // CenterGeom
-	RudeYbn::PPTR(Ch, 0xb0, OVert);
+	RudeYbn::PPTR(Ch, 0xb0, OVert);                // +0xb8 (shrunk verts) intentionally NULL, matches CW
 	RudeYbn::PU32(Ch, 0xd0, (uint32)NV); RudeYbn::PU32(Ch, 0xd4, (uint32)NP);
 	RudeYbn::PPTR(Ch, 0xf0, OF0);
 	RudeYbn::PPTR(Ch, 0x118, OMidx);
@@ -1849,11 +1898,14 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	RudeYbn::PPTR(Seg, 0x90, OFl1); RudeYbn::PPTR(Seg, 0x98, OFl2);
 	RudeYbn::PU16(Seg, 0xa0, 1); RudeYbn::PU16(Seg, 0xa2, 1);      // NumChildren, capacity
 
-	// --- container: pad, flags, raw deflate, RSC7 v43 (system segment only) ---
-	if (Seg.Num() % 0x2000) { Seg.AddZeroed(0x2000 - (Seg.Num() % 0x2000)); }
-	int32 SysPages = 0;
-	const uint32 SysFlag = 0x20000000u | RudeYtd::FlagsFromSize((uint32)Seg.Num(), SysPages);
+	// --- container: RSC7 v43 (system segment only). Page flags reverse-engineered from CW's
+	// known-good output: system pages cap at 64KB (a 128KB single page is rejected at load).
+	// SysPageFlags pads the segment and emits CW's exact encoding (0x20000 -> two 64KB pages
+	// -> 0x20000040; <=64KB -> one pow2 page like real small ybns).
+	uint32 Padded = 0;
+	const uint32 SysFlag = 0x20000000u | RudeYbn::SysPageFlags((uint32)Seg.Num(), Padded);
 	const uint32 GfxFlag = 0xb0000000u;
+	Seg.SetNumZeroed((int32)Padded);
 
 	int32 ZSize = FCompression::CompressMemoryBound(NAME_Zlib, Seg.Num());
 	TArray<uint8> Z; Z.SetNumUninitialized(ZSize);
