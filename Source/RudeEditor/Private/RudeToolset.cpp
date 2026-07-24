@@ -1256,6 +1256,98 @@ namespace RudeYtd
 		}
 		P = MoveTemp(Out); W = NW; H = NH;
 	}
+
+	// ---- clean-room BC block compressors (faithful port of tools/build_ytd.py's numpy
+	// encoders, which render DXT1 + ATI2 in-game). Public S3TC/DX spec, no lifted code. ----
+	static uint16 Pack565(int r, int g, int b)
+	{
+		return (uint16)((((r >> 3) & 0x1F) << 11) | (((g >> 2) & 0x3F) << 5) | ((b >> 3) & 0x1F));
+	}
+	static void Expand565(uint16 c, int& r, int& g, int& b)
+	{
+		const int R = (c >> 11) & 0x1F, G = (c >> 5) & 0x3F, B = c & 0x1F;
+		r = (R << 3) | (R >> 2); g = (G << 2) | (G >> 4); b = (B << 3) | (B >> 2);
+	}
+	// BC1 colour block: 16 RGB pixels -> 8 bytes (4-colour mode; c0>=c1 via component max/min).
+	static void Bc1(const int rgb[16][3], uint8* out)
+	{
+		int mx[3] = { rgb[0][0], rgb[0][1], rgb[0][2] }, mn[3] = { rgb[0][0], rgb[0][1], rgb[0][2] };
+		for (int i = 1; i < 16; ++i) { for (int c = 0; c < 3; ++c) { mx[c] = FMath::Max(mx[c], rgb[i][c]); mn[c] = FMath::Min(mn[c], rgb[i][c]); } }
+		const uint16 c0 = Pack565(mx[0], mx[1], mx[2]), c1 = Pack565(mn[0], mn[1], mn[2]);
+		int p[4][3];
+		Expand565(c0, p[0][0], p[0][1], p[0][2]);
+		Expand565(c1, p[1][0], p[1][1], p[1][2]);
+		for (int c = 0; c < 3; ++c) { p[2][c] = (2 * p[0][c] + p[1][c]) / 3; p[3][c] = (p[0][c] + 2 * p[1][c]) / 3; }
+		uint32 packed = 0;
+		for (int i = 0; i < 16; ++i)
+		{
+			int best = 0x7FFFFFFF, bk = 0;
+			for (int k = 0; k < 4; ++k)
+			{
+				const int dr = rgb[i][0] - p[k][0], dg = rgb[i][1] - p[k][1], db = rgb[i][2] - p[k][2];
+				const int d = dr * dr + dg * dg + db * db;
+				if (d < best) { best = d; bk = k; }
+			}
+			packed |= (uint32)bk << (2 * i);
+		}
+		out[0] = c0 & 0xFF; out[1] = (c0 >> 8) & 0xFF; out[2] = c1 & 0xFF; out[3] = (c1 >> 8) & 0xFF;
+		for (int k = 0; k < 4; ++k) { out[4 + k] = (packed >> (8 * k)) & 0xFF; }
+	}
+	// BC4 single channel: 16 values -> 8 bytes (8-value interp; v0>=v1).
+	static void Bc4(const int v[16], uint8* out)
+	{
+		int v0 = v[0], v1 = v[0];
+		for (int i = 1; i < 16; ++i) { v0 = FMath::Max(v0, v[i]); v1 = FMath::Min(v1, v[i]); }
+		int pal[8];
+		for (int k = 0; k < 8; ++k) { pal[k] = ((7 - k) * v0 + k * v1) / 7; }
+		pal[0] = v0; pal[1] = v1;
+		uint64 packed = 0;
+		for (int i = 0; i < 16; ++i)
+		{
+			int best = 0x7FFFFFFF, bk = 0;
+			for (int k = 0; k < 8; ++k) { const int d = FMath::Abs(v[i] - pal[k]); if (d < best) { best = d; bk = k; } }
+			packed |= (uint64)bk << (3 * i);
+		}
+		out[0] = (uint8)v0; out[1] = (uint8)v1;
+		for (int k = 0; k < 6; ++k) { out[2 + k] = (packed >> (8 * k)) & 0xFF; }
+	}
+	// Encode one mip level of a BGRA buffer (LW x LH) in Mode -> append blocks to Out.
+	// Block order row-major; pixels row-major; edge-replicate pad for sub-4 mips (matches build_ytd).
+	static void EncodeLevel(const TArray<uint8>& BGRA, int32 LW, int32 LH, const FString& Mode, TArray<uint8>& Out)
+	{
+		const int32 BW = (LW + 3) / 4, BH = (LH + 3) / 4;
+		const bool bAti2 = (Mode == TEXT("ATI2")), bDxt5 = (Mode == TEXT("DXT5"));
+		uint8 blk[8];
+		int rgb[16][3], chn[16], Rv[16], Gv[16], Av[16];
+		for (int32 by = 0; by < BH; ++by)
+		{
+			for (int32 bx = 0; bx < BW; ++bx)
+			{
+				for (int py = 0; py < 4; ++py)
+				{
+					for (int px = 0; px < 4; ++px)
+					{
+						const int32 sx = FMath::Min(bx * 4 + px, LW - 1), sy = FMath::Min(by * 4 + py, LH - 1);
+						const uint8* pxl = &BGRA[(sy * LW + sx) * 4];
+						const int idx = py * 4 + px;
+						rgb[idx][0] = pxl[2]; rgb[idx][1] = pxl[1]; rgb[idx][2] = pxl[0];   // R,G,B from BGRA
+						Rv[idx] = pxl[2]; Gv[idx] = pxl[1]; Av[idx] = pxl[3];
+					}
+				}
+				if (bAti2)
+				{
+					for (int i = 0; i < 16; ++i) { chn[i] = Rv[i]; } Bc4(chn, blk); Out.Append(blk, 8);
+					for (int i = 0; i < 16; ++i) { chn[i] = Gv[i]; } Bc4(chn, blk); Out.Append(blk, 8);
+				}
+				else if (bDxt5)
+				{
+					for (int i = 0; i < 16; ++i) { chn[i] = Av[i]; } Bc4(chn, blk); Out.Append(blk, 8);
+					Bc1(rgb, blk); Out.Append(blk, 8);
+				}
+				else { Bc1(rgb, blk); Out.Append(blk, 8); }
+			}
+		}
+	}
 }
 
 FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath,
@@ -1266,7 +1358,8 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
 	};
 #if WITH_EDITORONLY_DATA
-	struct FTexIn { FString Name; uint32 Hash = 0; int32 W = 0; int32 H = 0; uint32 U40 = 20; TArray<uint8> BGRA; };
+	struct FTexIn { FString Name; uint32 Hash = 0; int32 W = 0; int32 H = 0; uint32 U40 = 20;
+	                uint32 Fmt = 21; int32 Stride = 0; int32 Mips = 1; TArray<uint8> Data; };
 	TArray<FTexIn> Texs;
 
 	TArray<FString> Entries;
@@ -1278,48 +1371,72 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 	{
 		TArray<FString> Fld;
 		E.ParseIntoArray(Fld, TEXT(";"), true);
-		if (Fld.Num() < 2) { return Fail(TEXT("each spec needs ContentPath;RageName[;Usage]")); }
+		if (Fld.Num() < 2) { return Fail(TEXT("each spec needs ContentPath;RageName[;Usage[;Format]]")); }
 		const FString Path = Fld[0].TrimStartAndEnd();
 		const FString Name = Fld[1].TrimStartAndEnd();
 		const FString Usage = (Fld.Num() > 2) ? Fld[2].TrimStartAndEnd().ToUpper() : TEXT("DIFFUSE");
+		FString FmtSel = (Fld.Num() > 3) ? Fld[3].TrimStartAndEnd().ToUpper() : TEXT("AUTO");
 
 		UTexture2D* Tex = LoadObject<UTexture2D>(nullptr, *Path);
 		if (!Tex) { return Fail(FString::Printf(TEXT("texture not found: %s"), *Path)); }
 		FTextureSource& Src = Tex->Source;
 		if (!Src.IsValid()) { return Fail(FString::Printf(TEXT("no editor source: %s"), *Path)); }
-		const int32 W = Src.GetSizeX();
-		const int32 H = Src.GetSizeY();
+		int32 tw = Src.GetSizeX(), th = Src.GetSizeY();
 		const ETextureSourceFormat SF = Src.GetFormat();
 		TArray64<uint8> Mip;
 		if (!Src.GetMipData(Mip, 0, 0, 0, nullptr)) { return Fail(FString::Printf(TEXT("GetMipData failed: %s"), *Path)); }
 
-		FTexIn T;
-		T.Name = Name; T.W = W; T.H = H;
-		T.U40 = (Usage == TEXT("NORMAL")) ? 22u : 20u;   // 🧠 usage-derived (reproduced; pending in-game confirm)
-		T.BGRA.SetNumUninitialized(W * H * 4);
+		TArray<uint8> BGRA; BGRA.SetNumUninitialized(tw * th * 4);
 		if (SF == TSF_BGRA8 || SF == TSF_BGRE8)
 		{
-			FMemory::Memcpy(T.BGRA.GetData(), Mip.GetData(), FMath::Min<int64>(Mip.Num(), T.BGRA.Num()));
+			FMemory::Memcpy(BGRA.GetData(), Mip.GetData(), FMath::Min<int64>(Mip.Num(), BGRA.Num()));
 		}
 		else if (SF == TSF_G8)
 		{
-			for (int32 i = 0; i < W * H; ++i)
+			for (int32 i = 0; i < tw * th; ++i)
+			{ const uint8 G = Mip[i]; BGRA[i * 4] = G; BGRA[i * 4 + 1] = G; BGRA[i * 4 + 2] = G; BGRA[i * 4 + 3] = 255; }
+		}
+		else { return Fail(FString::Printf(TEXT("unsupported source fmt %d (want BGRA8/G8): %s"), (int32)SF, *Path)); }
+
+		// optional downscale (mainly for RAW; DXT/BC keeps full-res small enough)
+		while (Cap > 0 && (tw > Cap || th > Cap) && tw > 1 && th > 1) { RudeYtd::HalveBGRA(BGRA, tw, th); }
+
+		// resolve AUTO: NORMAL -> ATI2 (BC5); real alpha -> DXT5; else DXT1 (matches build_ytd)
+		if (FmtSel == TEXT("AUTO"))
+		{
+			if (Usage == TEXT("NORMAL")) { FmtSel = TEXT("ATI2"); }
+			else
 			{
-				const uint8 G = Mip[i];
-				T.BGRA[i * 4] = G; T.BGRA[i * 4 + 1] = G; T.BGRA[i * 4 + 2] = G; T.BGRA[i * 4 + 3] = 255;
+				bool bAlpha = false;
+				for (int32 i = 3; i < BGRA.Num(); i += 4) { if (BGRA[i] < 255) { bAlpha = true; break; } }
+				FmtSel = bAlpha ? TEXT("DXT5") : TEXT("DXT1");
 			}
 		}
-		else
+
+		FTexIn T;
+		T.Name = Name; T.Hash = RudeYtd::Joaat(Name); T.W = tw; T.H = th;
+		T.U40 = (Usage == TEXT("NORMAL")) ? 22u : 20u;   // 🧠 usage-derived (reproduced; pending confirm)
+		if (FmtSel == TEXT("RAW") || FmtSel == TEXT("A8R8G8B8"))
 		{
-			return Fail(FString::Printf(TEXT("unsupported source fmt %d (want BGRA8/G8): %s"), (int32)SF, *Path));
+			T.Fmt = 21; T.Stride = tw * 4; T.Mips = 1; T.Data = MoveTemp(BGRA);      // uncompressed
 		}
-		// Downscale oversized textures. Uncompressed A8R8G8B8 is heavy (a 4096^2 = 64MB)
-		// and FiveM WILL crash the GPU on oversized assets - cap until DXT/BC lands (v2).
-		while (Cap > 0 && (T.W > Cap || T.H > Cap) && T.W > 1 && T.H > 1)
+		else if (FmtSel == TEXT("DXT1") || FmtSel == TEXT("DXT5") || FmtSel == TEXT("ATI2"))
 		{
-			RudeYtd::HalveBGRA(T.BGRA, T.W, T.H);
+			const int32 blockBytes = (FmtSel == TEXT("DXT1")) ? 8 : 16;
+			T.Fmt = (uint32)FmtSel[0] | ((uint32)FmtSel[1] << 8) | ((uint32)FmtSel[2] << 16) | ((uint32)FmtSel[3] << 24);  // FourCC
+			T.Stride = ((tw + 3) / 4) * blockBytes / 4;                              // bytes per pixel-row
+			int32 cw = tw, ch = th, mips = 0;
+			TArray<uint8> lvl = MoveTemp(BGRA);
+			while (true)                                                             // mip chain down to 4x4
+			{
+				RudeYtd::EncodeLevel(lvl, cw, ch, FmtSel, T.Data);
+				++mips;
+				if (cw <= 4 || ch <= 4) { break; }   // RAGE stops at the min DXT block (4x4); sub-4 mips break streaming
+				RudeYtd::HalveBGRA(lvl, cw, ch);
+			}
+			T.Mips = mips;
 		}
-		T.Hash = RudeYtd::Joaat(Name);
+		else { return Fail(FString::Printf(TEXT("unknown format '%s' (AUTO|DXT1|DXT5|ATI2|RAW)"), *FmtSel)); }
 		Texs.Add(MoveTemp(T));
 	}
 
@@ -1327,17 +1444,18 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 	Texs.Sort([](const FTexIn& A, const FTexIn& B) { return A.Hash < B.Hash; });
 	const int32 N = Texs.Num();
 
-	// ---- graphics segment: pixel data, each texture 4MB-page-aligned (v1: uniform pages
-	// -> always-valid flags; the rock case is byte-identical to CW). Tight small-texture
-	// packing is a v2 streaming-budget optimization (needs a mixed-size diff pair). ----
-	const uint32 GP = 0x400000;
+	// ---- graphics segment: pixel data, tightly packed. Each texture aligns to TA (8KB,
+	// as real ytds do - NOT 4MB per texture, which oversized us). The TOTAL pads to a 4MB
+	// page so the segment tiles into uniform 4MB pages -> segment-size flags always valid. ----
+	const uint32 TA = 0x2000;         // per-texture alignment (real-ytd convention)
+	const uint32 GP = 0x400000;       // total-segment page (keeps FlagsFromSize valid)
 	TArray<uint8> Gfx;
 	TArray<uint32> GfxOff; GfxOff.SetNum(N);
 	for (int32 i = 0; i < N; ++i)
 	{
-		if (Gfx.Num() % GP) { Gfx.AddZeroed(GP - (Gfx.Num() % GP)); }
+		if (Gfx.Num() % TA) { Gfx.AddZeroed(TA - (Gfx.Num() % TA)); }
 		GfxOff[i] = (uint32)Gfx.Num();
-		Gfx.Append(Texs[i].BGRA);
+		Gfx.Append(Texs[i].Data);
 	}
 	if (Gfx.Num() % GP) { Gfx.AddZeroed(GP - (Gfx.Num() % GP)); }
 
@@ -1374,9 +1492,9 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 		RudeYtd::PutU32(Sys, b + 0x30, 1);
 		RudeYtd::PutU32(Sys, b + 0x40, T.U40);
 		RudeYtd::PutU16(Sys, b + 0x50, (uint16)T.W); RudeYtd::PutU16(Sys, b + 0x52, (uint16)T.H);
-		RudeYtd::PutU16(Sys, b + 0x54, 1); RudeYtd::PutU16(Sys, b + 0x56, (uint16)(T.W * 4));   // depth, stride
-		RudeYtd::PutU32(Sys, b + 0x58, 21);                                    // D3DFMT_A8R8G8B8
-		Sys[b + 0x5d] = 1;                                                     // mip level count
+		RudeYtd::PutU16(Sys, b + 0x54, 1); RudeYtd::PutU16(Sys, b + 0x56, (uint16)T.Stride);   // depth, stride
+		RudeYtd::PutU32(Sys, b + 0x58, T.Fmt);                                 // D3DFMT enum (21=A8R8G8B8) or FourCC
+		Sys[b + 0x5d] = (uint8)T.Mips;                                         // mip level count
 		RudeYtd::PutU32(Sys, b + 0x70, Gptr(GfxOff[i]));                       // pixel data*
 	}
 	// names (ASCII, null-terminated)
