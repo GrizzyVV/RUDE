@@ -77,9 +77,12 @@ public:
 	// "RSC7 binary container"). This is P5 step 1 - deleting CodeWalker for textures.
 	// TextureSpecs: comma-separated entries "ContentPath;RageName[;Usage]" (Usage in
 	// DIFFUSE|NORMAL|SPECULAR; drives grcTexture semantics). OutYtdPath: absolute *.ytd.
-	// v1 emits A8R8G8B8 (uncompressed, the in-game-proven path), 1 mip, 4MB-page-aligned
-	// graphics; DXT/BC + tight packing follow. Returns JSON:
+	// MaxDim: box-downscale any texture whose W or H exceeds this (power-of-two halving);
+	// "0"/empty = no cap. Uncompressed A8R8G8B8 is heavy - a 4096^2 = 64MB and FiveM will
+	// crash the GPU on oversized assets, so cap until DXT/BC compression lands (v2).
+	// v1 emits A8R8G8B8, 1 mip, 4MB-page-aligned graphics. Returns JSON:
 	// {ok, ytdPath, textures, bytes, sysFlags, gfxFlags} or {ok:false, error}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
-	static FString ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath);
+	static FString ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath,
+	                               const FString& MaxDim);
 };

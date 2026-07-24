@@ -1234,9 +1234,32 @@ namespace RudeYtd
 		B[Off] = V & 0xFF; B[Off + 1] = (V >> 8) & 0xFF; B[Off + 2] = (V >> 16) & 0xFF; B[Off + 3] = (V >> 24) & 0xFF;
 	}
 	static void PutU16(TArray<uint8>& B, int32 Off, uint16 V) { B[Off] = V & 0xFF; B[Off + 1] = (V >> 8) & 0xFF; }
+
+	// Box-downscale BGRA in place by 2x (average each 2x2 block). Power-of-two textures.
+	static void HalveBGRA(TArray<uint8>& P, int32& W, int32& H)
+	{
+		const int32 NW = FMath::Max(1, W / 2), NH = FMath::Max(1, H / 2);
+		TArray<uint8> Out; Out.SetNumUninitialized(NW * NH * 4);
+		for (int32 y = 0; y < NH; ++y)
+		{
+			for (int32 x = 0; x < NW; ++x)
+			{
+				for (int32 c = 0; c < 4; ++c)
+				{
+					const int32 s0 = P[((2 * y) * W + 2 * x) * 4 + c];
+					const int32 s1 = P[((2 * y) * W + 2 * x + 1) * 4 + c];
+					const int32 s2 = P[((2 * y + 1) * W + 2 * x) * 4 + c];
+					const int32 s3 = P[((2 * y + 1) * W + 2 * x + 1) * 4 + c];
+					Out[(y * NW + x) * 4 + c] = (uint8)((s0 + s1 + s2 + s3) / 4);
+				}
+			}
+		}
+		P = MoveTemp(Out); W = NW; H = NH;
+	}
 }
 
-FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath)
+FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath,
+                                      const FString& MaxDim)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -1249,6 +1272,7 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 	TArray<FString> Entries;
 	TextureSpecs.ParseIntoArray(Entries, TEXT(","), true);
 	if (Entries.Num() == 0) { return Fail(TEXT("no texture specs (want ContentPath;RageName;Usage , ...)")); }
+	const int32 Cap = FCString::Atoi(*MaxDim);   // 0/empty = no cap; else box-downscale oversized textures
 
 	for (const FString& E : Entries)
 	{
@@ -1288,6 +1312,12 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 		else
 		{
 			return Fail(FString::Printf(TEXT("unsupported source fmt %d (want BGRA8/G8): %s"), (int32)SF, *Path));
+		}
+		// Downscale oversized textures. Uncompressed A8R8G8B8 is heavy (a 4096^2 = 64MB)
+		// and FiveM WILL crash the GPU on oversized assets - cap until DXT/BC lands (v2).
+		while (Cap > 0 && (T.W > Cap || T.H > Cap) && T.W > 1 && T.H > 1)
+		{
+			RudeYtd::HalveBGRA(T.BGRA, T.W, T.H);
 		}
 		T.Hash = RudeYtd::Joaat(Name);
 		Texs.Add(MoveTemp(T));
