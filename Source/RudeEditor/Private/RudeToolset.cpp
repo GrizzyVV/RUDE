@@ -1811,9 +1811,19 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 
 	// --- system segment: composite header reserved @0, then blocks, then structs ---
 	TArray<uint8> Seg; Seg.AddZeroed(0xb0);
-	auto Emit = [&Seg](const TArray<uint8>& D, int32 Align = 16) -> int32
+	// Page-aware emit: NO struct/array may span a 64KB page boundary. RAGE system pages are
+	// independently relocatable, so a block straddling a page edge resolves to a bad address ->
+	// "Invalid fixup" at load. CW + real ybns respect this (CW places the BVH nodes at exactly
+	// 0x10000). We pad up to the next 64KB boundary before any block that would otherwise cross it.
+	// (Confirmed by diffing CW's known-good binary: our page FLAGS matched but our LAYOUT spanned.)
+	const int32 YBN_PAGE = 0x10000;
+	auto Emit = [&Seg, YBN_PAGE](const TArray<uint8>& D, int32 Align = 16) -> int32
 	{
 		if (Seg.Num() % Align) { Seg.AddZeroed(Align - (Seg.Num() % Align)); }
+		if (D.Num() <= YBN_PAGE && (Seg.Num() % YBN_PAGE) + D.Num() > YBN_PAGE)
+		{
+			Seg.AddZeroed(YBN_PAGE - (Seg.Num() % YBN_PAGE));   // don't straddle a page boundary
+		}
 		const int32 O = Seg.Num(); Seg.Append(D); return O;
 	};
 	const int32 OPoly = Emit(PolyBytes);
