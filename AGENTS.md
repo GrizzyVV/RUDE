@@ -12,6 +12,11 @@ All tools take/return JSON-friendly values; results are JSON strings with an `ok
 |---|---|---|
 | `Ping` | `() -> string` | Version + liveness |
 | `ImportYdr` | `(XmlPath, DestFolder) -> json` | CodeWalker ydr XML → `UStaticMesh`. Material slots are named `<rage_shader_preset>__<geoIndex>` — bind materials by slot name |
+| `ImportYtd` | `(XmlPath, PixelFolder, DestFolder) -> json` | ytd XML + decoded PNGs → `UTexture2D` with Usage-driven semantics (NORMAL→TC_Normalmap, sRGB rules) |
+| `ExportYdr` | `(AssetPath, OutXmlPath) -> json` | `UStaticMesh` → CW-valid ydr XML (inverse transform, shader presets, embedded collision `<Bounds>`) |
+| `ExportYbn` | `(AssetPath, OutXmlPath) -> json` | `UStaticMesh` collision → `.ybn` XML (standalone bounds; note: prop collision actually comes from the ydr's embedded bounds) |
+| `ExportTexture` | `(TexturePath, OutPngPath) -> json` | `UTexture2D` source (BGRA8) → PNG |
+| `ExportYtdBinary` | `(TextureSpecs, OutYtdPath, MaxDim) -> json` | **`UTexture2D`(s) → a binary FiveM `.ytd` (RSC7 v13), clean-room — NO CodeWalker.** `TextureSpecs` = `"Path;RageName[;Usage]"` comma-joined; `MaxDim` caps texture size (0 = none). v1 = A8R8G8B8; DXT/BC + mips next |
 
 ## The conventions (violating these breaks round-trips)
 
