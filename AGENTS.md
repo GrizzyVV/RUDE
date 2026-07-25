@@ -16,7 +16,8 @@ All tools take/return JSON-friendly values; results are JSON strings with an `ok
 | `ExportYdr` | `(AssetPath, OutXmlPath) -> json` | `UStaticMesh` → CW-valid ydr XML (inverse transform, shader presets, embedded collision `<Bounds>`) |
 | `ExportYbn` | `(AssetPath, OutXmlPath) -> json` | `UStaticMesh` collision → `.ybn` XML (standalone bounds; note: prop collision actually comes from the ydr's embedded bounds) |
 | `ExportTexture` | `(TexturePath, OutPngPath) -> json` | `UTexture2D` source (BGRA8) → PNG |
-| `ExportYtdBinary` | `(TextureSpecs, OutYtdPath, MaxDim) -> json` | **`UTexture2D`(s) → a binary FiveM `.ytd` (RSC7 v13), clean-room — NO CodeWalker.** `TextureSpecs` = `"Path;RageName[;Usage]"` comma-joined; `MaxDim` caps texture size (0 = none). v1 = A8R8G8B8; DXT/BC + mips next |
+| `ExportYtdBinary` | `(TextureSpecs, OutYtdPath, MaxDim) -> json` | **`UTexture2D`(s) → a binary FiveM `.ytd` (RSC7 v13), clean-room — NO CodeWalker. Validated in-game.** `TextureSpecs` = `"Path;RageName[;Usage[;Format]]"` comma-joined (Format `AUTO\|DXT1\|DXT5\|ATI2\|RAW`; AUTO: NORMAL→ATI2, alpha→DXT5, else DXT1). DXT/BC with mip chains capped at 4×4; `MaxDim` optional downscale (0 = none) |
+| `ExportYbnBinary` | `(AssetPath, OutYbnPath, WorldOffset) -> json` | **`UStaticMesh` → a binary FiveM `.ybn` (RSC7 v43), clean-room — NO CodeWalker. Validated in-game** (streamed world collision via ymap `<physicsDictionaries>`). phBoundComposite→GeometryBVH: quantized verts, stackless BVH + mandatory `m_Trees` subtree table, page-aware layout (no struct spans a 64KB page). `WorldOffset` = `"x,y,z"` gta metres for absolute world placement; empty = mesh-local |
 
 ## The conventions (violating these breaks round-trips)
 
