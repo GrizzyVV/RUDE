@@ -2224,7 +2224,10 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	for (int32 gi = 0; gi < Geos.Num(); ++gi)
 	{
 		const FGeo& G = Geos[gi];
-		TArray<uint8> Vb; Vb.AddZeroed(0x40);
+		// Struct sizes padded to the ORACLE's observed inter-struct spacing (its gaps are
+		// zero tails = null pointer slots the loader fixes up; packing the next struct's
+		// live data there reads as a bogus pointer -> "Invalid fixup", crash #4).
+		TArray<uint8> Vb; Vb.AddZeroed(0x80);
 		RudeYbn::PU32(Vb, 0x00, 0x4061d3f8u); RudeYbn::PU32(Vb, 0x04, 1);
 		RudeYbn::PU16(Vb, 0x08, 36); RudeYbn::PU16(Vb, 0x0a, 0x59);
 		RudeYbn::PPTR(Vb, 0x10, OVData[gi]);
@@ -2232,12 +2235,12 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 		RudeYbn::PPTR(Vb, 0x20, OVData[gi]);
 		RudeYbn::PPTR(Vb, 0x30, OFvf);
 		const int32 OVb = Emit(Vb);
-		TArray<uint8> Ib; Ib.AddZeroed(0x20);
+		TArray<uint8> Ib; Ib.AddZeroed(0x60);
 		RudeYbn::PU32(Ib, 0x00, 0x4061d158u); RudeYbn::PU32(Ib, 0x04, 1);
 		RudeYbn::PU32(Ib, 0x08, (uint32)G.Indices.Num());
 		RudeYbn::PPTR(Ib, 0x10, OIData[gi]);
 		const int32 OIb = Emit(Ib);
-		TArray<uint8> Ge; Ge.AddZeroed(0x80);
+		TArray<uint8> Ge; Ge.AddZeroed(0xa0);
 		RudeYbn::PU32(Ge, 0x00, 0x40618798u); RudeYbn::PU32(Ge, 0x04, 1);
 		RudeYbn::PPTR(Ge, 0x18, OVb);
 		RudeYbn::PPTR(Ge, 0x38, OIb);
