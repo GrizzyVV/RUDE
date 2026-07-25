@@ -88,6 +88,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYbn(const FString& AssetPath, const FString& OutXmlPath);
 
+	// THE THREAD-PULL: one call ingests a whole map area from the corpus.
+	// 1) builds an archetype index from every .ytyp XML under <CorpusRoot>/ytyp
+	// 2) parses <CorpusRoot>/ymap/<YmapPrefix>*.xml entities (import-lane transforms)
+	// 3) imports every referenced drawable found under <CorpusRoot>/ydr (skip-if-exists)
+	// 4) writes the scene manifest and spawns it via ImportScene (ISM actors,
+	//    idempotent, proxy cubes for corpus holes).
+	// Filter: "HD" (default) or "ALL" lod levels. Textures remain a separate pass
+	// until native BC decode lands. Returns JSON: {ok, ymaps, entities, resolved,
+	// meshesImported, meshesSkipped, meshesFailed, spawn:{...ImportScene stats}}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
+	                             const FString& DestMeshFolder, const FString& Filter);
+
 	// Emit a CMapTypes .ytyp (XML, FiveM-Legacy-loadable) defining one
 	// CBaseArchetypeDef per drawable. YdrSpecs: comma-separated
 	// "absPathTo.ydr.xml[;txd[;physDict]]". Encodes the in-game-proven collision

@@ -1366,6 +1366,135 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures, *SlotsJson);
 }
 
+FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
+                                    const FString& DestMeshFolder, const FString& Filter)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	// ---- 1) archetype index from every ytyp XML (name -> drawable assetName) ----
+	TMap<FString, FString> ArchToAsset;
+	{
+		TArray<FString> YtypFiles;
+		IFileManager::Get().FindFiles(YtypFiles, *(CorpusRoot / TEXT("ytyp") / TEXT("*.xml")), true, false);
+		for (const FString& F : YtypFiles)
+		{
+			FXmlFile Xml(CorpusRoot / TEXT("ytyp") / F);
+			if (!Xml.IsValid()) { continue; }
+			const FXmlNode* Root = Xml.GetRootNode();
+			const FXmlNode* Arche = Root ? Root->FindChildNode(TEXT("archetypes")) : nullptr;
+			if (!Arche) { continue; }
+			for (const FXmlNode* Item : Arche->GetChildrenNodes())
+			{
+				const FXmlNode* NameN = Item->FindChildNode(TEXT("name"));
+				const FXmlNode* AssetN = Item->FindChildNode(TEXT("assetName"));
+				const FXmlNode* TypeN = Item->FindChildNode(TEXT("assetType"));
+				if (!NameN || !AssetN) { continue; }
+				// drawable-backed archetypes only; ydd-dictionary / fragment archetypes
+				// stay unresolved (proxy cubes) until those importers exist
+				const FString AType = TypeN ? TypeN->GetContent().TrimStartAndEnd() : FString();
+				if (!AType.IsEmpty() && AType != TEXT("ASSET_TYPE_DRAWABLE")) { continue; }
+				ArchToAsset.Add(NameN->GetContent().TrimStartAndEnd().ToLower(),
+				                AssetN->GetContent().TrimStartAndEnd().ToLower());
+			}
+		}
+		if (ArchToAsset.Num() == 0) { return Fail(TEXT("no archetypes indexed - check CorpusRoot/ytyp")); }
+	}
+	// ---- 2) parse ymaps -> manifest scenes (IMPORT-lane transforms: pos Y-mirror*100,
+	// quat = (x,-y,z,w) - the boardwalk-anchored map, NOT the export involution) ----
+	TArray<FString> YmapFiles;
+	IFileManager::Get().FindFiles(YmapFiles, *(CorpusRoot / TEXT("ymap") / (YmapPrefix + TEXT("*.xml"))), true, false);
+	if (YmapFiles.Num() == 0) { return Fail(TEXT("no ymaps match the prefix")); }
+	int32 TotalEnts = 0, Resolved = 0;
+	TSet<FString> NeededDrawables;
+	FString ScenesJson;
+	for (const FString& F : YmapFiles)
+	{
+		FXmlFile Xml(CorpusRoot / TEXT("ymap") / F);
+		if (!Xml.IsValid()) { continue; }
+		const FXmlNode* Root = Xml.GetRootNode();
+		const FXmlNode* Ents = Root ? Root->FindChildNode(TEXT("entities")) : nullptr;
+		if (!Ents) { continue; }
+		FString EntJson;
+		int32 SceneEnts = 0;
+		for (const FXmlNode* E : Ents->GetChildrenNodes())
+		{
+			const FXmlNode* AN = E->FindChildNode(TEXT("archetypeName"));
+			const FXmlNode* Pos = E->FindChildNode(TEXT("position"));
+			if (!AN || !Pos) { continue; }
+			const FString Arch = AN->GetContent().TrimStartAndEnd().ToLower();
+			const double Px = FCString::Atod(*Pos->GetAttribute(TEXT("x")));
+			const double Py = FCString::Atod(*Pos->GetAttribute(TEXT("y")));
+			const double Pz = FCString::Atod(*Pos->GetAttribute(TEXT("z")));
+			double Qx = 0, Qy = 0, Qz = 0, Qw = 1;
+			if (const FXmlNode* Rot = E->FindChildNode(TEXT("rotation")))
+			{
+				Qx = FCString::Atod(*Rot->GetAttribute(TEXT("x")));
+				Qy = FCString::Atod(*Rot->GetAttribute(TEXT("y")));
+				Qz = FCString::Atod(*Rot->GetAttribute(TEXT("z")));
+				Qw = FCString::Atod(*Rot->GetAttribute(TEXT("w")));
+			}
+			auto Val = [&](const TCHAR* Tag, double Def) -> double
+			{
+				const FXmlNode* N = E->FindChildNode(Tag);
+				return N ? FCString::Atod(*N->GetAttribute(TEXT("value"))) : Def;
+			};
+			const FXmlNode* LodN = E->FindChildNode(TEXT("lodLevel"));
+			const FString Lod = LodN ? LodN->GetContent().TrimStartAndEnd() : FString();
+			const FString* Asset = ArchToAsset.Find(Arch);
+			++TotalEnts; ++SceneEnts;
+			if (Asset) { ++Resolved; NeededDrawables.Add(*Asset); }
+			EntJson += FString::Printf(TEXT(
+				"%s{\"archetype\":\"%s\",\"drawable\":%s,\"lodLevel\":\"%s\","
+				"\"ue_location\":[%f,%f,%f],\"ue_quat\":[%f,%f,%f,%f],\"scaleXY\":%f,\"scaleZ\":%f}"),
+				SceneEnts > 1 ? TEXT(",") : TEXT(""), *Arch,
+				Asset ? *FString::Printf(TEXT("\"%s\""), **Asset) : TEXT("null"), *Lod,
+				Px * 100.0, -Py * 100.0, Pz * 100.0,
+				Qx, -Qy, Qz, Qw,
+				Val(TEXT("scaleXY"), 1.0), Val(TEXT("scaleZ"), 1.0));
+		}
+		if (SceneEnts == 0) { continue; }
+		FString YmapName = FPaths::GetBaseFilename(F);
+		YmapName.RemoveFromEnd(TEXT(".ymap"));
+		ScenesJson += FString::Printf(TEXT("%s{\"ymap\":\"%s\",\"entities\":[%s]}"),
+			ScenesJson.IsEmpty() ? TEXT("") : TEXT(","), *YmapName, *EntJson);
+	}
+	const FString ManifestPath = FPaths::ProjectSavedDir() / TEXT("RUDE") /
+		FString::Printf(TEXT("area_%s_manifest.json"), *YmapPrefix.Replace(TEXT("*"), TEXT("")));
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(ManifestPath), true);
+	if (!FFileHelper::SaveStringToFile(TEXT("[") + ScenesJson + TEXT("]"), *ManifestPath,
+		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		return Fail(TEXT("failed to write area manifest"));
+	}
+	// ---- 3) import every referenced drawable present in the corpus (skip-if-exists) ----
+	int32 MeshOk = 0, MeshSkip = 0, MeshFail = 0, MeshMissing = 0, Done = 0;
+	for (const FString& D : NeededDrawables)
+	{
+		++Done;
+		const FString YdrPath = CorpusRoot / TEXT("ydr") / (D + TEXT(".ydr.xml"));
+		if (!FPaths::FileExists(YdrPath)) { ++MeshMissing; continue; }
+		if (FPackageName::DoesPackageExist(DestMeshFolder / D)) { ++MeshSkip; continue; }
+		const FString R = ImportYdr(YdrPath, DestMeshFolder);
+		if (R.Contains(TEXT("\"ok\":true"))) { ++MeshOk; } else { ++MeshFail; }
+		if (Done % 100 == 0)
+		{
+			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportMapArea meshes %d/%d (ok %d, skip %d, fail %d)"),
+				Done, NeededDrawables.Num(), MeshOk, MeshSkip, MeshFail);
+			CollectGarbage(RF_NoFlags);
+		}
+	}
+	// ---- 4) spawn through the proven ImportScene path ----
+	const FString Spawn = ImportScene(ManifestPath, DestMeshFolder, Filter);
+	return FString::Printf(TEXT(
+		"{\"ok\":true,\"ymaps\":%d,\"entities\":%d,\"resolved\":%d,\"meshesImported\":%d,"
+		"\"meshesSkipped\":%d,\"meshesFailed\":%d,\"meshesMissingFromCorpus\":%d,"
+		"\"manifest\":\"%s\",\"spawn\":%s}"),
+		YmapFiles.Num(), TotalEnts, Resolved, MeshOk, MeshSkip, MeshFail, MeshMissing,
+		*ManifestPath, *Spawn);
+}
+
 // Ported from the in-game-proven tools/emit_ytyp.py - the archetype flag +
 // physicsDictionary laws are load-bearing (FULL COLLISION MODEL, 2026-07-24).
 FString URudeToolset::ExportYtyp(const FString& YdrSpecs, const FString& YtypName,
