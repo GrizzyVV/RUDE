@@ -1881,6 +1881,30 @@ namespace RudeYbn
 		return n;
 	}
 
+	// Uniform-page flag encoding for LARGE resources: N pages of size P (pow2 >= 0x2000).
+	// Page size must be >= the largest single emitted block, or the block SPANS a page
+	// boundary - RAGE pages are independently relocatable and a torn blob crashes the
+	// allocator (ERR_MEM_MULTIALLOC_FREE, learned in-game on the first binary ydr: the
+	// rock's 120KB vertex blob straddled uniform 64KB pages; CW's oracle avoids it with
+	// a 128KB first page). Encoding: P = 0x200 << (ss+k); count of class-k pages lives
+	// in a bounded bit-field, so pick the smallest ss whose k-field holds N.
+	static uint32 SysPageFlagsUniform(uint32 RawSize, uint32 P, uint32& OutPadded, uint32& OutPages)
+	{
+		const uint32 N = (RawSize + P - 1) / P;
+		OutPadded = N * P; OutPages = N;
+		int32 Shift = 0; { uint32 v = P; while (v > 0x200u) { v >>= 1; ++Shift; } }   // ss+k
+		// class k: bit position + capacity (k8..k4 usable; k3..k0 capacity 1)
+		static const int32 KBit[9] = { 27, 26, 25, 24, 17, 11, 7, 5, 4 };   // k0..k8
+		static const uint32 KMax[9] = { 1, 1, 1, 1, 127, 63, 15, 3, 1 };
+		for (int32 k = FMath::Min(Shift, 8); k >= 0; --k)
+		{
+			const int32 ss = Shift - k;
+			if (ss > 0xF || KMax[k] < N) { continue; }
+			return (uint32)ss | (N << KBit[k]);
+		}
+		return 0xFFFFFFFFu;   // unencodable (absurd sizes) - caller must fail
+	}
+
 	// RSC7 system-segment page flags, reverse-engineered from CW's KNOWN-GOOD ybn output.
 	// RAGE caps a system page at 0x10000 (64KB) - a single 128KB page is rejected at load
 	// with "Invalid fixup, address is neither virtual nor physical". So:
@@ -2021,9 +2045,41 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	const FVector3f Center = (BMin + BMax) * 0.5f;
 	const float Radius = (BMax - Center).Size();
 
-	// --- segment writer: header reserved @0, page-aware Emit (no struct spans 64KB) ---
+	// --- collision soup (welded across all geometries) computed EARLY so the page plan
+	// can account for every block size before anything is emitted ---
+	TArray<FVector3f> CV; TArray<int32> CI;
+	{
+		TMap<FString, int32> W2;
+		for (const FGeo& G : Geos)
+		{
+			for (int32 i = 0; i < G.Indices.Num(); ++i)
+			{
+				const FVector3f P = G.Pos[G.Indices[i]];
+				const FString K = FString::Printf(TEXT("%.4f,%.4f,%.4f"), P.X, P.Y, P.Z);
+				int32 Idx;
+				if (const int32* F = W2.Find(K)) { Idx = *F; }
+				else { Idx = CV.Num(); CV.Add(P); W2.Add(K, Idx); }
+				CI.Add(Idx);
+			}
+		}
+	}
+	if (CV.Num() > 65535) { return Fail(TEXT("collision verts exceed 65535")); }
+
+	// --- page plan: page size = pow2 >= the largest single block (a block may NEVER
+	// span a page boundary; RAGE pages are independently relocatable - the in-game
+	// ERR_MEM_MULTIALLOC_FREE law) ---
+	uint32 Largest = 0x2000;
+	for (const FGeo& G : Geos)
+	{
+		Largest = FMath::Max(Largest, (uint32)G.Pos.Num() * 36u);
+		Largest = FMath::Max(Largest, (uint32)G.Indices.Num() * 2u);
+	}
+	Largest = FMath::Max(Largest, (uint32)(CI.Num() / 3) * 16u);   // bound polys; node array is smaller
+	Largest = FMath::Max(Largest, (uint32)CV.Num() * 6u);
+	const int32 PAGE = (int32)FMath::RoundUpToPowerOfTwo(Largest);
+
+	// --- segment writer: header reserved @0, page-aware Emit ---
 	TArray<uint8> Seg; Seg.AddZeroed(0xd0);
-	const int32 PAGE = 0x10000;
 	auto Emit = [&Seg, PAGE](const TArray<uint8>& D, int32 Align = 16) -> int32
 	{
 		if (Seg.Num() % Align) { Seg.AddZeroed(Align - (Seg.Num() % Align)); }
@@ -2196,24 +2252,7 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	// in-game-proven ExportYbnBinary with the composite emitted in place (not @0) ----------
 	int32 OComposite = 0;
 	{
-		TArray<FVector3f> CV; TArray<int32> CI;
-		{
-			TMap<FString, int32> W2;
-			for (const FGeo& G : Geos)
-			{
-				for (int32 i = 0; i < G.Indices.Num(); ++i)
-				{
-					const FVector3f P = G.Pos[G.Indices[i]];
-					const FString K = FString::Printf(TEXT("%.4f,%.4f,%.4f"), P.X, P.Y, P.Z);
-					int32 Idx;
-					if (const int32* F = W2.Find(K)) { Idx = *F; }
-					else { Idx = CV.Num(); CV.Add(P); W2.Add(K, Idx); }
-					CI.Add(Idx);
-				}
-			}
-		}
 		const int32 NV = CV.Num(), NP = CI.Num() / 3;
-		if (NV > 65535) { return Fail(TEXT("collision verts exceed 65535")); }
 		FVector3f WMin(FLT_MAX), WMax(-FLT_MAX);
 		for (const FVector3f& V : CV) { WMin = WMin.ComponentMin(V); WMax = WMax.ComponentMax(V); }
 		const FVector3f Ctr = (WMin + WMax) * 0.5f;
@@ -2409,12 +2448,14 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	RudeYbn::PPTR(Seg, 0xa8, OName);
 	RudeYbn::PPTR(Seg, 0xc8, OComposite);
 
-	// --- container: RSC7 v165, sys hi-nibble 0xa, gfx 0x5 (gfx=0), uniform 64KB pages ---
-	uint32 Padded = 0;
-	const uint32 SysFlag = 0xa0000000u | RudeYbn::SysPageFlags((uint32)Seg.Num(), Padded);
+	// --- container: RSC7 v165, sys hi-nibble 0xa, gfx 0x5 (gfx=0), uniform pages of PAGE ---
+	uint32 Padded = 0, NPages = 0;
+	const uint32 LowFlags = RudeYbn::SysPageFlagsUniform((uint32)Seg.Num(), (uint32)PAGE, Padded, NPages);
+	if (LowFlags == 0xFFFFFFFFu) { return Fail(TEXT("unencodable page plan - resource too large")); }
+	const uint32 SysFlag = 0xa0000000u | LowFlags;
 	const uint32 GfxFlag = 0x50000000u;
 	Seg.SetNumZeroed((int32)Padded);
-	RudeYbn::PU32(Seg, OBm + 0x08, Padded / 0x10000u);   // blockmap page count
+	RudeYbn::PU32(Seg, OBm + 0x08, NPages);   // blockmap page count
 
 	int32 ZSize = FCompression::CompressMemoryBound(NAME_Zlib, Seg.Num());
 	TArray<uint8> Z; Z.SetNumUninitialized(ZSize);
@@ -2485,6 +2526,13 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	const int32 NV = Verts.Num(), NP = Indices.Num() / 3;
 	if (NV == 0 || NP == 0) { return Fail(TEXT("no collision geometry")); }
 	if (NV > 65535) { return Fail(TEXT("vertex count exceeds 65535 (u16 poly indices) - split the mesh")); }
+	// A single block may never span a page boundary; this writer's proven pager uses
+	// 64KB pages, so any block > 64KB would emit a torn (crashing) resource. Fail loudly
+	// instead (upgrade path: the uniform-P pager ExportYdrBinary uses).
+	if (NP * 16 > 0x10000 || NV * 6 > 0x10000)
+	{
+		return Fail(TEXT("collision block exceeds the 64KB page (>4096 tris) - split the mesh; large-page ybn support queued"));
+	}
 
 	// --- WORLD aabb + center; vertices are stored RELATIVE to CenterGeom ---
 	FVector3f WMin(FLT_MAX), WMax(-FLT_MAX);
