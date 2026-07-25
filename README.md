@@ -1,5 +1,6 @@
 # RUDE — RAGE ↔ Unreal Development Environment
-<img width="2550" height="1398" alt="image" src="https://github.com/user-attachments/assets/81297560-6cc8-4606-b27f-9fa761e01e65" />
+<img width="2554" height="1400" alt="image" src="https://github.com/user-attachments/assets/6c0b2d52-c2a6-4643-953a-7329a4eaddc7" />
+
 
 **Unreal Engine as a first-class FiveM mapping DCC.** Import GTA V map context into UE,
 author with real level-editor tools, export straight back to FiveM.
