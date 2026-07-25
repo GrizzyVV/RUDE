@@ -1561,7 +1561,15 @@ namespace RudeYbn
 	static const float CHILD_MARGIN = 0.005f;      // child+0x2c ; composite margin = 0
 	static const uint32 CHILD_FLAGS1 = 0x3e;       // composite ChildrenFlags1 (single child)
 	static const uint32 CHILD_FLAGS2 = 0x3e;       // composite ChildrenFlags2
+	// Second u32 of each 16-byte ChildrenFlags entry, copied from CW's known-good binary
+	// byte-for-byte (looks like don't-care/uninitialized in CW's writer; kept for parity).
+	static const uint32 CHILD_FLAGS_PAD = 0x07f3bec0;
 	static const int32 POLYS_PER_LEAF = 4;
+	// phOptimizedBvh m_Trees: maximal subtrees of <= this many nodes. Pinned from the real
+	// Legacy corpus (41 ybns, Desktop/fxserver): max observed tree span = 127 across every
+	// file; spine (uncovered) nodes = treeCount-1 in EVERY file, i.e. trees are the maximal
+	// <=127-node subtrees of one flat stackless BVH. Subtree node counts are always odd.
+	static const int32 MAX_NODES_PER_TREE = 127;
 
 	static void PU32(TArray<uint8>& B, int32 O, uint32 V)
 	{ B[O] = V & 0xFF; B[O+1] = (V>>8) & 0xFF; B[O+2] = (V>>16) & 0xFF; B[O+3] = (V>>24) & 0xFF; }
@@ -1756,6 +1764,30 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	RudeYbn::SetEscape(Nodes, 0);
 	if (PolyOrder.Num() != NP) { return Fail(TEXT("BVH leaf coverage broken")); }
 
+	// m_Trees: cut the flat stackless BVH into its maximal subtrees of <= MAX_NODES_PER_TREE
+	// nodes (each entry = (startNode, endNode) absolute). MANDATORY: every real ybn has this
+	// array; its absence was the final "Invalid fixup" root cause (the loader fixes up the
+	// m_Trees pointer at bvhHdr+0x70, which our 0x60-byte header did not contain).
+	TArray<TPair<int32, int32>> Trees;
+	{
+		TArray<int32> Stack; Stack.Add(0);
+		while (Stack.Num() > 0)
+		{
+			const int32 i = Stack.Pop();
+			const int32 Size = Nodes[i].Escape - i;   // Escape is absolute here: subtree = [i, Escape)
+			if (Size <= RudeYbn::MAX_NODES_PER_TREE || Nodes[i].bLeaf)
+			{
+				Trees.Add(TPair<int32, int32>(i, Nodes[i].Escape));
+			}
+			else
+			{
+				// right child first so the stack pops left-to-right (entries stay in node order)
+				Stack.Add(Nodes[i + 1].Escape);
+				Stack.Add(i + 1);
+			}
+		}
+	}
+
 	// node quantization (relative to center, same frame as the stored vertices)
 	float NBMin[3] = { FLT_MAX, FLT_MAX, FLT_MAX }, NBMax[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
 	for (const RudeYbn::FBvhNode& N : Nodes)
@@ -1834,7 +1866,26 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	// the fixup crash was disproven by diffing CW's working output).
 	const int32 OMidx = Emit(MatIdxBytes);
 
-	TArray<uint8> Bvh; Bvh.AddZeroed(0x60);                       // phOptimizedBvh header
+	// m_Trees array: 16 bytes/entry = the root node's quantized AABB (s16 min/max, same
+	// quantum+frame as the node array) + u16 startNode + u16 endNode (absolute, exclusive).
+	TArray<uint8> TreeBytes; TreeBytes.AddZeroed(Trees.Num() * 16);
+	for (int32 t = 0; t < Trees.Num(); ++t)
+	{
+		const RudeYbn::FBvhNode& RootN = Nodes[Trees[t].Key];
+		for (int32 a = 0; a < 3; ++a)
+		{
+			RudeYbn::PS16(TreeBytes, t*16 + a*2,     QuantS16(RootN.Lo[a], NQ[a]));
+			RudeYbn::PS16(TreeBytes, t*16 + 6 + a*2, QuantS16(RootN.Hi[a], NQ[a]));
+		}
+		RudeYbn::PU16(TreeBytes, t*16 + 12, (uint16)Trees[t].Key);
+		RudeYbn::PU16(TreeBytes, t*16 + 14, (uint16)Trees[t].Value);
+	}
+	const int32 OTrees = Emit(TreeBytes);
+
+	// phOptimizedBvh header is 0x80 bytes (NOT 0x60 - the 0x60 truncation dropped the
+	// m_Trees pointer slot and was the final in-game "Invalid fixup" root cause):
+	// +0x60 forward quantum vec4, +0x70 m_Trees ptr, +0x78 u16 count / +0x7a u16 capacity.
+	TArray<uint8> Bvh; Bvh.AddZeroed(0x80);
 	RudeYbn::PPTR(Bvh, 0x00, ONode);
 	RudeYbn::PU32(Bvh, 0x08, (uint32)Nodes.Num()); RudeYbn::PU32(Bvh, 0x0c, (uint32)Nodes.Num());
 	{
@@ -1844,6 +1895,10 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 		RudeYbn::PVEC3(Bvh, 0x30, WB1); RudeYbn::PU32(Bvh, 0x3c, 0xffc00000u);
 		RudeYbn::PVEC3(Bvh, 0x40, WorldCtr); RudeYbn::PU32(Bvh, 0x4c, 0xffc00000u);
 		RudeYbn::PVEC3(Bvh, 0x50, NInv); RudeYbn::PU32(Bvh, 0x5c, 0xffc00000u);
+		RudeYbn::PVEC3(Bvh, 0x60, NQ);   RudeYbn::PU32(Bvh, 0x6c, 0xffc00000u);
+		RudeYbn::PPTR(Bvh, 0x70, OTrees);
+		RudeYbn::PU16(Bvh, 0x78, (uint16)Trees.Num());
+		RudeYbn::PU16(Bvh, 0x7a, (uint16)Trees.Num());
 	}
 	const int32 OBvh = Emit(Bvh);
 
@@ -1861,13 +1916,18 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	RudeYbn::PVEC3(ChildBox, 0x00, WorldMin); RudeYbn::PU32(ChildBox, 0x0c, 1);
 	RudeYbn::PVEC3(ChildBox, 0x10, WorldMax); RudeYbn::PF32(ChildBox, 0x1c, RudeYbn::CHILD_MARGIN);
 	const int32 OBbox = Emit(ChildBox);
-	TArray<uint8> Fl1; Fl1.AddZeroed(4); RudeYbn::PU32(Fl1, 0, RudeYbn::CHILD_FLAGS1);
+	// ChildrenFlags arrays: 16 bytes PER CHILD (not 4 - CW and real ybns use a 16-byte
+	// stride; second word copied from the known-good binary, trailing 8 bytes zero).
+	TArray<uint8> Fl1; Fl1.AddZeroed(16);
+	RudeYbn::PU32(Fl1, 0, RudeYbn::CHILD_FLAGS1); RudeYbn::PU32(Fl1, 4, RudeYbn::CHILD_FLAGS_PAD);
 	const int32 OFl1 = Emit(Fl1);
-	TArray<uint8> Fl2; Fl2.AddZeroed(4); RudeYbn::PU32(Fl2, 0, RudeYbn::CHILD_FLAGS2);
+	TArray<uint8> Fl2; Fl2.AddZeroed(16);
+	RudeYbn::PU32(Fl2, 0, RudeYbn::CHILD_FLAGS2); RudeYbn::PU32(Fl2, 4, RudeYbn::CHILD_FLAGS_PAD);
 	const int32 OFl2 = Emit(Fl2);
 
-	// --- phBoundGeometryBVH child header (0x140) ---
-	TArray<uint8> Ch; Ch.AddZeroed(0x140);
+	// --- phBoundGeometryBVH child header (0x150: 0x140 of fields + the 0x0000ffff
+	// sentinel at +0x140, present in CW's output and EVERY real corpus ybn) ---
+	TArray<uint8> Ch; Ch.AddZeroed(0x150);
 	RudeYbn::PF32(Ch, 0x00, VertR); RudeYbn::PU32(Ch, 0x04, 1);
 	Ch[0x10] = 0x08;                                               // BoundType = GeometryBVH
 	RudeYbn::PF32(Ch, 0x14, CornerR);
@@ -1883,9 +1943,11 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	RudeYbn::PVEC3(Ch, 0xa0, WorldCtr); RudeYbn::PF32(Ch, 0xac, RudeYbn::UNK_F2);  // CenterGeom
 	RudeYbn::PPTR(Ch, 0xb0, OVert);                // +0xb8 (shrunk verts) intentionally NULL, matches CW
 	RudeYbn::PU32(Ch, 0xd0, (uint32)NV); RudeYbn::PU32(Ch, 0xd4, (uint32)NP);
-	RudeYbn::PPTR(Ch, 0xf0, OF0);
+	RudeYbn::PPTR(Ch, 0xf0, OF0);                  // materials array (one all-zero default material)
 	RudeYbn::PPTR(Ch, 0x118, OMidx);
+	RudeYbn::PU32(Ch, 0x120, 1);                   // material count = 1 (CW known-good; every real ybn >= 1)
 	RudeYbn::PPTR(Ch, 0x130, OBvh);
+	RudeYbn::PU16(Ch, 0x140, 0xffff);              // sentinel, universal in CW + real corpus
 	const int32 OChild = Emit(Ch);
 
 	TArray<uint8> CArr; CArr.AddZeroed(8); RudeYbn::PPTR(CArr, 0, OChild);

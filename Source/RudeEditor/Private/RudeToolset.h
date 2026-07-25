@@ -89,7 +89,8 @@ public:
 	// Export a UStaticMesh's collision directly to a binary FiveM .ybn (RSC7 v43) -
 	// CLEAN-ROOM, no CodeWalker. P5 step 2. Emits a phBoundComposite wrapping one
 	// phBoundGeometryBVH: quantized vertices, 16-byte triangles, u8 material indices,
-	// and a CONSTRUCTED stackless phOptimizedBvh (escape-index tree). Every phBound
+	// and a CONSTRUCTED stackless phOptimizedBvh (escape-index tree + the mandatory
+	// m_Trees subtree table: maximal <=127-node subtree ranges). Every phBound
 	// struct is built from pinned field offsets (docs/ENGINEERING_LOG "ybn binary
 	// format") - no template bytes, so it generalizes to any mesh.
 	// FRAME CONVENTION (pinned against the real ybn): header boxes, CenterGeom and the
