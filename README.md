@@ -7,9 +7,12 @@ author with real level-editor tools, export straight back to FiveM.
 
 Free forever. No paywall, no premium tier, no strings. Ever.
 
-> **Status: early alpha (0.1).** The foundations are proven — placements authored in UE
-> load in live FiveM, and RAGE drawables import as native StaticMesh assets — but this is
-> young software under heavy active development. Expect sharp edges.
+> **Status: early alpha (0.1) — with the big milestone passed.** A 100% RUDE-authored
+> asset (binary `.ydr` + `.ytd` + `.ytyp`/`.ymap`) loads, renders, and collides in live
+> FiveM with **zero CodeWalker involvement** — the entire UE→FiveM-Legacy export pipeline
+> is clean-room native. On the import side, RUDE has ingested an entire GTA V island
+> (Cayo Perico: 126 ymaps, 31k placed instances, textured) into a UE level. Young
+> software, heavy active development, sharp edges.
 
 ---
 
@@ -17,8 +20,11 @@ Free forever. No paywall, no premium tier, no strings. Ever.
 
 | Working today | How |
 |---|---|
-| Author prop/map placements in UE → FiveM | Emit XML-format `.ymap`/`.ytyp` that FiveM (Legacy) loads natively — no binary conversion needed for the placement layer |
-| Import GTA V drawables into UE | `ImportYdr`: CodeWalker-XML → `UStaticMesh` with per-shader material slots, in one call |
+| **Export binary `.ydr`/`.ybn`/`.ytd` — no CodeWalker** | Clean-room RSC7 writers (`ExportYdrBinary`, `ExportYbnBinary`, `ExportYtdBinary`), validated in live FiveM: meshes with embedded collision, world collision bounds, DXT/BC texture dictionaries with mip chains |
+| Author placements in UE → FiveM | `ExportYtyp` + `ExportYmap` emit the archetype/placement layer (XML, FiveM Legacy loads it natively) with the in-game-proven collision flag model and manifest |
+| Import GTA V drawables into UE | `ImportYdr` (+`ImportYdrBatch`): CodeWalker-XML → `UStaticMesh` with per-shader material instances (RAGE RenderBucket-driven opaque/cutout/decal routing), textures bound by name, PIE-walkable collision |
+| Ingest whole map areas | `ImportScene`: scene manifest → one actor per ymap with instanced-static-mesh components (48k entities in one call) |
+| Import texture dictionaries | `ImportYtd`: ytd XML + decoded pixels → `UTexture2D` with usage-correct semantics (normal maps, sRGB) |
 | Agent-native operation | RUDE registers an MCP toolset inside the editor — AI agents drive imports/exports as first-class tools. Humans get the same functions as Blueprint-callable nodes |
 
 **The roadmap** (phased; each phase ships when its in-game gate passes): full placement
@@ -40,10 +46,10 @@ navmesh/paths, structured timecycle editing).
 - Unreal Engine **5.8** (Windows)
 - For the agent surface: the engine's **ToolsetRegistry** + **ModelContextProtocol**
   plugins (shipped Experimental in 5.8) enabled in your project
-- To produce importable XML: [CodeWalker](https://github.com/dexyfex/CodeWalker)
-  (export any asset as XML from your own installation)
+- For the **import** side only: [CodeWalker](https://github.com/dexyfex/CodeWalker)
+  XML exports from your own installation (until RUDE's direct game-file reader lands).
+  The **export** side needs no external tools — RUDE writes game-ready binaries itself.
 - For FiveM **Enhanced** output: Cfx's Alchemist converts RUDE's Legacy output
-  (binary lane — in progress)
 
 ## Install
 
@@ -63,8 +69,10 @@ triangle winding: PASS THROUGH as-is in the native importer (empirically pinned:
   under the Y-mirror, RAGE winding already faces outward in UE). If you route
   through OBJ instead, reverse it — UE's OBJ importer adds its own flip.
 UVs: passed through raw (both engines are V-down)
-rotations: CEntityDef quats are STANDARD right-handed Z-up (empirically pinned
-  in-game). UE<->GTA under the Y-mirror: gta_quat = (-ue_x, ue_y, -ue_z, ue_w).
+rotations — TWO LANES with different maps (both empirically pinned; do not unify):
+  EXPORT (authoring for FiveM): gta_quat = (-ue_x, ue_y, -ue_z, ue_w)
+  IMPORT (reading CW-exported ymap XML): ue_quat = (gta_x, -gta_y, gta_z, gta_w)
+  (the two paths cross CodeWalker in opposite directions; details in AGENTS.md)
 ```
 
 FiveM manifest law for emitted placement resources: `this_is_a_map 'yes'` is **required**

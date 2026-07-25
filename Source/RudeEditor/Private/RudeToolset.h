@@ -88,6 +88,26 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYbn(const FString& AssetPath, const FString& OutXmlPath);
 
+	// Emit a CMapTypes .ytyp (XML, FiveM-Legacy-loadable) defining one
+	// CBaseArchetypeDef per drawable. YdrSpecs: comma-separated
+	// "absPathTo.ydr.xml[;txd[;physDict]]". Encodes the in-game-proven collision
+	// model: embedded <Bounds> children gate flag bit 17 (0x20000) AND a NON-EMPTY
+	// <physicsDictionary> (the switch; no .ybn file is shipped or needed); embedded
+	// ShaderGroup TextureDictionary -> empty archetype textureDictionary, else the
+	// asset's own name. Returns JSON: {ok, ytypPath, archetypes}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ExportYtyp(const FString& YdrSpecs, const FString& YtypName,
+	                          const FString& OutYtypPath);
+
+	// Emit a complete FiveM placement resource: stream/<name>.ymap (XML CMapData)
+	// + fxmanifest.lua (with the REQUIRED this_is_a_map). EntitiesJsonPath: JSON
+	// array of {archetype, ue:{x,y,z}, ue_quat:{x,y,z,w}?} in UE space; transforms
+	// use the pinned EXPORT-lane conventions (cm->m Y-mirror; gta_quat =
+	// (-x, y, -z, w), bench-proven). Returns JSON: {ok, ymapPath, entities}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ExportYmap(const FString& EntitiesJsonPath, const FString& MapName,
+	                          const FString& OutDir);
+
 	// Export a UTexture2D's source pixels to a PNG on disk (feeds the PBR->RAGE
 	// ytd pipeline). Reads the texture Source (BGRA8), writes PNG via ImageWrapper.
 	// TexturePath: content path of the Texture2D. OutPngPath: absolute *.png path.

@@ -1228,6 +1228,209 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures, *SlotsJson);
 }
 
+// Ported from the in-game-proven tools/emit_ytyp.py - the archetype flag +
+// physicsDictionary laws are load-bearing (FULL COLLISION MODEL, 2026-07-24).
+FString URudeToolset::ExportYtyp(const FString& YdrSpecs, const FString& YtypName,
+                                 const FString& OutYtypPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	TArray<FString> Specs;
+	YdrSpecs.ParseIntoArray(Specs, TEXT(","), true);
+	if (Specs.Num() == 0) { return Fail(TEXT("no ydr specs (want absPath[;txd[;physDict]], ...)")); }
+
+	FString Archetypes;
+	for (const FString& SpecStr : Specs)
+	{
+		TArray<FString> F;
+		SpecStr.TrimStartAndEnd().ParseIntoArray(F, TEXT(";"), false);
+		FXmlFile Xml(F[0]);
+		if (!Xml.IsValid()) { return Fail(FString::Printf(TEXT("XML load failed: %s"), *F[0])); }
+		const FXmlNode* Root = Xml.GetRootNode();
+		if (!Root || Root->GetTag() != TEXT("Drawable")) { return Fail(FString::Printf(TEXT("not a Drawable: %s"), *F[0])); }
+
+		FString Name = FPaths::GetBaseFilename(F[0]);
+		Name.RemoveFromEnd(TEXT(".ydr"));
+		if (const FXmlNode* N = Root->FindChildNode(TEXT("Name")))
+		{
+			FString S = N->GetContent().TrimStartAndEnd();
+			int32 Dot; if (S.FindChar(TEXT('.'), Dot)) { S.LeftInline(Dot); }
+			if (!S.IsEmpty()) { Name = S; }
+		}
+		Name.ToLowerInline();
+		auto Vec = [&](const TCHAR* Tag, float V[3]) -> bool
+		{
+			const FXmlNode* E = Root->FindChildNode(Tag);
+			if (!E) { return false; }
+			V[0] = FCString::Atof(*E->GetAttribute(TEXT("x")));
+			V[1] = FCString::Atof(*E->GetAttribute(TEXT("y")));
+			V[2] = FCString::Atof(*E->GetAttribute(TEXT("z")));
+			return true;
+		};
+		float BbMin[3], BbMax[3], Bsc[3];
+		if (!Vec(TEXT("BoundingBoxMin"), BbMin) || !Vec(TEXT("BoundingBoxMax"), BbMax) ||
+		    !Vec(TEXT("BoundingSphereCenter"), Bsc))
+		{
+			return Fail(FString::Printf(TEXT("missing bounds fields: %s"), *F[0]));
+		}
+		float Bsr = 0.f;
+		if (const FXmlNode* R = Root->FindChildNode(TEXT("BoundingSphereRadius")))
+		{
+			Bsr = FCString::Atof(*R->GetAttribute(TEXT("value")));
+		}
+		// collidable iff the drawable embeds a <Bounds> with >=1 child (gates bit 17)
+		bool bCollidable = false;
+		if (const FXmlNode* B = Root->FindChildNode(TEXT("Bounds")))
+		{
+			if (const FXmlNode* C = B->FindChildNode(TEXT("Children")))
+			{
+				bCollidable = C->GetChildrenNodes().Num() > 0;
+			}
+		}
+		// embedded ShaderGroup TextureDictionary -> empty archetype txd
+		bool bEmbeddedTex = false;
+		if (const FXmlNode* SG = Root->FindChildNode(TEXT("ShaderGroup")))
+		{
+			if (const FXmlNode* TD = SG->FindChildNode(TEXT("TextureDictionary")))
+			{
+				bEmbeddedTex = TD->GetChildrenNodes().Num() > 0;
+			}
+		}
+		const FString Txd = (F.Num() > 1 && !F[1].IsEmpty()) ? F[1] : (bEmbeddedTex ? TEXT("") : Name);
+		const FString PhysDict = (F.Num() > 2 && !F[2].IsEmpty()) ? F[2] : (bCollidable ? Name : TEXT(""));
+		const uint32 Flags = (bCollidable || !PhysDict.IsEmpty()) ? 537001984u : 536870912u;
+		const int32 LodDist = FMath::Max(100, (int32)(Bsr * 4.f));
+		Archetypes += FString::Printf(TEXT(
+			"  <Item type=\"CBaseArchetypeDef\">\n"
+			"   <lodDist value=\"%d\" />\n   <flags value=\"%u\" />\n"
+			"   <specialAttribute value=\"0\" />\n"
+			"   <bbMin x=\"%f\" y=\"%f\" z=\"%f\" />\n   <bbMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"
+			"   <bsCentre x=\"%f\" y=\"%f\" z=\"%f\" />\n   <bsRadius value=\"%f\" />\n"
+			"   <hdTextureDist value=\"%d\" />\n   <name>%s</name>\n"
+			"   <textureDictionary>%s</textureDictionary>\n   <clipDictionary />\n"
+			"   <drawableDictionary />\n   <physicsDictionary>%s</physicsDictionary>\n"
+			"   <assetType>ASSET_TYPE_DRAWABLE</assetType>\n   <assetName>%s</assetName>\n"
+			"   <extensions />\n  </Item>\n"),
+			LodDist, Flags, BbMin[0], BbMin[1], BbMin[2], BbMax[0], BbMax[1], BbMax[2],
+			Bsc[0], Bsc[1], Bsc[2], Bsr, LodDist, *Name, *Txd, *PhysDict, *Name);
+	}
+	const FString Ytyp = FString::Printf(TEXT(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapTypes>\n <extensions />\n <archetypes>\n%s"
+		" </archetypes>\n <name>%s</name>\n <dependencies />\n"
+		" <compositeEntityTypes itemType=\"CCompositeEntityType\" />\n</CMapTypes>\n"),
+		*Archetypes, *YtypName);
+	if (!FFileHelper::SaveStringToFile(Ytyp, *OutYtypPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		return Fail(TEXT("failed to write ytyp"));
+	}
+	return FString::Printf(TEXT("{\"ok\":true,\"ytypPath\":\"%s\",\"archetypes\":%d}"),
+		*OutYtypPath, Specs.Num());
+}
+
+// Ported from the in-game-proven tools/emit_ymap.py (P0-validated placement lane;
+// EXPORT-side transform + quat conventions, bench-pinned).
+FString URudeToolset::ExportYmap(const FString& EntitiesJsonPath, const FString& MapName,
+                                 const FString& OutDir)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	FString Raw;
+	if (!FFileHelper::LoadFileToString(Raw, *EntitiesJsonPath)) { return Fail(TEXT("cannot read entities JSON")); }
+	TArray<TSharedPtr<FJsonValue>> Ents;
+	{
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Raw);
+		if (!FJsonSerializer::Deserialize(Reader, Ents) || Ents.Num() == 0)
+		{
+			return Fail(TEXT("entities JSON must be a non-empty array"));
+		}
+	}
+	FString Rows;
+	double MinX = 1e18, MinY = 1e18, MinZ = 1e18, MaxX = -1e18, MaxY = -1e18, MaxZ = -1e18;
+	int32 Count = 0;
+	for (const TSharedPtr<FJsonValue>& V : Ents)
+	{
+		const TSharedPtr<FJsonObject>* E;
+		if (!V.IsValid() || !V->TryGetObject(E)) { continue; }
+		const TSharedPtr<FJsonObject>* Ue;
+		if (!(*E)->TryGetObjectField(TEXT("ue"), Ue)) { continue; }
+		const FString Arch = (*E)->GetStringField(TEXT("archetype"));
+		const double X = (*Ue)->GetNumberField(TEXT("x")) / 100.0;
+		const double Y = -(*Ue)->GetNumberField(TEXT("y")) / 100.0;
+		const double Z = (*Ue)->GetNumberField(TEXT("z")) / 100.0;
+		double Qx = 0, Qy = 0, Qz = 0, Qw = 1;
+		const TSharedPtr<FJsonObject>* Q;
+		if ((*E)->TryGetObjectField(TEXT("ue_quat"), Q))
+		{
+			// EXPORT-lane involution (bench-pinned): gta_quat = (-x, y, -z, w)
+			Qx = -(*Q)->GetNumberField(TEXT("x"));
+			Qy = (*Q)->GetNumberField(TEXT("y"));
+			Qz = -(*Q)->GetNumberField(TEXT("z"));
+			Qw = (*Q)->GetNumberField(TEXT("w"));
+		}
+		MinX = FMath::Min(MinX, X); MinY = FMath::Min(MinY, Y); MinZ = FMath::Min(MinZ, Z);
+		MaxX = FMath::Max(MaxX, X); MaxY = FMath::Max(MaxY, Y); MaxZ = FMath::Max(MaxZ, Z);
+		const uint32 Guid = FCrc::StrCrc32(*FString::Printf(TEXT("%s:%s:%f:%f:%f"), *MapName, *Arch, X, Y, Z));
+		Rows += FString::Printf(TEXT(
+			"  <Item type=\"CEntityDef\">\n   <archetypeName>%s</archetypeName>\n"
+			"   <flags value=\"1572864\" />\n   <guid value=\"%u\" />\n"
+			"   <position x=\"%f\" y=\"%f\" z=\"%f\" />\n"
+			"   <rotation x=\"%f\" y=\"%f\" z=\"%f\" w=\"%f\" />\n"
+			"   <scaleXY value=\"1\" />\n   <scaleZ value=\"1\" />\n   <parentIndex value=\"-1\" />\n"
+			"   <lodDist value=\"500\" />\n   <childLodDist value=\"0\" />\n"
+			"   <lodLevel>LODTYPES_DEPTH_ORPHANHD</lodLevel>\n   <numChildren value=\"0\" />\n"
+			"   <priorityLevel>PRI_REQUIRED</priorityLevel>\n   <extensions />\n"
+			"   <ambientOcclusionMultiplier value=\"255\" />\n"
+			"   <artificialAmbientOcclusion value=\"255\" />\n   <tintValue value=\"0\" />\n  </Item>\n"),
+			*Arch, Guid, X, Y, Z, Qx, Qy, Qz, Qw);
+		++Count;
+	}
+	if (Count == 0) { return Fail(TEXT("no valid entities")); }
+	const double M = 10.0, S = 300.0;
+	const FString Ymap = FString::Printf(TEXT(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapData>\n <name>%s</name>\n <parent />\n"
+		" <flags value=\"0\" />\n <contentFlags value=\"1\" />\n"
+		" <streamingExtentsMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"
+		" <streamingExtentsMax x=\"%f\" y=\"%f\" z=\"%f\" />\n"
+		" <entitiesExtentsMin x=\"%f\" y=\"%f\" z=\"%f\" />\n"
+		" <entitiesExtentsMax x=\"%f\" y=\"%f\" z=\"%f\" />\n <entities>\n%s </entities>\n"
+		" <containerLods itemType=\"rage__fwContainerLodDef\" />\n <boxOccluders itemType=\"BoxOccluder\" />\n"
+		" <occludeModels itemType=\"OccludeModel\" />\n <physicsDictionaries />\n <instancedData>\n"
+		"  <ImapLink />\n  <PropInstanceList itemType=\"rage__fwPropInstanceListDef\" />\n"
+		"  <GrassInstanceList itemType=\"rage__fwGrassInstanceListDef\" />\n </instancedData>\n"
+		" <timeCycleModifiers itemType=\"CTimeCycleModifier\" />\n <carGenerators itemType=\"CCarGen\" />\n"
+		" <LODLightsSOA>\n  <direction itemType=\"FloatXYZ\" />\n  <falloff />\n  <falloffExponent />\n"
+		"  <timeAndStateFlags />\n  <hash />\n  <coneInnerAngle />\n  <coneOuterAngleOrCapExt />\n"
+		"  <coronaIntensity />\n </LODLightsSOA>\n <DistantLODLightsSOA>\n"
+		"  <position itemType=\"FloatXYZ\" />\n  <RGBI />\n  <numStreetLights value=\"0\" />\n"
+		"  <category value=\"0\" />\n </DistantLODLightsSOA>\n <block>\n  <version value=\"0\" />\n"
+		"  <flags value=\"0\" />\n  <name>%s</name>\n  <exportedBy>RUDE</exportedBy>\n  <owner></owner>\n"
+		"  <time></time>\n </block>\n</CMapData>\n"),
+		*MapName,
+		MinX - S, MinY - S, MinZ - S, MaxX + S, MaxY + S, MaxZ + S,
+		MinX - M, MinY - M, MinZ - M, MaxX + M, MaxY + M, MaxZ + M,
+		*Rows, *MapName);
+	const FString StreamDir = OutDir / TEXT("stream");
+	IFileManager::Get().MakeDirectory(*StreamDir, true);
+	const FString YmapPath = StreamDir / (MapName + TEXT(".ymap"));
+	if (!FFileHelper::SaveStringToFile(Ymap, *YmapPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		return Fail(TEXT("failed to write ymap"));
+	}
+	const FString Manifest = TEXT(
+		"fx_version 'cerulean'\ngame 'gta5'\n\n"
+		"author 'RUDE - RAGE <-> Unreal Development Environment'\n"
+		"description 'RUDE-authored placement resource'\n\n"
+		"-- Required for streamed ymaps to take effect (reloads map storage on load).\n"
+		"this_is_a_map 'yes'\n");
+	FFileHelper::SaveStringToFile(Manifest, *(OutDir / TEXT("fxmanifest.lua")),
+		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	return FString::Printf(TEXT("{\"ok\":true,\"ymapPath\":\"%s\",\"entities\":%d}"), *YmapPath, Count);
+}
+
 FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& DestFolder,
                                      const FString& Mode)
 {

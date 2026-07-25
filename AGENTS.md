@@ -11,9 +11,14 @@ All tools take/return JSON-friendly values; results are JSON strings with an `ok
 | Tool | Signature | Notes |
 |---|---|---|
 | `Ping` | `() -> string` | Version + liveness |
-| `ImportYdr` | `(XmlPath, DestFolder) -> json` | CodeWalker ydr XML → `UStaticMesh`. Material slots are named `<rage_shader_preset>__<geoIndex>` — bind materials by slot name |
-| `ImportYtd` | `(XmlPath, PixelFolder, DestFolder) -> json` | ytd XML + decoded PNGs → `UTexture2D` with Usage-driven semantics (NORMAL→TC_Normalmap, sRGB rules) |
+| `ImportYdr` | `(XmlPath, DestFolder) -> json` | CodeWalker ydr XML → `UStaticMesh`. Material slots named `<rage_shader_preset>__<geoIndex>`; MaterialInstances auto-created from the RUDE masters with **RenderBucket-driven routing** (0 opaque / 1·3 cutout / 2 decal — preset names lie), textures bound by name from `/Game/RUDE/Textures`, **complex-as-simple collision** for PIE walking. Reimport is edit-in-place |
+| `ImportYdrBatch` | `(ListPath, DestFolder, Mode) -> json` | Text list of ydr XML paths; skip-if-exists (idempotent) unless `Mode="FORCE"` (reimport in place — the re-bind flow after a texture pass) |
+| `ImportScene` | `(ManifestPath, MeshFolder, Filter) -> json` | Scene manifest (JSON array of ymaps+entities) → one actor per ymap with one ISM component per unique drawable; HD lod filter default; proxy cubes for missing meshes; idempotent (clears the previous spawn) |
+| `ImportYtd` | `(XmlPath, PixelFolder, DestFolder) -> json` | ytd XML + decoded PNGs → `UTexture2D` with Usage-driven semantics (NORMAL→TC_Normalmap, sRGB rules). ⚠ never re-import over textures already SAVED this session — recreate their packages fresh (bulkdata corruption law) |
 | `ExportYdr` | `(AssetPath, OutXmlPath) -> json` | `UStaticMesh` → CW-valid ydr XML (inverse transform, shader presets, embedded collision `<Bounds>`) |
+| `ExportYdrBinary` | `(AssetPath, OutYdrPath) -> json` | **`UStaticMesh` → binary FiveM `.ydr` (RSC7 v165), clean-room — NO CodeWalker. Validated in-game** (renders, textured, collides). GTAV1 vertex layout, normal_spec param template with name-hash binding, embedded phBoundComposite collision, page-plan-safe layout. Drawable name = output filename |
+| `ExportYtyp` | `(YdrSpecs, YtypName, OutYtypPath) -> json` | ydr XML(s) → CMapTypes `.ytyp` with the in-game-proven collision model (embedded bounds gate flag bit 17 + non-empty physicsDictionary switch; no `.ybn` shipped) |
+| `ExportYmap` | `(EntitiesJsonPath, MapName, OutDir) -> json` | Entities JSON (UE space) → complete placement resource: `stream/<name>.ymap` + fxmanifest with the required `this_is_a_map` |
 | `ExportYbn` | `(AssetPath, OutXmlPath) -> json` | `UStaticMesh` collision → `.ybn` XML (standalone bounds; note: prop collision actually comes from the ydr's embedded bounds) |
 | `ExportTexture` | `(TexturePath, OutPngPath) -> json` | `UTexture2D` source (BGRA8) → PNG |
 | `ExportYtdBinary` | `(TextureSpecs, OutYtdPath, MaxDim) -> json` | **`UTexture2D`(s) → a binary FiveM `.ytd` (RSC7 v13), clean-room — NO CodeWalker. Validated in-game.** `TextureSpecs` = `"Path;RageName[;Usage[;Format]]"` comma-joined (Format `AUTO\|DXT1\|DXT5\|ATI2\|RAW`; AUTO: NORMAL→ATI2, alpha→DXT5, else DXT1). DXT/BC with mip chains capped at 4×4; `MaxDim` optional downscale (0 = none) |
