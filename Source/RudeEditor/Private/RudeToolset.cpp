@@ -1917,6 +1917,529 @@ namespace RudeYbn
 	}
 }
 
+// ======================= ExportYdrBinary - clean-room .ydr (RSC7 v165) =======================
+// The LAST CodeWalker dependency. Every struct pinned against our own CW oracle
+// (rude_rockwall.ydr) + its XML ground truth - docs/ENGINEERING_LOG "ydr binary format",
+// "COMPLETE STRUCT MAP". Bound serialization: same structures as ExportYbnBinary (the
+// phBound code below is intentionally duplicated from the in-game-proven ybn writer with
+// only the root-at-zero difference; shared-helper refactor is queued with a byte-identity
+// regression gate - do NOT let the two drift).
+FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+#if WITH_EDITORONLY_DATA
+	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *AssetPath);
+	if (!Mesh) { return Fail(TEXT("StaticMesh not found")); }
+	const FMeshDescription* MeshDesc = Mesh->GetMeshDescription(0);
+	if (!MeshDesc) { return Fail(TEXT("no MeshDescription on LOD0")); }
+	FStaticMeshConstAttributes Attributes(*MeshDesc);
+	TVertexAttributesConstRef<FVector3f> Positions = Attributes.GetVertexPositions();
+	TVertexInstanceAttributesConstRef<FVector3f> InstNormals = Attributes.GetVertexInstanceNormals();
+	TVertexInstanceAttributesConstRef<FVector2f> InstUVs = Attributes.GetVertexInstanceUVs();
+	TPolygonGroupAttributesConstRef<FName> GroupSlots = Attributes.GetPolygonGroupMaterialSlotNames();
+	FString MeshName = Mesh->GetName();
+	MeshName.ToLowerInline();
+
+	// --- gather per polygon group (same rules as the XML lane: weld by (vid,normal,uv),
+	// inverse RUDE transform, preset + texture names from the slot's RUDE MI) ---
+	struct FGeo
+	{
+		FString Preset = TEXT("default");
+		FString Diffuse, Normal;
+		TArray<FVector3f> Pos; TArray<FVector3f> Nrm; TArray<FVector2f> UV;
+		TArray<int32> Indices;
+	};
+	TArray<FGeo> Geos;
+	for (const FPolygonGroupID GroupID : MeshDesc->PolygonGroups().GetElementIDs())
+	{
+		FGeo G;
+		FString SlotName = GroupSlots[GroupID].ToString();
+		const int32 Sep = SlotName.Find(TEXT("__"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+		const bool bRudeSlot = (Sep != INDEX_NONE);
+		G.Preset = bRudeSlot ? SlotName.Left(Sep) : TEXT("default");
+		int32 SlotIdx = INDEX_NONE;
+		for (int32 i = 0; i < Mesh->GetStaticMaterials().Num(); ++i)
+		{
+			if (Mesh->GetStaticMaterials()[i].MaterialSlotName == GroupSlots[GroupID]) { SlotIdx = i; break; }
+		}
+		if (Mesh->GetStaticMaterials().IsValidIndex(SlotIdx))
+		{
+			if (const UMaterialInstanceConstant* MIC =
+				Cast<UMaterialInstanceConstant>(Mesh->GetStaticMaterials()[SlotIdx].MaterialInterface))
+			{
+				UTexture* T = nullptr;
+				if (MIC->GetTextureParameterValue(FMaterialParameterInfo(TEXT("Diffuse")), T) && T) { G.Diffuse = T->GetName(); }
+				T = nullptr;
+				if (MIC->GetTextureParameterValue(FMaterialParameterInfo(TEXT("Normal")), T) && T) { G.Normal = T->GetName(); }
+			}
+		}
+		if (!bRudeSlot)
+		{
+			if (!G.Normal.IsEmpty())       { G.Preset = TEXT("normal_spec"); }
+			else if (!G.Diffuse.IsEmpty()) { G.Preset = TEXT("spec"); }
+		}
+		TMap<FString, int32> Weld;
+		for (const FPolygonID PolyID : MeshDesc->GetPolygonGroupPolygonIDs(GroupID))
+		{
+			for (const FTriangleID TriID : MeshDesc->GetPolygonTriangles(PolyID))
+			{
+				for (const FVertexInstanceID Inst : MeshDesc->GetTriangleVertexInstances(TriID))
+				{
+					const FVertexID VID = MeshDesc->GetVertexInstanceVertex(Inst);
+					const FVector3f P = Positions[VID];
+					const FVector3f N = InstNormals[Inst];
+					const FVector2f UV = InstUVs.Get(Inst, 0);
+					const FString Key = FString::Printf(TEXT("%d|%.3f,%.3f,%.3f|%.4f,%.4f"),
+						VID.GetValue(), N.X, N.Y, N.Z, UV.X, UV.Y);
+					int32 Index;
+					if (const int32* Found = Weld.Find(Key)) { Index = *Found; }
+					else
+					{
+						Index = G.Pos.Num();
+						G.Pos.Add(FVector3f(P.X / 100.f, -P.Y / 100.f, P.Z / 100.f));
+						G.Nrm.Add(FVector3f(N.X, -N.Y, N.Z));
+						G.UV.Add(UV);
+						Weld.Add(Key, Index);
+					}
+					G.Indices.Add(Index);
+				}
+			}
+		}
+		if (G.Pos.Num() > 0 && G.Indices.Num() >= 3)
+		{
+			if (G.Pos.Num() > 65535) { return Fail(TEXT("geometry exceeds 65535 verts (u16 indices) - split the mesh")); }
+			Geos.Add(MoveTemp(G));
+		}
+	}
+	if (Geos.Num() == 0) { return Fail(TEXT("no polygon groups with geometry")); }
+
+	FVector3f BMin(FLT_MAX), BMax(-FLT_MAX);
+	for (const FGeo& G : Geos) { for (const FVector3f& P : G.Pos) { BMin = BMin.ComponentMin(P); BMax = BMax.ComponentMax(P); } }
+	const FVector3f Center = (BMin + BMax) * 0.5f;
+	const float Radius = (BMax - Center).Size();
+
+	// --- segment writer: header reserved @0, page-aware Emit (no struct spans 64KB) ---
+	TArray<uint8> Seg; Seg.AddZeroed(0xd0);
+	const int32 PAGE = 0x10000;
+	auto Emit = [&Seg, PAGE](const TArray<uint8>& D, int32 Align = 16) -> int32
+	{
+		if (Seg.Num() % Align) { Seg.AddZeroed(Align - (Seg.Num() % Align)); }
+		if (D.Num() <= PAGE && (Seg.Num() % PAGE) + D.Num() > PAGE)
+		{
+			Seg.AddZeroed(PAGE - (Seg.Num() % PAGE));
+		}
+		const int32 O = Seg.Num(); Seg.Append(D); return O;
+	};
+	auto EmitStr = [&](const FString& S) -> int32
+	{
+		TArray<uint8> B; B.SetNumZeroed(S.Len() + 1);
+		for (int32 i = 0; i < S.Len(); ++i) { B[i] = (uint8)S[i]; }
+		return Emit(B);
+	};
+
+	// --- vertex + index data per geometry (GTAV1: Pos 3f, Normal 3f, Colour0 4xu8, UV 2f) ---
+	TArray<int32> OVData, OIData;
+	for (const FGeo& G : Geos)
+	{
+		TArray<uint8> VB; VB.SetNumZeroed(G.Pos.Num() * 36);
+		for (int32 v = 0; v < G.Pos.Num(); ++v)
+		{
+			const int32 o = v * 36;
+			RudeYbn::PF32(VB, o + 0, G.Pos[v].X); RudeYbn::PF32(VB, o + 4, G.Pos[v].Y); RudeYbn::PF32(VB, o + 8, G.Pos[v].Z);
+			RudeYbn::PF32(VB, o + 12, G.Nrm[v].X); RudeYbn::PF32(VB, o + 16, G.Nrm[v].Y); RudeYbn::PF32(VB, o + 20, G.Nrm[v].Z);
+			VB[o + 24] = 255; VB[o + 25] = 255; VB[o + 26] = 255; VB[o + 27] = 255;
+			RudeYbn::PF32(VB, o + 28, G.UV[v].X); RudeYbn::PF32(VB, o + 32, G.UV[v].Y);
+		}
+		OVData.Add(Emit(VB));
+		TArray<uint8> IB; IB.SetNumZeroed(G.Indices.Num() * 2);
+		for (int32 i = 0; i < G.Indices.Num(); ++i) { RudeYbn::PU16(IB, i * 2, (uint16)G.Indices[i]); }
+		OIData.Add(Emit(IB));
+	}
+
+	// --- grcFvf (GTAV1): mask 0x59, stride 36, 4 channels, format nibbles ---
+	TArray<uint8> Fvf; Fvf.AddZeroed(0x10);
+	RudeYbn::PU32(Fvf, 0x00, 0x59); RudeYbn::PU16(Fvf, 0x04, 36); Fvf[0x07] = 4;
+	RudeYbn::PU32(Fvf, 0x08, 0x55996996u); RudeYbn::PU32(Fvf, 0x0c, 0x77555555u);
+	const int32 OFvf = Emit(Fvf);
+	const int32 OName = EmitStr(MeshName);
+
+	// --- shared 7-vector value block (the normal_spec template, XML order) ---
+	static const float VecVals[7] = { 0.9f, 40.f, 0.3f, 1.f, 1.f, 0.f, 1.f };
+	TArray<uint8> Vals; Vals.AddZeroed(7 * 16);
+	for (int32 i = 0; i < 7; ++i) { RudeYbn::PF32(Vals, i * 16, VecVals[i]); }
+	const int32 OVals = Emit(Vals);
+
+	// --- per-shader: texture stubs (0x50: refcount, name*, 0x00020001), param table,
+	//     param block, shader struct ---
+	TMap<FString, int32> TexStubByName;
+	auto TexStub = [&](const FString& Name) -> int32
+	{
+		const FString L = Name.ToLower();
+		if (int32* F = TexStubByName.Find(L)) { return *F; }
+		const int32 NameOfs = EmitStr(L);
+		TArray<uint8> St; St.AddZeroed(0x50);
+		RudeYbn::PU32(St, 0x04, 1);
+		RudeYbn::PPTR(St, 0x28, NameOfs);
+		RudeYbn::PU32(St, 0x30, 0x00020001u);
+		const int32 O = Emit(St);
+		TexStubByName.Add(L, O);
+		return O;
+	};
+	TArray<int32> ShaderOfs;
+	for (const FGeo& G : Geos)
+	{
+		struct FPar { uint32 Meta; int32 Ofs; };
+		TArray<FPar> Pars;
+		if (!G.Diffuse.IsEmpty()) { Pars.Add({ 0x200u, TexStub(G.Diffuse) }); }
+		if (!G.Normal.IsEmpty()) { Pars.Add({ 0x300u, TexStub(G.Normal) }); }
+		static const uint32 VecMeta[7] = { 0xa601, 0xa501, 0xa401, 0xa301, 0xa201, 0xa101, 0xa001 };
+		for (int32 i = 0; i < 7; ++i) { Pars.Add({ VecMeta[i], OVals + i * 16 }); }
+		TArray<uint8> Tbl; Tbl.AddZeroed(Pars.Num() * 16);
+		for (int32 i = 0; i < Pars.Num(); ++i)
+		{
+			RudeYbn::PU32(Tbl, i * 16, Pars[i].Meta);
+			RudeYbn::PPTR(Tbl, i * 16 + 8, Pars[i].Ofs);
+		}
+		const int32 OTbl = Emit(Tbl);
+		// preset: only the pinned normal_spec/spec templates for v1; anything else falls
+		// back to normal_spec's registers with its own name hash (same as the XML lane's
+		// default-param behaviour - flag for the P2 material lane).
+		// The shader OBJECT *is* the 0x30 param block (oracle: shader ptr-array entries
+		// point straight at it - there is NO intermediate struct).
+		const FString Preset = (G.Preset == TEXT("default")) ? TEXT("normal_spec") : G.Preset;
+		TArray<uint8> Blk; Blk.AddZeroed(0x30);
+		RudeYbn::PPTR(Blk, 0x00, OTbl);
+		RudeYbn::PU32(Blk, 0x08, RudeYtd::Joaat(Preset));
+		RudeYbn::PU32(Blk, 0x10, 0x80000000u | (uint32)Pars.Num());
+		RudeYbn::PU32(Blk, 0x14, 0x01500100u);
+		RudeYbn::PU32(Blk, 0x18, RudeYtd::Joaat(Preset + TEXT(".sps")));
+		RudeYbn::PU32(Blk, 0x20, 0x0000ff01u);
+		RudeYbn::PU32(Blk, 0x24, 0x02000000u);
+		ShaderOfs.Add(Emit(Blk));
+	}
+	TArray<uint8> ShArr; ShArr.AddZeroed(ShaderOfs.Num() * 8);
+	for (int32 i = 0; i < ShaderOfs.Num(); ++i) { RudeYbn::PPTR(ShArr, i * 8, ShaderOfs[i]); }
+	const int32 OShArr = Emit(ShArr);
+	TArray<uint8> SG; SG.AddZeroed(0x40);
+	RudeYbn::PU32(SG, 0x00, 0x406137f0u); RudeYbn::PU32(SG, 0x04, 1);   // VFT 0x1406137f0
+	RudeYbn::PPTR(SG, 0x10, OShArr);
+	RudeYbn::PU16(SG, 0x18, (uint16)ShaderOfs.Num()); RudeYbn::PU16(SG, 0x1a, (uint16)ShaderOfs.Num());
+	RudeYbn::PU32(SG, 0x30, 4);
+	const int32 OSG = Emit(SG);
+
+	// --- blockmap (page count patched after final size) ---
+	TArray<uint8> Bm; Bm.AddZeroed(0x40);
+	const int32 OBm = Emit(Bm);
+
+	// --- per-geometry: VB struct, IB struct, geometry struct ---
+	TArray<int32> OGeoStructs;
+	TArray<uint8> GeoBounds; GeoBounds.AddZeroed(Geos.Num() * 0x20);
+	TArray<uint8> ShaderMap; ShaderMap.AddZeroed(FMath::Max(Geos.Num() * 2, 8));
+	for (int32 gi = 0; gi < Geos.Num(); ++gi)
+	{
+		const FGeo& G = Geos[gi];
+		TArray<uint8> Vb; Vb.AddZeroed(0x40);
+		RudeYbn::PU32(Vb, 0x00, 0x4061d3f8u); RudeYbn::PU32(Vb, 0x04, 1);
+		RudeYbn::PU16(Vb, 0x08, 36); RudeYbn::PU16(Vb, 0x0a, 0x59);
+		RudeYbn::PPTR(Vb, 0x10, OVData[gi]);
+		RudeYbn::PU32(Vb, 0x18, (uint32)G.Pos.Num());
+		RudeYbn::PPTR(Vb, 0x20, OVData[gi]);
+		RudeYbn::PPTR(Vb, 0x30, OFvf);
+		const int32 OVb = Emit(Vb);
+		TArray<uint8> Ib; Ib.AddZeroed(0x20);
+		RudeYbn::PU32(Ib, 0x00, 0x4061d158u); RudeYbn::PU32(Ib, 0x04, 1);
+		RudeYbn::PU32(Ib, 0x08, (uint32)G.Indices.Num());
+		RudeYbn::PPTR(Ib, 0x10, OIData[gi]);
+		const int32 OIb = Emit(Ib);
+		TArray<uint8> Ge; Ge.AddZeroed(0x80);
+		RudeYbn::PU32(Ge, 0x00, 0x40618798u); RudeYbn::PU32(Ge, 0x04, 1);
+		RudeYbn::PPTR(Ge, 0x18, OVb);
+		RudeYbn::PPTR(Ge, 0x38, OIb);
+		RudeYbn::PU32(Ge, 0x58, (uint32)G.Indices.Num());
+		RudeYbn::PU32(Ge, 0x5c, (uint32)(G.Indices.Num() / 3));
+		RudeYbn::PU16(Ge, 0x60, (uint16)G.Pos.Num()); RudeYbn::PU16(Ge, 0x62, 3);
+		RudeYbn::PU32(Ge, 0x70, 36);
+		RudeYbn::PPTR(Ge, 0x78, OVData[gi]);
+		OGeoStructs.Add(Emit(Ge));
+		FVector3f GMin(FLT_MAX), GMax(-FLT_MAX);
+		for (const FVector3f& P : G.Pos) { GMin = GMin.ComponentMin(P); GMax = GMax.ComponentMax(P); }
+		const float Mn[3] = { GMin.X, GMin.Y, GMin.Z }, Mx[3] = { GMax.X, GMax.Y, GMax.Z };
+		RudeYbn::PVEC3(GeoBounds, gi * 0x20, Mn);
+		RudeYbn::PVEC3(GeoBounds, gi * 0x20 + 0x10, Mx);
+		RudeYbn::PU16(ShaderMap, gi * 2, (uint16)gi);
+	}
+	const int32 OGeoBounds = Emit(GeoBounds);
+	const int32 OShaderMap = Emit(ShaderMap);
+	TArray<uint8> GeoArr; GeoArr.AddZeroed(OGeoStructs.Num() * 8);
+	for (int32 i = 0; i < OGeoStructs.Num(); ++i) { RudeYbn::PPTR(GeoArr, i * 8, OGeoStructs[i]); }
+	const int32 OGeoArr = Emit(GeoArr);
+	TArray<uint8> Model; Model.AddZeroed(0x30);
+	RudeYbn::PU32(Model, 0x00, 0x40610a98u); RudeYbn::PU32(Model, 0x04, 1);
+	RudeYbn::PPTR(Model, 0x08, OGeoArr);
+	RudeYbn::PU16(Model, 0x10, (uint16)Geos.Num()); RudeYbn::PU16(Model, 0x12, (uint16)Geos.Num());
+	RudeYbn::PPTR(Model, 0x18, OGeoBounds);
+	RudeYbn::PPTR(Model, 0x20, OShaderMap);
+	RudeYbn::PU32(Model, 0x2c, 0x000100ffu);
+	const int32 OModel = Emit(Model);
+	TArray<uint8> ModelArr; ModelArr.AddZeroed(8);
+	RudeYbn::PPTR(ModelArr, 0, OModel);
+	const int32 OModelArr = Emit(ModelArr);
+	TArray<uint8> ModelsHdr; ModelsHdr.AddZeroed(0x10);
+	RudeYbn::PPTR(ModelsHdr, 0x00, OModelArr);
+	RudeYbn::PU16(ModelsHdr, 0x08, 1); RudeYbn::PU16(ModelsHdr, 0x0a, 1);
+	const int32 OModelsHdr = Emit(ModelsHdr);
+
+	// ---------- embedded phBoundComposite (whole-mesh GeometryBVH), duplicated from the
+	// in-game-proven ExportYbnBinary with the composite emitted in place (not @0) ----------
+	int32 OComposite = 0;
+	{
+		TArray<FVector3f> CV; TArray<int32> CI;
+		{
+			TMap<FString, int32> W2;
+			for (const FGeo& G : Geos)
+			{
+				for (int32 i = 0; i < G.Indices.Num(); ++i)
+				{
+					const FVector3f P = G.Pos[G.Indices[i]];
+					const FString K = FString::Printf(TEXT("%.4f,%.4f,%.4f"), P.X, P.Y, P.Z);
+					int32 Idx;
+					if (const int32* F = W2.Find(K)) { Idx = *F; }
+					else { Idx = CV.Num(); CV.Add(P); W2.Add(K, Idx); }
+					CI.Add(Idx);
+				}
+			}
+		}
+		const int32 NV = CV.Num(), NP = CI.Num() / 3;
+		if (NV > 65535) { return Fail(TEXT("collision verts exceed 65535")); }
+		FVector3f WMin(FLT_MAX), WMax(-FLT_MAX);
+		for (const FVector3f& V : CV) { WMin = WMin.ComponentMin(V); WMax = WMax.ComponentMax(V); }
+		const FVector3f Ctr = (WMin + WMax) * 0.5f;
+		TArray<FVector3f> Rel; Rel.Reserve(NV);
+		for (const FVector3f& V : CV) { Rel.Add(V - Ctr); }
+		float RMin[3] = { FLT_MAX, FLT_MAX, FLT_MAX }, RMax[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+		for (const FVector3f& R : Rel) { for (int32 a = 0; a < 3; ++a) { RMin[a] = FMath::Min(RMin[a], R[a]); RMax[a] = FMath::Max(RMax[a], R[a]); } }
+		float Quant[3], Half[3];
+		for (int32 a = 0; a < 3; ++a)
+		{
+			Half[a] = FMath::Max(FMath::Abs(RMin[a]), FMath::Abs(RMax[a]));
+			Quant[a] = (Half[a] > 0.f) ? (Half[a] / 32767.0f) : 1.0f;
+		}
+		const float CornerR = FMath::Sqrt(Half[0]*Half[0] + Half[1]*Half[1] + Half[2]*Half[2]);
+		float VertR = 0.f;
+		for (const FVector3f& R : Rel) { VertR = FMath::Max(VertR, R.Size()); }
+		const float WorldMin[3] = { WMin.X, WMin.Y, WMin.Z };
+		const float WorldMax[3] = { WMax.X, WMax.Y, WMax.Z };
+		const float WorldCtr[3] = { Ctr.X, Ctr.Y, Ctr.Z };
+
+		TArray<FVector3f> TriCtr; TriCtr.Reserve(NP);
+		for (int32 j = 0; j < NP; ++j) { TriCtr.Add((Rel[CI[j*3]] + Rel[CI[j*3+1]] + Rel[CI[j*3+2]]) / 3.0f); }
+		TArray<int32> Order; Order.Reserve(NP);
+		for (int32 j = 0; j < NP; ++j) { Order.Add(j); }
+		TArray<RudeYbn::FBvhNode> Nodes; TArray<int32> PolyOrder;
+		RudeYbn::BuildBvh(Rel, CI, TriCtr, Order, 0, NP, Nodes, PolyOrder);
+		RudeYbn::SetEscape(Nodes, 0);
+		if (PolyOrder.Num() != NP) { return Fail(TEXT("BVH leaf coverage broken")); }
+		TArray<TPair<int32, int32>> Trees;
+		{
+			TArray<int32> Stack; Stack.Add(0);
+			while (Stack.Num() > 0)
+			{
+				const int32 i = Stack.Pop();
+				const int32 Size = Nodes[i].Escape - i;
+				if (Size <= RudeYbn::MAX_NODES_PER_TREE || Nodes[i].bLeaf) { Trees.Add(TPair<int32, int32>(i, Nodes[i].Escape)); }
+				else { Stack.Add(Nodes[i + 1].Escape); Stack.Add(i + 1); }
+			}
+		}
+		float NBMin[3] = { FLT_MAX, FLT_MAX, FLT_MAX }, NBMax[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+		for (const RudeYbn::FBvhNode& N : Nodes)
+		{
+			for (int32 a = 0; a < 3; ++a) { NBMin[a] = FMath::Min(NBMin[a], N.Lo[a]); NBMax[a] = FMath::Max(NBMax[a], N.Hi[a]); }
+		}
+		float NQ[3], NInv[3];
+		for (int32 a = 0; a < 3; ++a)
+		{
+			const float M = FMath::Max(FMath::Abs(NBMin[a]), FMath::Abs(NBMax[a]));
+			NQ[a] = (M > 0.f) ? (M / 32767.0f) : 1.0f;
+			NInv[a] = (NQ[a] > 0.f) ? (1.0f / NQ[a]) : 0.f;
+		}
+		auto QS = [](float V, float Q) -> int16
+		{ return (int16)FMath::Clamp<int32>(FMath::RoundToInt(V / Q), -32768, 32767); };
+
+		TArray<uint8> PolyB; PolyB.AddZeroed(NP * 16);
+		for (int32 k = 0; k < NP; ++k)
+		{
+			const int32 j = PolyOrder[k];
+			const FVector3f& A = Rel[CI[j*3]]; const FVector3f& B2 = Rel[CI[j*3+1]]; const FVector3f& C = Rel[CI[j*3+2]];
+			const float Area = 0.5f * FVector3f::CrossProduct(B2 - A, C - A).Size();
+			uint32 AreaBits; FMemory::Memcpy(&AreaBits, &Area, 4);
+			AreaBits &= 0xFFFFFFF8u;
+			RudeYbn::PU32(PolyB, k*16, AreaBits);
+			RudeYbn::PU16(PolyB, k*16+4, (uint16)CI[j*3]);
+			RudeYbn::PU16(PolyB, k*16+6, (uint16)CI[j*3+1]);
+			RudeYbn::PU16(PolyB, k*16+8, (uint16)CI[j*3+2]);
+		}
+		TArray<uint8> VertB; VertB.AddZeroed(NV * 6);
+		for (int32 i = 0; i < NV; ++i)
+		{
+			for (int32 a = 0; a < 3; ++a) { RudeYbn::PS16(VertB, i*6 + a*2, QS(Rel[i][a], Quant[a])); }
+		}
+		TArray<uint8> MatB; MatB.AddZeroed(NP);
+		TArray<uint8> NodeB; NodeB.AddZeroed(Nodes.Num() * 16);
+		for (int32 i = 0; i < Nodes.Num(); ++i)
+		{
+			const RudeYbn::FBvhNode& N = Nodes[i];
+			for (int32 a = 0; a < 3; ++a)
+			{
+				RudeYbn::PS16(NodeB, i*16 + a*2,     QS(N.Lo[a], NQ[a]));
+				RudeYbn::PS16(NodeB, i*16 + 6 + a*2, QS(N.Hi[a], NQ[a]));
+			}
+			RudeYbn::PU16(NodeB, i*16 + 12, (uint16)(N.bLeaf ? N.PolyStart : (N.Escape - i)));
+			RudeYbn::PU16(NodeB, i*16 + 14, (uint16)(N.bLeaf ? N.PolyCount : 0));
+		}
+		TArray<uint8> TreeB; TreeB.AddZeroed(Trees.Num() * 16);
+		for (int32 t = 0; t < Trees.Num(); ++t)
+		{
+			const RudeYbn::FBvhNode& RootN = Nodes[Trees[t].Key];
+			for (int32 a = 0; a < 3; ++a)
+			{
+				RudeYbn::PS16(TreeB, t*16 + a*2,     QS(RootN.Lo[a], NQ[a]));
+				RudeYbn::PS16(TreeB, t*16 + 6 + a*2, QS(RootN.Hi[a], NQ[a]));
+			}
+			RudeYbn::PU16(TreeB, t*16 + 12, (uint16)Trees[t].Key);
+			RudeYbn::PU16(TreeB, t*16 + 14, (uint16)Trees[t].Value);
+		}
+		const int32 OPoly = Emit(PolyB);
+		const int32 ONode = Emit(NodeB);
+		const int32 OVert = Emit(VertB);
+		const int32 OMidx = Emit(MatB);
+		const int32 OTrees = Emit(TreeB);
+		TArray<uint8> Bvh; Bvh.AddZeroed(0x80);
+		RudeYbn::PPTR(Bvh, 0x00, ONode);
+		RudeYbn::PU32(Bvh, 0x08, (uint32)Nodes.Num()); RudeYbn::PU32(Bvh, 0x0c, (uint32)Nodes.Num());
+		{
+			const float WB0[3] = { NBMin[0]+WorldCtr[0], NBMin[1]+WorldCtr[1], NBMin[2]+WorldCtr[2] };
+			const float WB1[3] = { NBMax[0]+WorldCtr[0], NBMax[1]+WorldCtr[1], NBMax[2]+WorldCtr[2] };
+			RudeYbn::PVEC3(Bvh, 0x20, WB0); RudeYbn::PU32(Bvh, 0x2c, 0xffc00000u);
+			RudeYbn::PVEC3(Bvh, 0x30, WB1); RudeYbn::PU32(Bvh, 0x3c, 0xffc00000u);
+			RudeYbn::PVEC3(Bvh, 0x40, WorldCtr); RudeYbn::PU32(Bvh, 0x4c, 0xffc00000u);
+			RudeYbn::PVEC3(Bvh, 0x50, NInv); RudeYbn::PU32(Bvh, 0x5c, 0xffc00000u);
+			RudeYbn::PVEC3(Bvh, 0x60, NQ);   RudeYbn::PU32(Bvh, 0x6c, 0xffc00000u);
+			RudeYbn::PPTR(Bvh, 0x70, OTrees);
+			RudeYbn::PU16(Bvh, 0x78, (uint16)Trees.Num()); RudeYbn::PU16(Bvh, 0x7a, (uint16)Trees.Num());
+		}
+		const int32 OBvh = Emit(Bvh);
+		TArray<uint8> Xf; Xf.AddZeroed(0x40);
+		RudeYbn::PF32(Xf, 0x00, 1.f); RudeYbn::PF32(Xf, 0x14, 1.f); RudeYbn::PU32(Xf, 0x1c, 1);
+		RudeYbn::PF32(Xf, 0x28, 1.f); RudeYbn::PU32(Xf, 0x2c, 1);
+		const int32 OXf = Emit(Xf);
+		TArray<uint8> F0; F0.AddZeroed(0x20);
+		const int32 OF0 = Emit(F0);
+		TArray<uint8> CBox; CBox.AddZeroed(0x20);
+		RudeYbn::PVEC3(CBox, 0x00, WorldMin); RudeYbn::PU32(CBox, 0x0c, 1);
+		RudeYbn::PVEC3(CBox, 0x10, WorldMax); RudeYbn::PF32(CBox, 0x1c, RudeYbn::CHILD_MARGIN);
+		const int32 OCBox = Emit(CBox);
+		TArray<uint8> F1; F1.AddZeroed(16);
+		RudeYbn::PU32(F1, 0, RudeYbn::CHILD_FLAGS1); RudeYbn::PU32(F1, 4, RudeYbn::CHILD_FLAGS_PAD);
+		const int32 OF1 = Emit(F1);
+		TArray<uint8> F2; F2.AddZeroed(16);
+		RudeYbn::PU32(F2, 0, RudeYbn::CHILD_FLAGS2); RudeYbn::PU32(F2, 4, RudeYbn::CHILD_FLAGS_PAD);
+		const int32 OF2 = Emit(F2);
+		TArray<uint8> Ch; Ch.AddZeroed(0x150);
+		RudeYbn::PF32(Ch, 0x00, VertR); RudeYbn::PU32(Ch, 0x04, 1);
+		Ch[0x10] = 0x08;
+		RudeYbn::PF32(Ch, 0x14, CornerR);
+		RudeYbn::PVEC3(Ch, 0x20, WorldMax); RudeYbn::PF32(Ch, 0x2c, RudeYbn::CHILD_MARGIN);
+		RudeYbn::PVEC3(Ch, 0x30, WorldMin); RudeYbn::PU32(Ch, 0x3c, 1);
+		RudeYbn::PVEC3(Ch, 0x40, WorldCtr);
+		RudeYbn::PVEC3(Ch, 0x50, WorldCtr);
+		RudeYbn::PF32(Ch, 0x60, 1.f); RudeYbn::PF32(Ch, 0x64, 1.f);
+		RudeYbn::PF32(Ch, 0x68, 1.f); RudeYbn::PF32(Ch, 0x6c, 1.f);
+		RudeYbn::PU32(Ch, 0x84, (uint32)NV);
+		RudeYbn::PPTR(Ch, 0x88, OPoly);
+		RudeYbn::PVEC3(Ch, 0x90, Quant); RudeYbn::PF32(Ch, 0x9c, RudeYbn::UNK_F1);
+		RudeYbn::PVEC3(Ch, 0xa0, WorldCtr); RudeYbn::PF32(Ch, 0xac, RudeYbn::UNK_F2);
+		RudeYbn::PPTR(Ch, 0xb0, OVert);
+		RudeYbn::PU32(Ch, 0xd0, (uint32)NV); RudeYbn::PU32(Ch, 0xd4, (uint32)NP);
+		RudeYbn::PPTR(Ch, 0xf0, OF0);
+		RudeYbn::PPTR(Ch, 0x118, OMidx);
+		RudeYbn::PU32(Ch, 0x120, 1);
+		RudeYbn::PPTR(Ch, 0x130, OBvh);
+		RudeYbn::PU16(Ch, 0x140, 0xffff);
+		const int32 OChild = Emit(Ch);
+		TArray<uint8> CArr; CArr.AddZeroed(8);
+		RudeYbn::PPTR(CArr, 0, OChild);
+		const int32 OCArr = Emit(CArr);
+		TArray<uint8> Comp; Comp.AddZeroed(0xb0);
+		RudeYbn::PF32(Comp, 0x00, VertR); RudeYbn::PU32(Comp, 0x04, 1);
+		Comp[0x10] = 0x0a;
+		RudeYbn::PF32(Comp, 0x14, CornerR);
+		RudeYbn::PVEC3(Comp, 0x20, WorldMax); RudeYbn::PF32(Comp, 0x2c, 0.f);
+		RudeYbn::PVEC3(Comp, 0x30, WorldMin); RudeYbn::PU32(Comp, 0x3c, 1);
+		RudeYbn::PVEC3(Comp, 0x40, WorldCtr);
+		RudeYbn::PVEC3(Comp, 0x50, WorldCtr);
+		RudeYbn::PF32(Comp, 0x60, 1.f); RudeYbn::PF32(Comp, 0x64, 1.f);
+		RudeYbn::PF32(Comp, 0x68, 1.f); RudeYbn::PF32(Comp, 0x6c, 1.f);
+		RudeYbn::PPTR(Comp, 0x70, OCArr);
+		RudeYbn::PPTR(Comp, 0x78, OXf); RudeYbn::PPTR(Comp, 0x80, OXf);
+		RudeYbn::PPTR(Comp, 0x88, OCBox);
+		RudeYbn::PPTR(Comp, 0x90, OF1); RudeYbn::PPTR(Comp, 0x98, OF2);
+		RudeYbn::PU16(Comp, 0xa0, 1); RudeYbn::PU16(Comp, 0xa2, 1);
+		OComposite = Emit(Comp);
+	}
+
+	// --- gtaDrawable header @0 ---
+	RudeYbn::PU32(Seg, 0x00, 0x40573178u); RudeYbn::PU32(Seg, 0x04, 1);   // VFT 0x140573178
+	RudeYbn::PPTR(Seg, 0x08, OBm);
+	RudeYbn::PPTR(Seg, 0x10, OSG);
+	{
+		const float C[3] = { Center.X, Center.Y, Center.Z };
+		const float Mn[3] = { BMin.X, BMin.Y, BMin.Z }, Mx[3] = { BMax.X, BMax.Y, BMax.Z };
+		RudeYbn::PVEC3(Seg, 0x20, C); RudeYbn::PF32(Seg, 0x2c, Radius);
+		RudeYbn::PVEC3(Seg, 0x30, Mn); RudeYbn::PU32(Seg, 0x3c, 0x7f800001u);
+		RudeYbn::PVEC3(Seg, 0x40, Mx); RudeYbn::PU32(Seg, 0x4c, 0x7f800001u);
+	}
+	RudeYbn::PPTR(Seg, 0x50, OModelsHdr);
+	for (int32 k = 0; k < 4; ++k) { RudeYbn::PF32(Seg, 0x70 + k*4, 9998.f); }
+	RudeYbn::PU32(Seg, 0x80, 0x0000ff01u);
+	RudeYbn::PU16(Seg, 0x9a, 0x0012);
+	RudeYbn::PPTR(Seg, 0xa0, OModelsHdr);
+	RudeYbn::PPTR(Seg, 0xa8, OName);
+	RudeYbn::PPTR(Seg, 0xc8, OComposite);
+
+	// --- container: RSC7 v165, sys hi-nibble 0xa, gfx 0x5 (gfx=0), uniform 64KB pages ---
+	uint32 Padded = 0;
+	const uint32 SysFlag = 0xa0000000u | RudeYbn::SysPageFlags((uint32)Seg.Num(), Padded);
+	const uint32 GfxFlag = 0x50000000u;
+	Seg.SetNumZeroed((int32)Padded);
+	RudeYbn::PU32(Seg, OBm + 0x08, Padded / 0x10000u);   // blockmap page count
+
+	int32 ZSize = FCompression::CompressMemoryBound(NAME_Zlib, Seg.Num());
+	TArray<uint8> Z; Z.SetNumUninitialized(ZSize);
+	if (!FCompression::CompressMemory(NAME_Zlib, Z.GetData(), ZSize, Seg.GetData(), Seg.Num()))
+	{
+		return Fail(TEXT("zlib compress failed"));
+	}
+	if (ZSize < 7 || Z[0] != 0x78) { return Fail(TEXT("unexpected zlib stream")); }
+	TArray<uint8> Out;
+	auto AddU32 = [&](uint32 V) { Out.Add(V & 0xFF); Out.Add((V>>8) & 0xFF); Out.Add((V>>16) & 0xFF); Out.Add((V>>24) & 0xFF); };
+	Out.Add('R'); Out.Add('S'); Out.Add('C'); Out.Add('7');
+	AddU32(165); AddU32(SysFlag); AddU32(GfxFlag);
+	Out.Append(Z.GetData() + 2, ZSize - 6);
+	if (!FFileHelper::SaveArrayToFile(Out, *OutYdrPath)) { return Fail(TEXT("write .ydr failed")); }
+
+	int32 TotalVerts = 0, TotalTris = 0;
+	for (const FGeo& G : Geos) { TotalVerts += G.Pos.Num(); TotalTris += G.Indices.Num() / 3; }
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"ydrPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"bytes\":%d,\"segSize\":%d,\"sysFlags\":\"0x%08x\"}"),
+		*OutYdrPath, Geos.Num(), TotalVerts, TotalTris, Out.Num(), Seg.Num(), SysFlag);
+#else
+	return Fail(TEXT("editor-only"));
+#endif
+}
+
 FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& OutYbnPath,
                                       const FString& WorldOffset)
 {

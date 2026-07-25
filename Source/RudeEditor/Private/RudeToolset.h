@@ -108,6 +108,18 @@ public:
 	static FString ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath,
 	                               const FString& MaxDim);
 
+	// Export a UStaticMesh directly to a binary FiveM .ydr (RSC7 v165) - CLEAN-ROOM,
+	// no CodeWalker. P5 step 3, the LAST CodeWalker dependency. Emits a gtaDrawable:
+	// GTAV1 vertex buffers (Pos/Normal/Colour0/UV, 36B stride) + u16 index buffers per
+	// polygon group, ShaderGroup with the normal_spec/spec parameter template (external
+	// -ytd texture stubs resolved by name), and the EMBEDDED phBoundComposite collision
+	// (same serialization as ExportYbnBinary - whole-mesh GeometryBVH). All-in-system
+	// (gfx=0), page-aware layout. Struct map: docs/ENGINEERING_LOG "ydr binary format".
+	// AssetPath: content path of the StaticMesh. OutYdrPath: absolute *.ydr path.
+	// Returns JSON: {ok, ydrPath, geometries, vertices, triangles, bytes, sysFlags}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath);
+
 	// Export a UStaticMesh's collision directly to a binary FiveM .ybn (RSC7 v43) -
 	// CLEAN-ROOM, no CodeWalker. P5 step 2. Emits a phBoundComposite wrapping one
 	// phBoundGeometryBVH: quantized vertices, 16-byte triangles, u8 material indices,
