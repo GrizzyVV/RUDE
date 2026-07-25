@@ -45,10 +45,13 @@ public:
 	// Batch ImportYdr: ListPath = a text file of absolute *.ydr.xml paths, one per line.
 	// Imports each as a UStaticMesh into DestFolder via the same path as ImportYdr,
 	// SKIPPING files whose target asset already exists (idempotent re-runs; the P4
-	// hash-manifest resumability model, name-level). Progress goes to the log.
+	// hash-manifest resumability model, name-level) UNLESS Mode is "FORCE" - then every
+	// file reimports in place (rebinds MaterialInstances against currently-imported
+	// textures; the texture-pass re-bind flow). Progress goes to the log.
 	// Returns JSON: {ok, imported, skipped, failed, failedFiles:[...first 30]}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
-	static FString ImportYdrBatch(const FString& ListPath, const FString& DestFolder);
+	static FString ImportYdrBatch(const FString& ListPath, const FString& DestFolder,
+	                              const FString& Mode);
 
 	// Spawn a scene manifest (tools/ingest_ymap.py output: JSON array of
 	// {ymap, entities:[{archetype, drawable, ue_location, ue_quat, scaleXY, scaleZ,

@@ -1147,8 +1147,14 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 				FString::Printf(TEXT("/Game/RUDE/Materials/Instances/%s/%s"), *Name, *MIName);
 			if (UPackage* MIPackage = CreatePackage(*MIPackageName))
 			{
-				UMaterialInstanceConstant* MIC = NewObject<UMaterialInstanceConstant>(
-					MIPackage, FName(*MIName), RF_Public | RF_Standalone);
+				// TRUE edit-in-place (same law as textures): reuse an existing MI on
+				// reimport - NewObject over an existing object displaces it.
+				UMaterialInstanceConstant* MIC = FindObject<UMaterialInstanceConstant>(MIPackage, *MIName);
+				if (!MIC)
+				{
+					MIC = NewObject<UMaterialInstanceConstant>(
+						MIPackage, FName(*MIName), RF_Public | RF_Standalone);
+				}
 				MIC->SetParentEditorOnly(Master);
 				if (UTexture2D* T = FindTexture(Def->Diffuse))
 				{
@@ -1196,7 +1202,8 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures, *SlotsJson);
 }
 
-FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& DestFolder)
+FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& DestFolder,
+                                     const FString& Mode)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -1207,6 +1214,7 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	{
 		return Fail(TEXT("cannot read list file"));
 	}
+	const bool bForce = Mode.TrimStartAndEnd().Equals(TEXT("FORCE"), ESearchCase::IgnoreCase);
 	int32 Imported = 0, Skipped = 0, Failed = 0;
 	FString FailedFiles;
 	for (int32 i = 0; i < Lines.Num(); ++i)
@@ -1214,10 +1222,11 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		const FString Path = Lines[i].TrimStartAndEnd();
 		if (Path.IsEmpty()) { continue; }
 		// skip-if-exists on the FILENAME base (corpus files are named <drawable>.ydr.xml,
-		// matching the drawable <Name> ImportYdr derives) - idempotent re-runs
+		// matching the drawable <Name> ImportYdr derives) - idempotent re-runs.
+		// FORCE mode reimports in place (MI re-bind after a texture pass).
 		FString Base = FPaths::GetBaseFilename(Path);
 		Base.RemoveFromEnd(TEXT(".ydr"));
-		if (FPackageName::DoesPackageExist(DestFolder / Base))
+		if (!bForce && FPackageName::DoesPackageExist(DestFolder / Base))
 		{
 			++Skipped;
 			continue;
