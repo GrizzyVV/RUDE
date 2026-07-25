@@ -917,6 +917,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	struct FShaderDef
 	{
 		FString Preset = TEXT("default");
+		int32 RenderBucket = 0;              // RAGE draw bucket: 0 opaque, 1 alpha, 2 decal, 3 cutout
 		FString Diffuse, Normal, Specular;   // texture NAMES from the ydr
 	};
 	TArray<FShaderDef> Shaders;
@@ -930,6 +931,10 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 				if (const FXmlNode* SName = Item->FindChildNode(TEXT("Name")))
 				{
 					Def.Preset = SName->GetContent().TrimStartAndEnd();
+				}
+				if (const FXmlNode* RB = Item->FindChildNode(TEXT("RenderBucket")))
+				{
+					Def.RenderBucket = FCString::Atoi(*RB->GetAttribute(TEXT("value")));
 				}
 				if (const FXmlNode* Params = Item->FindChildNode(TEXT("Parameters")))
 				{
@@ -1100,14 +1105,19 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		}
 	}
 
-	auto MasterForPreset = [](const FString& Preset) -> UMaterialInterface*
+	auto MasterForPreset = [](const FString& Preset, int32 Bucket) -> UMaterialInterface*
 	{
 		const FString P = Preset.ToLower();
 		const TCHAR* Path = TEXT("/RUDE/Masters/M_RUDE_Opaque.M_RUDE_Opaque");
-		if (P.Contains(TEXT("decal")))       { Path = TEXT("/RUDE/Masters/M_RUDE_Decal.M_RUDE_Decal"); }
-		// foliage/vegetation presets (trees_*, grass_*) are alpha-tested in RAGE but are
-		// not named "cutout" - route them to the cutout master or leaves render solid
-		else if (P.Contains(TEXT("cutout")) || P.StartsWith(TEXT("trees")) ||
+		// RenderBucket is RAGE's authoritative signal (0 opaque, 1 alpha, 2 decal,
+		// 3 cutout) - preset names lie (the airstrip weeds are "default" @ bucket 3).
+		// Bucket first; name rules as fallback for bucket-0 oddities.
+		if (Bucket == 2 || P.Contains(TEXT("decal")))
+		{
+			Path = TEXT("/RUDE/Masters/M_RUDE_Decal.M_RUDE_Decal");
+		}
+		else if (Bucket == 1 || Bucket == 3 ||
+		         P.Contains(TEXT("cutout")) || P.StartsWith(TEXT("trees")) ||
 		         P.StartsWith(TEXT("grass")) || P.Contains(TEXT("alpha")) ||
 		         P.Contains(TEXT("foliage")))
 		{
@@ -1138,7 +1148,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		const FShaderDef* Def = Shaders.IsValidIndex(ShaderIdx) ? &Shaders[ShaderIdx] : nullptr;
 
 		UMaterialInterface* SlotMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
-		UMaterialInterface* Master = Def ? MasterForPreset(Def->Preset) : nullptr;
+		UMaterialInterface* Master = Def ? MasterForPreset(Def->Preset, Def->RenderBucket) : nullptr;
 		const FString ConfigKey = Def
 			? (Def->Preset + TEXT("|") + Def->Diffuse + TEXT("|") + Def->Normal + TEXT("|") + Def->Specular).ToLower()
 			: FString();
@@ -1195,6 +1205,15 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	}
 
 	Mesh->Build(true);
+	// PIE-walkable collision: map meshes use their render triangles as collision
+	// (complex-as-simple) - RAGE collision stays a separate lane (ybn/embedded bounds).
+	if (!Mesh->GetBodySetup()) { Mesh->CreateBodySetup(); }
+	if (UBodySetup* BS = Mesh->GetBodySetup())
+	{
+		BS->CollisionTraceFlag = CTF_UseComplexAsSimple;
+		BS->InvalidatePhysicsData();
+		BS->CreatePhysicsMeshes();
+	}
 	Mesh->PostEditChange();
 	Package->MarkPackageDirty();
 	FAssetRegistryModule::AssetCreated(Mesh);
