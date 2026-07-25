@@ -34,6 +34,7 @@
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionMultiply.h"
 #include "Materials/MaterialExpressionSaturate.h"
+#include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionSubtract.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionVertexColor.h"
@@ -84,18 +85,72 @@ static UMaterialInterface* EnsureDecalGeoMaster()
 	WPO->MaterialExpressionEditorX = -300; WPO->MaterialExpressionEditorY = 600;
 	M->GetExpressionCollection().AddExpression(WPO);
 
+	// Opacity = Diffuse.A * Visible. ImportYdr sets Visible=0 when the decal's texture
+	// isn't in the corpus, so an unresolved decal DISAPPEARS instead of painting an
+	// opaque white slab across the beach (2026-07-25 regression, Matt-spotted).
+	auto* Vis = NewObject<UMaterialExpressionScalarParameter>(M);
+	Vis->ParameterName = TEXT("Visible"); Vis->DefaultValue = 1.f;
+	M->GetExpressionCollection().AddExpression(Vis);
+	auto* AlphaSrc = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	AlphaSrc->ParameterName = TEXT("Diffuse"); AlphaSrc->SamplerType = SAMPLERTYPE_Color; AlphaSrc->Texture = DefWhite;
+	M->GetExpressionCollection().AddExpression(AlphaSrc);
+	auto* OpMul = NewObject<UMaterialExpressionMultiply>(M);
+	OpMul->A.Expression = AlphaSrc; OpMul->A.MaskA = 1; OpMul->A.Mask = 1;
+	OpMul->A.MaskR = 0; OpMul->A.MaskG = 0; OpMul->A.MaskB = 0;
+	OpMul->B.Expression = Vis;
+	M->GetExpressionCollection().AddExpression(OpMul);
+
 	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
 	EO->BaseColor.Expression = Diff;
 	EO->Normal.Expression = Nrm;
 	EO->WorldPositionOffset.Expression = WPO;
+	EO->OpacityMask.Expression = OpMul;
+	M->PostEditChange();
+	Pkg->MarkPackageDirty();
+	FAssetRegistryModule::AssetCreated(M);
+	return M;
+}
+
+// RAGE foliage is alpha-tested AND double-sided (leaf cards are single quads). Imported
+// single-sided, every leaf facing away from the light renders near-black (the dark trees
+// on Cayo, 2026-07-25). Two-sided + masked is the correct foliage material.
+static UMaterialInterface* EnsureFoliageMaster()
+{
+	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_Foliage.M_RUDE_Foliage");
+	if (UMaterialInterface* Existing = LoadObject<UMaterialInterface>(nullptr, FullPath))
 	{
-		auto* A = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
-		A->ParameterName = TEXT("Diffuse"); A->SamplerType = SAMPLERTYPE_Color; A->Texture = DefWhite;
-		M->GetExpressionCollection().AddExpression(A);
-		EO->OpacityMask.Expression = A;
-		EO->OpacityMask.MaskA = 1; EO->OpacityMask.Mask = 1;
-		EO->OpacityMask.MaskR = 0; EO->OpacityMask.MaskG = 0; EO->OpacityMask.MaskB = 0;
+		return Existing;
 	}
+	UPackage* Pkg = CreatePackage(TEXT("/RUDE/Masters/M_RUDE_Foliage"));
+	if (!Pkg) { return nullptr; }
+	UMaterial* M = NewObject<UMaterial>(Pkg, TEXT("M_RUDE_Foliage"), RF_Public | RF_Standalone);
+	M->BlendMode = BLEND_Masked;
+	M->TwoSided = true;
+	M->SetShadingModel(MSM_TwoSidedFoliage);   // light transmits through leaf cards
+	UTexture* DefWhite = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+	UTexture* DefNormal = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineMaterials/FlatNormal.FlatNormal"));
+
+	auto* Diff = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Diff->ParameterName = TEXT("Diffuse"); Diff->SamplerType = SAMPLERTYPE_Color; Diff->Texture = DefWhite;
+	Diff->MaterialExpressionEditorX = -600;
+	M->GetExpressionCollection().AddExpression(Diff);
+	auto* Nrm = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Nrm->ParameterName = TEXT("Normal"); Nrm->SamplerType = SAMPLERTYPE_Normal; Nrm->Texture = DefNormal;
+	Nrm->MaterialExpressionEditorX = -600; Nrm->MaterialExpressionEditorY = 300;
+	M->GetExpressionCollection().AddExpression(Nrm);
+	auto* Sub = NewObject<UMaterialExpressionConstant>(M); Sub->R = 0.35f;   // subsurface strength
+	M->GetExpressionCollection().AddExpression(Sub);
+	auto* SubCol = NewObject<UMaterialExpressionMultiply>(M);
+	SubCol->A.Expression = Diff; SubCol->B.Expression = Sub;
+	M->GetExpressionCollection().AddExpression(SubCol);
+
+	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
+	EO->BaseColor.Expression = Diff;
+	EO->Normal.Expression = Nrm;
+	EO->SubsurfaceColor.Expression = SubCol;
+	EO->OpacityMask.Expression = Diff;
+	EO->OpacityMask.MaskA = 1; EO->OpacityMask.Mask = 1;
+	EO->OpacityMask.MaskR = 0; EO->OpacityMask.MaskG = 0; EO->OpacityMask.MaskB = 0;
 	M->PostEditChange();
 	Pkg->MarkPackageDirty();
 	FAssetRegistryModule::AssetCreated(M);
@@ -1341,10 +1396,13 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		{
 			return EnsureDecalGeoMaster();   // coplanar-safe (WPO offset), masked
 		}
+		else if (P.StartsWith(TEXT("trees")) || P.StartsWith(TEXT("grass")) ||
+		         P.Contains(TEXT("foliage")) || P.Contains(TEXT("plant")))
+		{
+			return EnsureFoliageMaster();    // two-sided foliage shading (leaf cards)
+		}
 		else if (Bucket == 1 || Bucket == 3 ||
-		         P.Contains(TEXT("cutout")) || P.StartsWith(TEXT("trees")) ||
-		         P.StartsWith(TEXT("grass")) || P.Contains(TEXT("alpha")) ||
-		         P.Contains(TEXT("foliage")))
+		         P.Contains(TEXT("cutout")) || P.Contains(TEXT("alpha")))
 		{
 			Path = TEXT("/RUDE/Masters/M_RUDE_Cutout.M_RUDE_Cutout");
 		}
@@ -1431,6 +1489,14 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 					MIC->SetTextureParameterValueEditorOnly(
 						FMaterialParameterInfo(TEXT("Specular")), T);
 					++BoundTextures;
+				}
+				// A decal whose texture isn't in the corpus must render as NOTHING, not as
+				// an opaque white slab (the master's default texture is white).
+				if (Def->RenderBucket == 2 || Def->Preset.Contains(TEXT("decal")))
+				{
+					const bool bHasDiffuse = FindTexture(Def->Diffuse) != nullptr;
+					MIC->SetScalarParameterValueEditorOnly(
+						FMaterialParameterInfo(TEXT("Visible")), bHasDiffuse ? 1.f : 0.f);
 				}
 				if (bTerrain)
 				{
