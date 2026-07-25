@@ -88,6 +88,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYbn(const FString& AssetPath, const FString& OutXmlPath);
 
+	// Position the level-editor perspective viewport and capture a screenshot -
+	// the agent-vision primitive (verify imports/materials without human eyes at
+	// the machine). CamSpec: "x,y,z,pitch,yaw" (UE cm/degrees). The PNG lands at
+	// OutPng on the NEXT viewport draw - poll the file. Returns {ok, requested}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString CaptureView(const FString& CamSpec, const FString& OutPng);
+
 	// THE THREAD-PULL: one call ingests a whole map area from the corpus.
 	// 1) builds an archetype index from every .ytyp XML under <CorpusRoot>/ytyp
 	// 2) parses <CorpusRoot>/ymap/<YmapPrefix>*.xml entities (import-lane transforms)

@@ -25,6 +25,8 @@
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "EngineUtils.h"
+#include "LevelEditorViewport.h"
+#include "UnrealClient.h"
 #include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionConstant.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
@@ -1364,6 +1366,31 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"boundTextures\":%d,\"slots\":[%s]}"),
 		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures, *SlotsJson);
+}
+
+FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	TArray<FString> C;
+	CamSpec.ParseIntoArray(C, TEXT(","), true);
+	if (C.Num() != 5) { return Fail(TEXT("CamSpec must be \"x,y,z,pitch,yaw\"")); }
+	const FVector Loc(FCString::Atod(*C[0]), FCString::Atod(*C[1]), FCString::Atod(*C[2]));
+	const FRotator Rot(FCString::Atod(*C[3]), FCString::Atod(*C[4]), 0.0);
+	for (FLevelEditorViewportClient* VC : GEditor->GetLevelViewportClients())
+	{
+		if (VC && VC->IsPerspective())
+		{
+			VC->SetViewLocation(Loc);
+			VC->SetViewRotation(Rot);
+			VC->Invalidate();
+			FScreenshotRequest::RequestScreenshot(OutPng, /*bShowUI*/ false, /*bAddFilenameSuffix*/ false);
+			return FString::Printf(TEXT("{\"ok\":true,\"requested\":\"%s\"}"), *OutPng);
+		}
+	}
+	return Fail(TEXT("no perspective level viewport"));
 }
 
 FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
