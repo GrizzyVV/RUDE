@@ -27,11 +27,17 @@
 #include "EngineUtils.h"
 #include "LevelEditorViewport.h"
 #include "UnrealClient.h"
+#include "Materials/MaterialExpressionAdd.h"
 #include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionDivide.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
+#include "Materials/MaterialExpressionMultiply.h"
+#include "Materials/MaterialExpressionSaturate.h"
+#include "Materials/MaterialExpressionSubtract.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionVertexColor.h"
+#include "Materials/MaterialExpressionVertexNormalWS.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
@@ -40,6 +46,62 @@
 // to layer1/2/3 by VC.R/G/B. Texture params Diffuse0..3 / Normal0..3 match ImportYdr's
 // terrain binding. (v1 approximation of the RAGE blend - acceptance test is Matt's
 // "patchwork gone" report; the 2tex_blend lookup variants refine later.)
+// RAGE decal geometry is COPLANAR with the surface it sits on; imported as ordinary
+// opaque meshes it z-fights (the black striping across the Cayo runway, 2026-07-25).
+// Fix WITHOUT touching geometry (export round-trip stays byte-exact): a masked
+// material that pushes the pixels off the surface via World Position Offset along the
+// vertex normal. 2cm is invisible at map scale and clears the depth tie.
+static UMaterialInterface* EnsureDecalGeoMaster()
+{
+	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_DecalGeo.M_RUDE_DecalGeo");
+	if (UMaterialInterface* Existing = LoadObject<UMaterialInterface>(nullptr, FullPath))
+	{
+		return Existing;
+	}
+	UPackage* Pkg = CreatePackage(TEXT("/RUDE/Masters/M_RUDE_DecalGeo"));
+	if (!Pkg) { return nullptr; }
+	UMaterial* M = NewObject<UMaterial>(Pkg, TEXT("M_RUDE_DecalGeo"), RF_Public | RF_Standalone);
+	M->BlendMode = BLEND_Masked;
+	M->TwoSided = true;
+	UTexture* DefWhite = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+	UTexture* DefNormal = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineMaterials/FlatNormal.FlatNormal"));
+
+	auto* Diff = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Diff->ParameterName = TEXT("Diffuse"); Diff->SamplerType = SAMPLERTYPE_Color; Diff->Texture = DefWhite;
+	Diff->MaterialExpressionEditorX = -600;
+	M->GetExpressionCollection().AddExpression(Diff);
+	auto* Nrm = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Nrm->ParameterName = TEXT("Normal"); Nrm->SamplerType = SAMPLERTYPE_Normal; Nrm->Texture = DefNormal;
+	Nrm->MaterialExpressionEditorX = -600; Nrm->MaterialExpressionEditorY = 300;
+	M->GetExpressionCollection().AddExpression(Nrm);
+	auto* VN = NewObject<UMaterialExpressionVertexNormalWS>(M);
+	VN->MaterialExpressionEditorX = -600; VN->MaterialExpressionEditorY = 600;
+	M->GetExpressionCollection().AddExpression(VN);
+	auto* Off = NewObject<UMaterialExpressionConstant>(M); Off->R = 2.0f;   // cm along the normal
+	M->GetExpressionCollection().AddExpression(Off);
+	auto* WPO = NewObject<UMaterialExpressionMultiply>(M);
+	WPO->A.Expression = VN; WPO->B.Expression = Off;
+	WPO->MaterialExpressionEditorX = -300; WPO->MaterialExpressionEditorY = 600;
+	M->GetExpressionCollection().AddExpression(WPO);
+
+	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
+	EO->BaseColor.Expression = Diff;
+	EO->Normal.Expression = Nrm;
+	EO->WorldPositionOffset.Expression = WPO;
+	{
+		auto* A = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		A->ParameterName = TEXT("Diffuse"); A->SamplerType = SAMPLERTYPE_Color; A->Texture = DefWhite;
+		M->GetExpressionCollection().AddExpression(A);
+		EO->OpacityMask.Expression = A;
+		EO->OpacityMask.MaskA = 1; EO->OpacityMask.Mask = 1;
+		EO->OpacityMask.MaskR = 0; EO->OpacityMask.MaskG = 0; EO->OpacityMask.MaskB = 0;
+	}
+	M->PostEditChange();
+	Pkg->MarkPackageDirty();
+	FAssetRegistryModule::AssetCreated(M);
+	return M;
+}
+
 static UMaterialInterface* EnsureTerrainMaster()
 {
 	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_Terrain.M_RUDE_Terrain");
@@ -75,21 +137,67 @@ static UMaterialInterface* EnsureTerrainMaster()
 		M->GetExpressionCollection().AddExpression(E);
 		return E;
 	};
+	// Blend weights: RAGE terrain masks live in a vertex COLOUR stream. Which one is
+	// per-shader-family ambiguous (corpus survey: Colour1.G/B vary in ~48/60 meshes,
+	// Colour0.A/B in ~44/33) - so ImportYdr ships BOTH (Colour0 -> vertex colour,
+	// Colour1 -> UV2/UV3) and this master blends from a chosen set. w1..w3 drive
+	// layers 1-3, layer0 takes the remainder: NORMALIZED weighted sum (a nested-lerp
+	// chain averages everything toward grey - the washed-out first attempt).
 	UMaterialExpressionComponentMask* Masks[3] = { Mask(1,0,0,-100), Mask(0,1,0,0), Mask(0,0,1,100) };
 	auto Chain = [&](UMaterialExpressionTextureSampleParameter2D* const T[4], int32 Y) -> UMaterialExpression*
 	{
-		UMaterialExpression* Prev = T[0];
-		for (int32 i = 0; i < 3; ++i)
+		// w0 = saturate(1 - (w1+w2+w3))
+		auto* Sum12 = NewObject<UMaterialExpressionAdd>(M);
+		Sum12->A.Expression = Masks[0]; Sum12->B.Expression = Masks[1];
+		M->GetExpressionCollection().AddExpression(Sum12);
+		auto* Sum123 = NewObject<UMaterialExpressionAdd>(M);
+		Sum123->A.Expression = Sum12; Sum123->B.Expression = Masks[2];
+		M->GetExpressionCollection().AddExpression(Sum123);
+		auto* One = NewObject<UMaterialExpressionConstant>(M); One->R = 1.f;
+		M->GetExpressionCollection().AddExpression(One);
+		auto* W0raw = NewObject<UMaterialExpressionSubtract>(M);
+		W0raw->A.Expression = One; W0raw->B.Expression = Sum123;
+		M->GetExpressionCollection().AddExpression(W0raw);
+		auto* W0 = NewObject<UMaterialExpressionSaturate>(M);
+		W0->Input.Expression = W0raw;
+		M->GetExpressionCollection().AddExpression(W0);
+
+		UMaterialExpression* Weights[4] = { W0, Masks[0], Masks[1], Masks[2] };
+		UMaterialExpression* Acc = nullptr;
+		UMaterialExpression* WSum = nullptr;
+		for (int32 i = 0; i < 4; ++i)
 		{
-			auto* L = NewObject<UMaterialExpressionLinearInterpolate>(M);
-			L->A.Expression = Prev;
-			L->B.Expression = T[i + 1];
-			L->Alpha.Expression = Masks[i];
-			L->MaterialExpressionEditorX = -400 + i * 150; L->MaterialExpressionEditorY = Y;
-			M->GetExpressionCollection().AddExpression(L);
-			Prev = L;
+			auto* Mul = NewObject<UMaterialExpressionMultiply>(M);
+			Mul->A.Expression = T[i]; Mul->B.Expression = Weights[i];
+			Mul->MaterialExpressionEditorX = -400; Mul->MaterialExpressionEditorY = Y + i * 90;
+			M->GetExpressionCollection().AddExpression(Mul);
+			if (!Acc) { Acc = Mul; }
+			else
+			{
+				auto* Add = NewObject<UMaterialExpressionAdd>(M);
+				Add->A.Expression = Acc; Add->B.Expression = Mul;
+				M->GetExpressionCollection().AddExpression(Add);
+				Acc = Add;
+			}
+			if (!WSum) { WSum = Weights[i]; }
+			else
+			{
+				auto* AddW = NewObject<UMaterialExpressionAdd>(M);
+				AddW->A.Expression = WSum; AddW->B.Expression = Weights[i];
+				M->GetExpressionCollection().AddExpression(AddW);
+				WSum = AddW;
+			}
 		}
-		return Prev;
+		auto* Eps = NewObject<UMaterialExpressionConstant>(M); Eps->R = 0.0001f;
+		M->GetExpressionCollection().AddExpression(Eps);
+		auto* SafeSum = NewObject<UMaterialExpressionAdd>(M);
+		SafeSum->A.Expression = WSum; SafeSum->B.Expression = Eps;
+		M->GetExpressionCollection().AddExpression(SafeSum);
+		auto* Div = NewObject<UMaterialExpressionDivide>(M);
+		Div->A.Expression = Acc; Div->B.Expression = SafeSum;
+		Div->MaterialExpressionEditorX = -150; Div->MaterialExpressionEditorY = Y;
+		M->GetExpressionCollection().AddExpression(Div);
+		return Div;
 	};
 	UMaterialExpressionTextureSampleParameter2D* D[4];
 	UMaterialExpressionTextureSampleParameter2D* N[4];
@@ -134,7 +242,8 @@ namespace RudeYdr
 		TArray<FVector3f> Positions;   // already RUDE-transformed to UE space (cm, Y-mirrored)
 		TArray<FVector3f> Normals;     // Y-mirrored
 		TArray<FVector2f> UVs;         // raw RAGE UVs (both engines are V-down; no flip)
-		TArray<FVector4f> Colors;      // Colour0 as 0-1 RGBA - terrain layer blend weights
+		TArray<FVector4f> Colors;      // Colour0 as 0-1 RGBA -> UE vertex colour
+		TArray<FVector4f> Colors1;     // Colour1 as 0-1 RGBA -> smuggled into UV2/UV3
 		TArray<int32> Indices;         // winding already flipped for the mirror
 	};
 
@@ -205,6 +314,7 @@ namespace RudeYdr
 			FVector3f Nrm(0, 0, 1);
 			FVector2f UV = FVector2f::ZeroVector;
 			FVector4f Col(1, 1, 1, 1);
+			FVector4f Col1(0, 0, 0, 0);
 			for (const FString& Sem : Semantics)
 			{
 				const int32 W = SemanticWidth(Sem);
@@ -227,11 +337,21 @@ namespace RudeYdr
 				}
 				else if (Sem == TEXT("Colour0"))
 				{
-					// terrain 4-layer blend weights live here (0-255 per channel)
+					// terrain blend weights live in a colour stream (0-255 per channel)
 					Col = FVector4f(FCString::Atof(*Toks[Off]) / 255.f,
 					                FCString::Atof(*Toks[Off + 1]) / 255.f,
 					                FCString::Atof(*Toks[Off + 2]) / 255.f,
 					                FCString::Atof(*Toks[Off + 3]) / 255.f);
+				}
+				else if (Sem == TEXT("Colour1"))
+				{
+					// UE static meshes carry ONE vertex-colour set, so Colour1 (the other
+					// terrain-mask candidate) rides in UV channels 2/3 - the material can
+					// then blend from either stream without a re-import.
+					Col1 = FVector4f(FCString::Atof(*Toks[Off]) / 255.f,
+					                 FCString::Atof(*Toks[Off + 1]) / 255.f,
+					                 FCString::Atof(*Toks[Off + 2]) / 255.f,
+					                 FCString::Atof(*Toks[Off + 3]) / 255.f);
 				}
 				Off += W;
 			}
@@ -240,6 +360,7 @@ namespace RudeYdr
 			Out.Normals.Add(FVector3f(Nrm.X, -Nrm.Y, Nrm.Z));
 			Out.UVs.Add(UV);
 			Out.Colors.Add(Col);
+			Out.Colors1.Add(Col1);
 		}
 
 		TArray<FString> IdxToks;
@@ -1120,6 +1241,8 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	}
 	FStaticMeshAttributes Attributes(*MeshDesc);
 	Attributes.Register();
+	// UV0 = the real UVs; UV2/UV3 smuggle Colour1 (RG / BA) for terrain blending
+	Attributes.GetVertexInstanceUVs().SetNumChannels(4);
 
 	TVertexAttributesRef<FVector3f> VertexPositions = Attributes.GetVertexPositions();
 	TVertexInstanceAttributesRef<FVector3f> InstNormals = Attributes.GetVertexInstanceNormals();
@@ -1175,7 +1298,10 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 			{
 				const FVertexInstanceID Inst = MeshDesc->CreateVertexInstance(VertexIDs[Idx]);
 				InstNormals[Inst] = Geo.Normals.IsValidIndex(Idx) ? Geo.Normals[Idx] : FVector3f(0, 0, 1);
-				InstUVs[Inst] = Geo.UVs.IsValidIndex(Idx) ? Geo.UVs[Idx] : FVector2f::ZeroVector;
+				InstUVs.Set(Inst, 0, Geo.UVs.IsValidIndex(Idx) ? Geo.UVs[Idx] : FVector2f::ZeroVector);
+				const FVector4f C1 = Geo.Colors1.IsValidIndex(Idx) ? Geo.Colors1[Idx] : FVector4f(0, 0, 0, 0);
+				InstUVs.Set(Inst, 2, FVector2f(C1.X, C1.Y));
+				InstUVs.Set(Inst, 3, FVector2f(C1.Z, C1.W));
 				InstColors[Inst] = Geo.Colors.IsValidIndex(Idx) ? Geo.Colors[Idx] : FVector4f(1, 1, 1, 1);
 				Insts.Add(Inst);
 			}
@@ -1213,7 +1339,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		// Bucket first; name rules as fallback for bucket-0 oddities.
 		if (Bucket == 2 || P.Contains(TEXT("decal")))
 		{
-			Path = TEXT("/RUDE/Masters/M_RUDE_Decal.M_RUDE_Decal");
+			return EnsureDecalGeoMaster();   // coplanar-safe (WPO offset), masked
 		}
 		else if (Bucket == 1 || Bucket == 3 ||
 		         P.Contains(TEXT("cutout")) || P.StartsWith(TEXT("trees")) ||
