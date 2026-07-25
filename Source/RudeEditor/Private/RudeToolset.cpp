@@ -2125,11 +2125,8 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	const int32 OFvf = Emit(Fvf);
 	const int32 OName = EmitStr(MeshName);
 
-	// --- shared 7-vector value block (the normal_spec template, XML order) ---
-	static const float VecVals[7] = { 0.9f, 40.f, 0.3f, 1.f, 1.f, 0.f, 1.f };
-	TArray<uint8> Vals; Vals.AddZeroed(7 * 16);
-	for (int32 i = 0; i < 7; ++i) { RudeYbn::PF32(Vals, i * 16, VecVals[i]); }
-	const int32 OVals = Emit(Vals);
+	// (vector parameter values are emitted INLINE inside each shader's contiguous
+	// parameter allocation below - the oracle's layout, load-bearing for teardown)
 
 	// --- per-shader: texture stubs (0x50: refcount, name*, 0x00020001), param table,
 	//     param block, shader struct ---
@@ -2150,19 +2147,46 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	TArray<int32> ShaderOfs;
 	for (const FGeo& G : Geos)
 	{
-		struct FPar { uint32 Meta; int32 Ofs; };
+		// One CONTIGUOUS parameter allocation per shader (the oracle's load-bearing
+		// layout - the crash-#2 root cause was missing it):
+		//   [N entries x16: {meta, value*}] [V vector values x16, entries point INTO
+		//   this] [N x u32 joaat(paramName) - the game binds parameters BY NAME HASH]
+		// The param block's +0x14 encodes it: (allocSize<<16) | hashArrayOffset
+		// (= 0x01500100 for the 9-param normal_spec template, matching the oracle).
+		struct FPar { uint32 Meta; int32 StubOfs; const TCHAR* Name; };   // StubOfs<0 = inline vector
 		TArray<FPar> Pars;
-		if (!G.Diffuse.IsEmpty()) { Pars.Add({ 0x200u, TexStub(G.Diffuse) }); }
-		if (!G.Normal.IsEmpty()) { Pars.Add({ 0x300u, TexStub(G.Normal) }); }
+		if (!G.Diffuse.IsEmpty()) { Pars.Add({ 0x200u, TexStub(G.Diffuse), TEXT("DiffuseSampler") }); }
+		if (!G.Normal.IsEmpty()) { Pars.Add({ 0x300u, TexStub(G.Normal), TEXT("BumpSampler") }); }
 		static const uint32 VecMeta[7] = { 0xa601, 0xa501, 0xa401, 0xa301, 0xa201, 0xa101, 0xa001 };
-		for (int32 i = 0; i < 7; ++i) { Pars.Add({ VecMeta[i], OVals + i * 16 }); }
-		TArray<uint8> Tbl; Tbl.AddZeroed(Pars.Num() * 16);
-		for (int32 i = 0; i < Pars.Num(); ++i)
+		static const float VecVals[7] = { 0.9f, 40.f, 0.3f, 1.f, 1.f, 0.f, 1.f };
+		static const TCHAR* VecName[7] = { TEXT("specularFresnel"), TEXT("specularFalloffMult"),
+			TEXT("specularIntensityMult"), TEXT("bumpiness"), TEXT("wetnessMultiplier"),
+			TEXT("useTessellation"), TEXT("HardAlphaBlend") };
+		for (int32 i = 0; i < 7; ++i) { Pars.Add({ VecMeta[i], -1, VecName[i] }); }
+		const int32 NPar = Pars.Num(), NVec = 7;
+		const int32 HashOfs = NPar * 16 + NVec * 16;
+		const int32 AllocSize = (NPar == 9) ? 0x150 : ((HashOfs + NPar * 4 + 15) & ~15);
+		TArray<uint8> Zero; Zero.AddZeroed(AllocSize);
+		const int32 OTbl = Emit(Zero);
 		{
-			RudeYbn::PU32(Tbl, i * 16, Pars[i].Meta);
-			RudeYbn::PPTR(Tbl, i * 16 + 8, Pars[i].Ofs);
+			int32 VecIdx = 0;
+			for (int32 i = 0; i < NPar; ++i)
+			{
+				RudeYbn::PU32(Seg, OTbl + i * 16, Pars[i].Meta);
+				if (Pars[i].StubOfs >= 0)
+				{
+					RudeYbn::PPTR(Seg, OTbl + i * 16 + 8, Pars[i].StubOfs);
+				}
+				else
+				{
+					const int32 VOfs = OTbl + NPar * 16 + VecIdx * 16;
+					RudeYbn::PF32(Seg, VOfs, VecVals[VecIdx]);
+					RudeYbn::PPTR(Seg, OTbl + i * 16 + 8, VOfs);
+					++VecIdx;
+				}
+				RudeYbn::PU32(Seg, OTbl + HashOfs + i * 4, RudeYtd::Joaat(Pars[i].Name));
+			}
 		}
-		const int32 OTbl = Emit(Tbl);
 		// preset: only the pinned normal_spec/spec templates for v1; anything else falls
 		// back to normal_spec's registers with its own name hash (same as the XML lane's
 		// default-param behaviour - flag for the P2 material lane).
@@ -2172,8 +2196,8 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 		TArray<uint8> Blk; Blk.AddZeroed(0x30);
 		RudeYbn::PPTR(Blk, 0x00, OTbl);
 		RudeYbn::PU32(Blk, 0x08, RudeYtd::Joaat(Preset));
-		RudeYbn::PU32(Blk, 0x10, 0x80000000u | (uint32)Pars.Num());
-		RudeYbn::PU32(Blk, 0x14, 0x01500100u);
+		RudeYbn::PU32(Blk, 0x10, 0x80000000u | (uint32)NPar);
+		RudeYbn::PU32(Blk, 0x14, ((uint32)AllocSize << 16) | (uint32)HashOfs);
 		RudeYbn::PU32(Blk, 0x18, RudeYtd::Joaat(Preset + TEXT(".sps")));
 		RudeYbn::PU32(Blk, 0x20, 0x0000ff01u);
 		RudeYbn::PU32(Blk, 0x24, 0x02000000u);
