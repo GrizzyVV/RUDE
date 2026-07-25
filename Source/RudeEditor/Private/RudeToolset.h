@@ -88,6 +88,16 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYbn(const FString& AssetPath, const FString& OutXmlPath);
 
+	// Spawn (or move) the sea-level reference plane - GTA's ocean sits at world z=0,
+	// which coastal authoring needs to see. This is a VISUAL REFERENCE, not game data:
+	// FiveM water comes from water.xml, which RUDE does not yet read or write.
+	// SizeMetres: half-extent of the plane in GTA metres (e.g. "4000").
+	// ZMetres: sea height in GTA metres (default 0). Lands in the RUDE_ENV folder so
+	// ImportScene's respawn (which clears RUDE_LS) leaves it alone.
+	// Returns JSON: {ok, actor, sizeM, zM}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString SpawnSeaLevel(const FString& SizeMetres, const FString& ZMetres);
+
 	// Position the level-editor perspective viewport and capture a screenshot -
 	// the agent-vision primitive (verify imports/materials without human eyes at
 	// the machine). CamSpec: "x,y,z,pitch,yaw" (UE cm/degrees). The PNG lands at

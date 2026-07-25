@@ -37,6 +37,7 @@
 #include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionSubtract.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
+#include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialExpressionVertexNormalWS.h"
 #include "Serialization/JsonReader.h"
@@ -1558,6 +1559,88 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"boundTextures\":%d,\"slots\":[%s]}"),
 		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures, *SlotsJson);
+}
+
+// Translucent sea material - a reference surface, deliberately simple (no waves/refraction;
+// RUDE is a mapping DCC, not a renderer).
+static UMaterialInterface* EnsureWaterMaster()
+{
+	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_Water.M_RUDE_Water");
+	if (UMaterialInterface* Existing = LoadObject<UMaterialInterface>(nullptr, FullPath))
+	{
+		return Existing;
+	}
+	UPackage* Pkg = CreatePackage(TEXT("/RUDE/Masters/M_RUDE_Water"));
+	if (!Pkg) { return nullptr; }
+	UMaterial* M = NewObject<UMaterial>(Pkg, TEXT("M_RUDE_Water"), RF_Public | RF_Standalone);
+	M->BlendMode = BLEND_Translucent;
+	M->TwoSided = true;
+	auto* Col = NewObject<UMaterialExpressionVectorParameter>(M);
+	Col->ParameterName = TEXT("WaterColor");
+	Col->DefaultValue = FLinearColor(0.012f, 0.055f, 0.075f, 1.f);
+	M->GetExpressionCollection().AddExpression(Col);
+	auto* Op = NewObject<UMaterialExpressionScalarParameter>(M);
+	Op->ParameterName = TEXT("Opacity"); Op->DefaultValue = 0.82f;
+	M->GetExpressionCollection().AddExpression(Op);
+	auto* Rough = NewObject<UMaterialExpressionScalarParameter>(M);
+	Rough->ParameterName = TEXT("Roughness"); Rough->DefaultValue = 0.06f;
+	M->GetExpressionCollection().AddExpression(Rough);
+	auto* Spec = NewObject<UMaterialExpressionConstant>(M); Spec->R = 1.f;
+	M->GetExpressionCollection().AddExpression(Spec);
+
+	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
+	EO->BaseColor.Expression = Col;
+	EO->Opacity.Expression = Op;
+	EO->Roughness.Expression = Rough;
+	EO->Specular.Expression = Spec;
+	M->PostEditChange();
+	Pkg->MarkPackageDirty();
+	FAssetRegistryModule::AssetCreated(M);
+	return M;
+}
+
+FString URudeToolset::SpawnSeaLevel(const FString& SizeMetres, const FString& ZMetres)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	const double SizeM = FMath::Max(1.0, FCString::Atod(*SizeMetres));
+	const double ZM = ZMetres.TrimStartAndEnd().IsEmpty() ? 0.0 : FCString::Atod(*ZMetres);
+	UStaticMesh* Plane = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
+	if (!Plane) { return Fail(TEXT("engine Plane mesh not found")); }
+	UMaterialInterface* Water = EnsureWaterMaster();
+
+	// replace any previous sea plane (idempotent, like ImportScene)
+	TArray<AActor*> Stale;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (It->GetFolderPath() == FName(TEXT("RUDE_ENV")) && It->GetActorLabel() == TEXT("RUDE_SeaLevel"))
+		{
+			Stale.Add(*It);
+		}
+	}
+	for (AActor* A : Stale) { World->DestroyActor(A); }
+
+	AActor* Actor = World->SpawnActor<AActor>();
+	if (!Actor) { return Fail(TEXT("spawn failed")); }
+	UStaticMeshComponent* SMC = NewObject<UStaticMeshComponent>(Actor, TEXT("Sea"));
+	Actor->SetRootComponent(SMC);
+	SMC->SetStaticMesh(Plane);
+	if (Water) { SMC->SetMaterial(0, Water); }
+	SMC->SetMobility(EComponentMobility::Static);
+	SMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	// engine Plane is 100x100cm -> scale to the requested half-extent (metres -> cm)
+	const double Scale = (SizeM * 100.0 * 2.0) / 100.0;
+	SMC->SetWorldTransform(FTransform(FQuat::Identity, FVector(0, 0, ZM * 100.0), FVector(Scale, Scale, 1.0)));
+	SMC->RegisterComponent();
+	Actor->AddInstanceComponent(SMC);
+	Actor->SetActorLabel(TEXT("RUDE_SeaLevel"));
+	Actor->SetFolderPath(FName(TEXT("RUDE_ENV")));
+	World->MarkPackageDirty();
+	return FString::Printf(TEXT("{\"ok\":true,\"actor\":\"RUDE_SeaLevel\",\"sizeM\":%.0f,\"zM\":%.2f}"), SizeM, ZM);
 }
 
 FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng)
