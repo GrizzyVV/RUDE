@@ -1964,7 +1964,10 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	TVertexInstanceAttributesConstRef<FVector3f> InstNormals = Attributes.GetVertexInstanceNormals();
 	TVertexInstanceAttributesConstRef<FVector2f> InstUVs = Attributes.GetVertexInstanceUVs();
 	TPolygonGroupAttributesConstRef<FName> GroupSlots = Attributes.GetPolygonGroupMaterialSlotNames();
-	FString MeshName = Mesh->GetName();
+	// Drawable name = the OUTPUT FILE's basename (corpus convention: the stream name IS
+	// the drawable identity; also keeps the emitted bytes final - no post-hoc patching).
+	FString MeshName = FPaths::GetBaseFilename(OutYdrPath);
+	MeshName.RemoveFromEnd(TEXT(".ydr"));
 	MeshName.ToLowerInline();
 
 	// --- gather per polygon group (same rules as the XML lane: weld by (vid,normal,uv),
