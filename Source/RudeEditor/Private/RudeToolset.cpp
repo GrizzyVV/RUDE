@@ -19,6 +19,13 @@
 #include "StaticMeshAttributes.h"
 #include "UObject/Package.h"
 #include "XmlFile.h"
+#include "Components/InstancedStaticMeshComponent.h"
+#include "Dom/JsonObject.h"
+#include "Editor.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 
 namespace RudeYdr
 {
@@ -1168,6 +1175,206 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"boundTextures\":%d,\"slots\":[%s]}"),
 		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures, *SlotsJson);
+}
+
+FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& DestFolder)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	TArray<FString> Lines;
+	if (!FFileHelper::LoadFileToStringArray(Lines, *ListPath))
+	{
+		return Fail(TEXT("cannot read list file"));
+	}
+	int32 Imported = 0, Skipped = 0, Failed = 0;
+	FString FailedFiles;
+	for (int32 i = 0; i < Lines.Num(); ++i)
+	{
+		const FString Path = Lines[i].TrimStartAndEnd();
+		if (Path.IsEmpty()) { continue; }
+		// skip-if-exists on the FILENAME base (corpus files are named <drawable>.ydr.xml,
+		// matching the drawable <Name> ImportYdr derives) - idempotent re-runs
+		FString Base = FPaths::GetBaseFilename(Path);
+		Base.RemoveFromEnd(TEXT(".ydr"));
+		if (FPackageName::DoesPackageExist(DestFolder / Base))
+		{
+			++Skipped;
+			continue;
+		}
+		const FString R = ImportYdr(Path, DestFolder);
+		if (R.Contains(TEXT("\"ok\":true"))) { ++Imported; }
+		else
+		{
+			++Failed;
+			if (Failed <= 30)
+			{
+				FailedFiles += FString::Printf(TEXT("%s\"%s\""), FailedFiles.IsEmpty() ? TEXT("") : TEXT(","), *Base);
+			}
+		}
+		if ((i + 1) % 50 == 0)
+		{
+			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportYdrBatch %d/%d (ok %d, skip %d, fail %d)"),
+				i + 1, Lines.Num(), Imported, Skipped, Failed);
+		}
+		if ((i + 1) % 250 == 0)
+		{
+			CollectGarbage(RF_NoFlags);   // keep editor memory flat on long batches
+		}
+	}
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"imported\":%d,\"skipped\":%d,\"failed\":%d,\"failedFiles\":[%s]}"),
+		Imported, Skipped, Failed, *FailedFiles);
+}
+
+FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& MeshFolder,
+                                  const FString& Filter)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	FString Raw;
+	if (!FFileHelper::LoadFileToString(Raw, *ManifestPath))
+	{
+		return Fail(TEXT("cannot read manifest"));
+	}
+	TArray<TSharedPtr<FJsonValue>> Scenes;
+	{
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Raw);
+		if (!FJsonSerializer::Deserialize(Reader, Scenes))
+		{
+			return Fail(TEXT("manifest is not a JSON array"));
+		}
+	}
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World)
+	{
+		return Fail(TEXT("no editor world"));
+	}
+	const bool bAll = Filter.TrimStartAndEnd().Equals(TEXT("ALL"), ESearchCase::IgnoreCase);
+
+	UStaticMesh* ProxyCube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	TMap<FString, UStaticMesh*> MeshCache;      // lowercase drawable -> mesh (nullptr = known-missing)
+	TMap<FString, int32> Missing;               // drawable/archetype -> proxy instance count
+	int32 NumYmaps = 0, NumEntities = 0, NumInstances = 0, NumProxies = 0;
+
+	for (const TSharedPtr<FJsonValue>& SceneVal : Scenes)
+	{
+		const TSharedPtr<FJsonObject>* SceneObj;
+		if (!SceneVal.IsValid() || !SceneVal->TryGetObject(SceneObj)) { continue; }
+		const TArray<TSharedPtr<FJsonValue>>* Entities;
+		if (!(*SceneObj)->TryGetArrayField(TEXT("entities"), Entities)) { continue; }
+		const FString YmapName = (*SceneObj)->GetStringField(TEXT("ymap"));
+
+		AActor* Actor = nullptr;
+		USceneComponent* Root = nullptr;
+		TMap<FString, UInstancedStaticMeshComponent*> IsmByMesh;   // key: mesh name or "proxy:<name>"
+
+		auto GetIsm = [&](const FString& Key, UStaticMesh* Mesh) -> UInstancedStaticMeshComponent*
+		{
+			if (UInstancedStaticMeshComponent** Found = IsmByMesh.Find(Key)) { return *Found; }
+			if (!Actor)
+			{
+				Actor = World->SpawnActor<AActor>();
+				if (!Actor) { return nullptr; }
+				Root = NewObject<USceneComponent>(Actor, TEXT("Root"));
+				Actor->SetRootComponent(Root);
+				Root->SetMobility(EComponentMobility::Static);
+				Root->RegisterComponent();
+				Actor->AddInstanceComponent(Root);
+				Actor->SetActorLabel(YmapName);
+				Actor->SetFolderPath(FName(TEXT("RUDE_LS")));
+				++NumYmaps;
+			}
+			UInstancedStaticMeshComponent* Ism = NewObject<UInstancedStaticMeshComponent>(
+				Actor, FName(*FString::Printf(TEXT("ISM_%d"), IsmByMesh.Num())));
+			Ism->SetStaticMesh(Mesh);
+			Ism->SetMobility(EComponentMobility::Static);
+			Ism->SetupAttachment(Root);
+			Ism->RegisterComponent();
+			Actor->AddInstanceComponent(Ism);
+			IsmByMesh.Add(Key, Ism);
+			return Ism;
+		};
+
+		for (const TSharedPtr<FJsonValue>& EntVal : *Entities)
+		{
+			const TSharedPtr<FJsonObject>* Ent;
+			if (!EntVal.IsValid() || !EntVal->TryGetObject(Ent)) { continue; }
+			if (!bAll)
+			{
+				FString Lod;
+				(*Ent)->TryGetStringField(TEXT("lodLevel"), Lod);
+				if (!Lod.IsEmpty() && Lod != TEXT("LODTYPES_DEPTH_HD") && Lod != TEXT("LODTYPES_DEPTH_ORPHANHD"))
+				{
+					continue;
+				}
+			}
+			const TArray<TSharedPtr<FJsonValue>>* Loc;
+			const TArray<TSharedPtr<FJsonValue>>* Quat;
+			if (!(*Ent)->TryGetArrayField(TEXT("ue_location"), Loc) || Loc->Num() != 3 ||
+			    !(*Ent)->TryGetArrayField(TEXT("ue_quat"), Quat) || Quat->Num() != 4)
+			{
+				continue;
+			}
+			++NumEntities;
+			const double SXY = (*Ent)->HasField(TEXT("scaleXY")) ? (*Ent)->GetNumberField(TEXT("scaleXY")) : 1.0;
+			const double SZ = (*Ent)->HasField(TEXT("scaleZ")) ? (*Ent)->GetNumberField(TEXT("scaleZ")) : 1.0;
+			FQuat Q((*Quat)[0]->AsNumber(), (*Quat)[1]->AsNumber(), (*Quat)[2]->AsNumber(), (*Quat)[3]->AsNumber());
+			Q.Normalize();
+			const FTransform Xf(Q,
+				FVector((*Loc)[0]->AsNumber(), (*Loc)[1]->AsNumber(), (*Loc)[2]->AsNumber()),
+				FVector(SXY, SXY, SZ));
+
+			FString Drawable;
+			(*Ent)->TryGetStringField(TEXT("drawable"), Drawable);   // null for unresolved archetypes
+			Drawable.ToLowerInline();
+			UStaticMesh* Mesh = nullptr;
+			if (!Drawable.IsEmpty())
+			{
+				if (UStaticMesh** Cached = MeshCache.Find(Drawable)) { Mesh = *Cached; }
+				else
+				{
+					Mesh = LoadObject<UStaticMesh>(nullptr, *(MeshFolder / Drawable));
+					MeshCache.Add(Drawable, Mesh);
+				}
+			}
+			if (Mesh)
+			{
+				if (UInstancedStaticMeshComponent* Ism = GetIsm(Drawable, Mesh))
+				{
+					Ism->AddInstance(Xf, /*bWorldSpace*/ true);
+					++NumInstances;
+				}
+			}
+			else if (ProxyCube)
+			{
+				const FString Tag = Drawable.IsEmpty() ? (*Ent)->GetStringField(TEXT("archetype")) : Drawable;
+				Missing.FindOrAdd(Tag)++;
+				if (UInstancedStaticMeshComponent* Ism = GetIsm(TEXT("proxy"), ProxyCube))
+				{
+					Ism->AddInstance(Xf, /*bWorldSpace*/ true);
+					++NumProxies;
+				}
+			}
+		}
+	}
+	World->MarkPackageDirty();
+
+	Missing.ValueSort(TGreater<int32>());
+	FString TopMissing;
+	int32 Shown = 0;
+	for (const TPair<FString, int32>& M : Missing)
+	{
+		if (++Shown > 20) { break; }
+		TopMissing += FString::Printf(TEXT("%s\"%s x%d\""), Shown > 1 ? TEXT(",") : TEXT(""), *M.Key, M.Value);
+	}
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"ymaps\":%d,\"entities\":%d,\"instances\":%d,\"proxies\":%d,")
+		TEXT("\"uniqueMeshes\":%d,\"missingMeshes\":%d,\"topMissing\":[%s]}"),
+		NumYmaps, NumEntities, NumInstances, NumProxies, MeshCache.Num(), Missing.Num(), *TopMissing);
 }
 
 // ======================= ExportYtdBinary - clean-room .ytd (RSC7 v13) =======================

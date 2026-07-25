@@ -23,6 +23,7 @@ public class RudeEditor : ModuleRules
 			"AssetRegistry",
 			"ToolsetRegistry",
 			"ImageWrapper",
+			"Json",
 		});
 	}
 }

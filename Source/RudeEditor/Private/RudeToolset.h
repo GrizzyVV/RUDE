@@ -42,6 +42,28 @@ public:
 	static FString ImportYtd(const FString& XmlPath, const FString& PixelFolder,
 	                         const FString& DestFolder);
 
+	// Batch ImportYdr: ListPath = a text file of absolute *.ydr.xml paths, one per line.
+	// Imports each as a UStaticMesh into DestFolder via the same path as ImportYdr,
+	// SKIPPING files whose target asset already exists (idempotent re-runs; the P4
+	// hash-manifest resumability model, name-level). Progress goes to the log.
+	// Returns JSON: {ok, imported, skipped, failed, failedFiles:[...first 30]}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ImportYdrBatch(const FString& ListPath, const FString& DestFolder);
+
+	// Spawn a scene manifest (tools/ingest_ymap.py output: JSON array of
+	// {ymap, entities:[{archetype, drawable, ue_location, ue_quat, scaleXY, scaleZ,
+	// lodLevel, resolved}]}) into the CURRENT editor level: one actor per ymap holding
+	// one InstancedStaticMeshComponent per unique drawable (the P4 ISM-first scale
+	// model). Entities are filtered to HD/ORPHANHD lod levels unless Filter == "ALL".
+	// Meshes resolve by lowercase drawable name under MeshFolder; unresolved archetypes
+	// and missing meshes render as proxy cubes (corpus-hole policy). Transforms are the
+	// manifest's UE-space values (already through the pinned GTA->UE convention).
+	// Returns JSON: {ok, ymaps, entities, instances, proxies, uniqueMeshes,
+	// missingMeshes, topMissing:[...first 20]}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ImportScene(const FString& ManifestPath, const FString& MeshFolder,
+	                           const FString& Filter);
+
 	// Export a UStaticMesh as a CodeWalker-compatible ydr XML file (the reverse
 	// lane). Positions/normals/UVs inverse-transformed per the RUDE convention;
 	// shader presets recovered from material slot names; texture names recovered
