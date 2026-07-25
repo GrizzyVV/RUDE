@@ -1105,7 +1105,14 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		const FString P = Preset.ToLower();
 		const TCHAR* Path = TEXT("/RUDE/Masters/M_RUDE_Opaque.M_RUDE_Opaque");
 		if (P.Contains(TEXT("decal")))       { Path = TEXT("/RUDE/Masters/M_RUDE_Decal.M_RUDE_Decal"); }
-		else if (P.Contains(TEXT("cutout"))) { Path = TEXT("/RUDE/Masters/M_RUDE_Cutout.M_RUDE_Cutout"); }
+		// foliage/vegetation presets (trees_*, grass_*) are alpha-tested in RAGE but are
+		// not named "cutout" - route them to the cutout master or leaves render solid
+		else if (P.Contains(TEXT("cutout")) || P.StartsWith(TEXT("trees")) ||
+		         P.StartsWith(TEXT("grass")) || P.Contains(TEXT("alpha")) ||
+		         P.Contains(TEXT("foliage")))
+		{
+			Path = TEXT("/RUDE/Masters/M_RUDE_Cutout.M_RUDE_Cutout");
+		}
 		return LoadObject<UMaterialInterface>(nullptr, Path);
 	};
 
