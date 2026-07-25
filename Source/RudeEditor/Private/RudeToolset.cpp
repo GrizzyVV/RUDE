@@ -25,8 +25,90 @@
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "EngineUtils.h"
+#include "Materials/MaterialExpressionComponentMask.h"
+#include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionLinearInterpolate.h"
+#include "Materials/MaterialExpressionTextureSampleParameter2D.h"
+#include "Materials/MaterialExpressionVertexColor.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+
+// Build /RUDE/Masters/M_RUDE_Terrain on demand if absent: the GTA terrain_cb_* family
+// blends 4 diffuse+normal layers by VERTEX COLOUR (Colour0) - base = layer0, then lerp
+// to layer1/2/3 by VC.R/G/B. Texture params Diffuse0..3 / Normal0..3 match ImportYdr's
+// terrain binding. (v1 approximation of the RAGE blend - acceptance test is Matt's
+// "patchwork gone" report; the 2tex_blend lookup variants refine later.)
+static UMaterialInterface* EnsureTerrainMaster()
+{
+	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_Terrain.M_RUDE_Terrain");
+	if (UMaterialInterface* Existing = LoadObject<UMaterialInterface>(nullptr, FullPath))
+	{
+		return Existing;
+	}
+	UPackage* Pkg = CreatePackage(TEXT("/RUDE/Masters/M_RUDE_Terrain"));
+	if (!Pkg) { return nullptr; }
+	UMaterial* M = NewObject<UMaterial>(Pkg, TEXT("M_RUDE_Terrain"), RF_Public | RF_Standalone);
+	UTexture* DefWhite = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+	UTexture* DefNormal = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineMaterials/FlatNormal.FlatNormal"));
+
+	auto TexParam = [&](const FString& Name, bool bNormal, int32 X, int32 Y) -> UMaterialExpressionTextureSampleParameter2D*
+	{
+		auto* E = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		E->ParameterName = FName(*Name);
+		E->SamplerType = bNormal ? SAMPLERTYPE_Normal : SAMPLERTYPE_Color;
+		E->Texture = bNormal ? DefNormal : DefWhite;
+		E->MaterialExpressionEditorX = X; E->MaterialExpressionEditorY = Y;
+		M->GetExpressionCollection().AddExpression(E);
+		return E;
+	};
+	auto* VC = NewObject<UMaterialExpressionVertexColor>(M);
+	VC->MaterialExpressionEditorX = -900;
+	M->GetExpressionCollection().AddExpression(VC);
+	auto Mask = [&](int32 R, int32 G, int32 B, int32 Y) -> UMaterialExpressionComponentMask*
+	{
+		auto* E = NewObject<UMaterialExpressionComponentMask>(M);
+		E->R = R; E->G = G; E->B = B; E->A = 0;
+		E->Input.Expression = VC;
+		E->MaterialExpressionEditorX = -700; E->MaterialExpressionEditorY = Y;
+		M->GetExpressionCollection().AddExpression(E);
+		return E;
+	};
+	UMaterialExpressionComponentMask* Masks[3] = { Mask(1,0,0,-100), Mask(0,1,0,0), Mask(0,0,1,100) };
+	auto Chain = [&](UMaterialExpressionTextureSampleParameter2D* const T[4], int32 Y) -> UMaterialExpression*
+	{
+		UMaterialExpression* Prev = T[0];
+		for (int32 i = 0; i < 3; ++i)
+		{
+			auto* L = NewObject<UMaterialExpressionLinearInterpolate>(M);
+			L->A.Expression = Prev;
+			L->B.Expression = T[i + 1];
+			L->Alpha.Expression = Masks[i];
+			L->MaterialExpressionEditorX = -400 + i * 150; L->MaterialExpressionEditorY = Y;
+			M->GetExpressionCollection().AddExpression(L);
+			Prev = L;
+		}
+		return Prev;
+	};
+	UMaterialExpressionTextureSampleParameter2D* D[4];
+	UMaterialExpressionTextureSampleParameter2D* N[4];
+	for (int32 i = 0; i < 4; ++i)
+	{
+		D[i] = TexParam(FString::Printf(TEXT("Diffuse%d"), i), false, -1300, -400 + i * 150);
+		N[i] = TexParam(FString::Printf(TEXT("Normal%d"), i), true, -1300, 300 + i * 150);
+	}
+	auto* Rough = NewObject<UMaterialExpressionConstant>(M);
+	Rough->R = 0.85f;
+	M->GetExpressionCollection().AddExpression(Rough);
+
+	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
+	EO->BaseColor.Expression = Chain(D, -200);
+	EO->Normal.Expression = Chain(N, 400);
+	EO->Roughness.Expression = Rough;
+	M->PostEditChange();
+	Pkg->MarkPackageDirty();
+	FAssetRegistryModule::AssetCreated(M);
+	return M;
+}
 
 namespace RudeYdr
 {
@@ -50,6 +132,7 @@ namespace RudeYdr
 		TArray<FVector3f> Positions;   // already RUDE-transformed to UE space (cm, Y-mirrored)
 		TArray<FVector3f> Normals;     // Y-mirrored
 		TArray<FVector2f> UVs;         // raw RAGE UVs (both engines are V-down; no flip)
+		TArray<FVector4f> Colors;      // Colour0 as 0-1 RGBA - terrain layer blend weights
 		TArray<int32> Indices;         // winding already flipped for the mirror
 	};
 
@@ -119,6 +202,7 @@ namespace RudeYdr
 			FVector3f Pos = FVector3f::ZeroVector;
 			FVector3f Nrm(0, 0, 1);
 			FVector2f UV = FVector2f::ZeroVector;
+			FVector4f Col(1, 1, 1, 1);
 			for (const FString& Sem : Semantics)
 			{
 				const int32 W = SemanticWidth(Sem);
@@ -139,12 +223,21 @@ namespace RudeYdr
 					UV = FVector2f(FCString::Atof(*Toks[Off]),
 					               FCString::Atof(*Toks[Off + 1]));
 				}
+				else if (Sem == TEXT("Colour0"))
+				{
+					// terrain 4-layer blend weights live here (0-255 per channel)
+					Col = FVector4f(FCString::Atof(*Toks[Off]) / 255.f,
+					                FCString::Atof(*Toks[Off + 1]) / 255.f,
+					                FCString::Atof(*Toks[Off + 2]) / 255.f,
+					                FCString::Atof(*Toks[Off + 3]) / 255.f);
+				}
 				Off += W;
 			}
 			// RUDE transform: gta meters -> ue cm, Y mirror
 			Out.Positions.Add(FVector3f(Pos.X * 100.f, -Pos.Y * 100.f, Pos.Z * 100.f));
 			Out.Normals.Add(FVector3f(Nrm.X, -Nrm.Y, Nrm.Z));
 			Out.UVs.Add(UV);
+			Out.Colors.Add(Col);
 		}
 
 		TArray<FString> IdxToks;
@@ -919,6 +1012,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		FString Preset = TEXT("default");
 		int32 RenderBucket = 0;              // RAGE draw bucket: 0 opaque, 1 alpha, 2 decal, 3 cutout
 		FString Diffuse, Normal, Specular;   // texture NAMES from the ydr
+		TMap<FString, FString> AllTex;       // every Texture param: samplerName -> texName (terrain layers)
 	};
 	TArray<FShaderDef> Shaders;
 	if (const FXmlNode* SG = Root->FindChildNode(TEXT("ShaderGroup")))
@@ -951,6 +1045,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 						}
 						const FString Tex = TexName->GetContent().TrimStartAndEnd();
 						const FString Sampler = P->GetAttribute(TEXT("name"));
+						if (!Tex.IsEmpty()) { Def.AllTex.Add(Sampler, Tex); }
 						if (Sampler == TEXT("DiffuseSampler"))       { Def.Diffuse = Tex; }
 						else if (Sampler == TEXT("BumpSampler"))     { Def.Normal = Tex; }
 						else if (Sampler == TEXT("SpecSampler"))     { Def.Specular = Tex; }
@@ -1027,6 +1122,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	TVertexAttributesRef<FVector3f> VertexPositions = Attributes.GetVertexPositions();
 	TVertexInstanceAttributesRef<FVector3f> InstNormals = Attributes.GetVertexInstanceNormals();
 	TVertexInstanceAttributesRef<FVector2f> InstUVs = Attributes.GetVertexInstanceUVs();
+	TVertexInstanceAttributesRef<FVector4f> InstColors = Attributes.GetVertexInstanceColors();
 	TPolygonGroupAttributesRef<FName> GroupSlotNames = Attributes.GetPolygonGroupMaterialSlotNames();
 
 	int32 TotalVerts = 0, TotalTris = 0;
@@ -1078,6 +1174,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 				const FVertexInstanceID Inst = MeshDesc->CreateVertexInstance(VertexIDs[Idx]);
 				InstNormals[Inst] = Geo.Normals.IsValidIndex(Idx) ? Geo.Normals[Idx] : FVector3f(0, 0, 1);
 				InstUVs[Inst] = Geo.UVs.IsValidIndex(Idx) ? Geo.UVs[Idx] : FVector2f::ZeroVector;
+				InstColors[Inst] = Geo.Colors.IsValidIndex(Idx) ? Geo.Colors[Idx] : FVector4f(1, 1, 1, 1);
 				Insts.Add(Inst);
 			}
 			MeshDesc->CreatePolygon(GroupID, Insts);
@@ -1148,10 +1245,26 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		const FShaderDef* Def = Shaders.IsValidIndex(ShaderIdx) ? &Shaders[ShaderIdx] : nullptr;
 
 		UMaterialInterface* SlotMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
-		UMaterialInterface* Master = Def ? MasterForPreset(Def->Preset, Def->RenderBucket) : nullptr;
-		const FString ConfigKey = Def
-			? (Def->Preset + TEXT("|") + Def->Diffuse + TEXT("|") + Def->Normal + TEXT("|") + Def->Specular).ToLower()
-			: FString();
+		const bool bTerrain = Def && Def->Preset.StartsWith(TEXT("terrain"), ESearchCase::IgnoreCase);
+		UMaterialInterface* Master = nullptr;
+		if (Def)
+		{
+			Master = bTerrain ? EnsureTerrainMaster() : MasterForPreset(Def->Preset, Def->RenderBucket);
+		}
+		FString ConfigKey;
+		if (Def)
+		{
+			ConfigKey = Def->Preset + TEXT("|") + Def->Diffuse + TEXT("|") + Def->Normal + TEXT("|") + Def->Specular;
+			if (bTerrain)
+			{
+				for (int32 li = 0; li < 4; ++li)
+				{
+					const FString* T = Def->AllTex.Find(FString::Printf(TEXT("TextureSampler_layer%d"), li));
+					ConfigKey += TEXT("|") + (T ? *T : FString());
+				}
+			}
+			ConfigKey.ToLowerInline();
+		}
 		if (Master && MIByConfig.Contains(ConfigKey))
 		{
 			SlotMaterial = MIByConfig[ConfigKey];
@@ -1190,6 +1303,31 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 					MIC->SetTextureParameterValueEditorOnly(
 						FMaterialParameterInfo(TEXT("Specular")), T);
 					++BoundTextures;
+				}
+				if (bTerrain)
+				{
+					// terrain_cb_* layer samplers -> the 4-layer master's Diffuse0..3/Normal0..3
+					for (int32 li = 0; li < 4; ++li)
+					{
+						if (const FString* TN = Def->AllTex.Find(FString::Printf(TEXT("TextureSampler_layer%d"), li)))
+						{
+							if (UTexture2D* T = FindTexture(*TN))
+							{
+								MIC->SetTextureParameterValueEditorOnly(
+									FMaterialParameterInfo(*FString::Printf(TEXT("Diffuse%d"), li)), T);
+								++BoundTextures;
+							}
+						}
+						if (const FString* TN = Def->AllTex.Find(FString::Printf(TEXT("BumpSampler_layer%d"), li)))
+						{
+							if (UTexture2D* T = FindTexture(*TN))
+							{
+								MIC->SetTextureParameterValueEditorOnly(
+									FMaterialParameterInfo(*FString::Printf(TEXT("Normal%d"), li)), T);
+								++BoundTextures;
+							}
+						}
+					}
 				}
 				MIC->PostEditChange();
 				MIPackage->MarkPackageDirty();
@@ -2794,13 +2932,8 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	const int32 NV = Verts.Num(), NP = Indices.Num() / 3;
 	if (NV == 0 || NP == 0) { return Fail(TEXT("no collision geometry")); }
 	if (NV > 65535) { return Fail(TEXT("vertex count exceeds 65535 (u16 poly indices) - split the mesh")); }
-	// A single block may never span a page boundary; this writer's proven pager uses
-	// 64KB pages, so any block > 64KB would emit a torn (crashing) resource. Fail loudly
-	// instead (upgrade path: the uniform-P pager ExportYdrBinary uses).
-	if (NP * 16 > 0x10000 || NV * 6 > 0x10000)
-	{
-		return Fail(TEXT("collision block exceeds the 64KB page (>4096 tris) - split the mesh; large-page ybn support queued"));
-	}
+	// (page size is derived from the largest block below - the uniform-P pager, same as
+	// ExportYdrBinary; no struct may span a page boundary, and none can by construction)
 
 	// --- WORLD aabb + center; vertices are stored RELATIVE to CenterGeom ---
 	FVector3f WMin(FLT_MAX), WMax(-FLT_MAX);
@@ -2919,12 +3052,15 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 
 	// --- system segment: composite header reserved @0, then blocks, then structs ---
 	TArray<uint8> Seg; Seg.AddZeroed(0xb0);
-	// Page-aware emit: NO struct/array may span a 64KB page boundary. RAGE system pages are
-	// independently relocatable, so a block straddling a page edge resolves to a bad address ->
-	// "Invalid fixup" at load. CW + real ybns respect this (CW places the BVH nodes at exactly
-	// 0x10000). We pad up to the next 64KB boundary before any block that would otherwise cross it.
-	// (Confirmed by diffing CW's known-good binary: our page FLAGS matched but our LAYOUT spanned.)
-	const int32 YBN_PAGE = 0x10000;
+	// Page-aware emit: NO struct/array may span a page boundary (RAGE pages are independently
+	// relocatable; a straddling block = "Invalid fixup"/torn-memory crash). Uniform-P pager:
+	// page size = pow2 >= the largest single block, min 64KB (preserves the proven small-mesh
+	// layout byte-for-byte: for <=64KB blocks this is exactly the old 64KB pager).
+	uint32 LargestBlk = 0x10000;
+	LargestBlk = FMath::Max(LargestBlk, (uint32)PolyBytes.Num());
+	LargestBlk = FMath::Max(LargestBlk, (uint32)NodeBytes.Num());
+	LargestBlk = FMath::Max(LargestBlk, (uint32)VertBytes.Num());
+	const int32 YBN_PAGE = (int32)FMath::RoundUpToPowerOfTwo(LargestBlk);
 	auto Emit = [&Seg, YBN_PAGE](const TArray<uint8>& D, int32 Align = 16) -> int32
 	{
 		if (Seg.Num() % Align) { Seg.AddZeroed(Align - (Seg.Num() % Align)); }
@@ -2985,7 +3121,7 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 
 	TArray<uint8> F0; F0.AddZeroed(0x20);                          // child+0xf0 block (zero)
 	const int32 OF0 = Emit(F0);
-	TArray<uint8> BlockMap; BlockMap.AddZeroed(0x40); RudeYbn::PU32(BlockMap, 0x08, 2);
+	TArray<uint8> BlockMap; BlockMap.AddZeroed(0x40);   // page count patched after the plan is known
 	const int32 OBm = Emit(BlockMap);
 
 	TArray<uint8> ChildBox; ChildBox.AddZeroed(0x20);              // [BoxMin.vec4, BoxMax.vec4] WORLD
@@ -3046,14 +3182,16 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	RudeYbn::PPTR(Seg, 0x90, OFl1); RudeYbn::PPTR(Seg, 0x98, OFl2);
 	RudeYbn::PU16(Seg, 0xa0, 1); RudeYbn::PU16(Seg, 0xa2, 1);      // NumChildren, capacity
 
-	// --- container: RSC7 v43 (system segment only). Page flags reverse-engineered from CW's
-	// known-good output: system pages cap at 64KB (a 128KB single page is rejected at load).
-	// SysPageFlags pads the segment and emits CW's exact encoding (0x20000 -> two 64KB pages
-	// -> 0x20000040; <=64KB -> one pow2 page like real small ybns).
-	uint32 Padded = 0;
-	const uint32 SysFlag = 0x20000000u | RudeYbn::SysPageFlags((uint32)Seg.Num(), Padded);
+	// --- container: RSC7 v43 (system segment only), uniform pages of YBN_PAGE.
+	// For <=64KB blocks this reproduces the in-game-proven plan exactly (rock wall:
+	// 2x64KB, flags 0x20000040, byte-identity regression-gated). ---
+	uint32 Padded = 0, NPages = 0;
+	const uint32 LowFlags = RudeYbn::SysPageFlagsUniform((uint32)Seg.Num(), (uint32)YBN_PAGE, Padded, NPages);
+	if (LowFlags == 0xFFFFFFFFu) { return Fail(TEXT("unencodable page plan - mesh too large")); }
+	const uint32 SysFlag = 0x20000000u | LowFlags;
 	const uint32 GfxFlag = 0xb0000000u;
 	Seg.SetNumZeroed((int32)Padded);
+	RudeYbn::PU32(Seg, OBm + 0x08, NPages);
 
 	int32 ZSize = FCompression::CompressMemoryBound(NAME_Zlib, Seg.Num());
 	TArray<uint8> Z; Z.SetNumUninitialized(ZSize);
