@@ -24,16 +24,22 @@
 #include "Editor.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "EngineUtils.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
 namespace RudeYdr
 {
-	// GTAV1 vertex layout semantic -> float width in a vertex Data line
+	// Vertex layout semantic -> token width in a vertex Data line. Covers every semantic
+	// observed across the corpus (14 distinct layouts incl. skinned props). A width-0
+	// (unknown) semantic MUST abort the geometry, not misalign the stream - width
+	// misalignment scrambles every vertex after the first (the "deformed mesh" class,
+	// caught on the Cayo slice: 6 skinned props with BlendWeights/BlendIndices).
 	static int32 SemanticWidth(const FString& Tag)
 	{
 		if (Tag == TEXT("Position") || Tag == TEXT("Normal")) return 3;
 		if (Tag == TEXT("Colour0") || Tag == TEXT("Colour1") || Tag == TEXT("Tangent")) return 4;
+		if (Tag == TEXT("BlendWeights") || Tag == TEXT("BlendIndices")) return 4;   // skin data, parsed + ignored
 		if (Tag.StartsWith(TEXT("TexCoord"))) return 2;
 		return 0;
 	}
@@ -63,15 +69,22 @@ namespace RudeYdr
 			return false;
 		}
 
-		// Layout: ordered semantic list
+		// Layout: ordered semantic list. An UNKNOWN semantic aborts (width guess = stream
+		// misalignment = scrambled geometry); report it instead of emitting garbage.
 		TArray<FString> Semantics;
 		int32 LineWidth = 0;
 		if (const FXmlNode* Layout = VB->FindChildNode(TEXT("Layout")))
 		{
 			for (const FXmlNode* Child : Layout->GetChildrenNodes())
 			{
+				const int32 W = SemanticWidth(Child->GetTag());
+				if (W == 0)
+				{
+					Error = FString::Printf(TEXT("unknown vertex semantic '%s' - refusing to misalign"), *Child->GetTag());
+					return false;
+				}
 				Semantics.Add(Child->GetTag());
-				LineWidth += SemanticWidth(Child->GetTag());
+				LineWidth += W;
 			}
 		}
 		if (LineWidth == 0)
@@ -93,6 +106,12 @@ namespace RudeYdr
 		// geometry bug of 2026-07-24. Never rely on newlines in XML payloads.)
 		TArray<FString> Toks;
 		VData->GetContent().ParseIntoArrayWS(Toks);
+		if (Toks.Num() % LineWidth != 0)
+		{
+			Error = FString::Printf(TEXT("vertex stream misaligned: %d tokens %% %d width = %d - layout mismatch"),
+				Toks.Num(), LineWidth, Toks.Num() % LineWidth);
+			return false;
+		}
 		const int32 NumVerts = Toks.Num() / LineWidth;
 		for (int32 V = 0; V < NumVerts; ++V)
 		{
@@ -1254,6 +1273,17 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		return Fail(TEXT("no editor world"));
 	}
 	const bool bAll = Filter.TrimStartAndEnd().Equals(TEXT("ALL"), ESearchCase::IgnoreCase);
+
+	// Idempotent respawn: clear any previous RUDE_LS spawn first (re-running the tool
+	// REPLACES the scene instead of stacking duplicates).
+	{
+		TArray<AActor*> Stale;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			if (It->GetFolderPath() == FName(TEXT("RUDE_LS"))) { Stale.Add(*It); }
+		}
+		for (AActor* A : Stale) { World->DestroyActor(A); }
+	}
 
 	UStaticMesh* ProxyCube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
 	TMap<FString, UStaticMesh*> MeshCache;      // lowercase drawable -> mesh (nullptr = known-missing)
