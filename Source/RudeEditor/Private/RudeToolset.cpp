@@ -3257,6 +3257,7 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 		return O;
 	};
 	TArray<int32> ShaderOfs;
+	TSet<FString> SubstitutedPresets;   // presets we had no verified param template for (crash #5)
 	for (const FGeo& G : Geos)
 	{
 		// One CONTIGUOUS parameter allocation per shader (the oracle's load-bearing
@@ -3267,8 +3268,13 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 		// (= 0x01500100 for the 9-param normal_spec template, matching the oracle).
 		struct FPar { uint32 Meta; int32 StubOfs; const TCHAR* Name; };   // StubOfs<0 = inline vector
 		TArray<FPar> Pars;
-		if (!G.Diffuse.IsEmpty()) { Pars.Add({ 0x200u, TexStub(G.Diffuse), TEXT("DiffuseSampler") }); }
-		if (!G.Normal.IsEmpty()) { Pars.Add({ 0x300u, TexStub(G.Normal), TEXT("BumpSampler") }); }
+		// ALWAYS emit both samplers, so the block is always the full 9-register normal_spec
+		// layout we declare (see crash #5 below). Shortening the block for a mesh with no
+		// normal map would reintroduce exactly the count mismatch that crashes the loader.
+		// A missing bump falls back to the stock `flatnormal`; a missing diffuse emits an
+		// unresolved stub, which renders untextured rather than failing to load.
+		Pars.Add({ 0x200u, TexStub(G.Diffuse.IsEmpty() ? TEXT("none") : G.Diffuse), TEXT("DiffuseSampler") });
+		Pars.Add({ 0x300u, TexStub(G.Normal.IsEmpty() ? TEXT("flatnormal") : G.Normal), TEXT("BumpSampler") });
 		static const uint32 VecMeta[7] = { 0xa601, 0xa501, 0xa401, 0xa301, 0xa201, 0xa101, 0xa001 };
 		static const float VecVals[7] = { 0.9f, 40.f, 0.3f, 1.f, 1.f, 0.f, 1.f };
 		static const TCHAR* VecName[7] = { TEXT("specularFresnel"), TEXT("specularFalloffMult"),
@@ -3299,12 +3305,26 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 				RudeYbn::PU32(Seg, OTbl + HashOfs + i * 4, RudeYtd::Joaat(Pars[i].Name));
 			}
 		}
-		// preset: only the pinned normal_spec/spec templates for v1; anything else falls
-		// back to normal_spec's registers with its own name hash (same as the XML lane's
-		// default-param behaviour - flag for the P2 material lane).
+		// ⛔⛔ IN-GAME CRASH #5 ("Invalid fixup", 2026-07-26, Matt-witnessed on the first
+		// multi-material export) - ROOT CAUSE AND FIX.
+		// The old behaviour declared the shader by its OWN name hash while handing it
+		// normal_spec's 9-register parameter block. That is harmless in the XML lane (CW
+		// rebuilds the params) and FATAL in binary: the game resolves the shader by hash,
+		// then walks THAT shader's real register layout over our block. A preset wanting
+		// more params than normal_spec (e.g. normal_spec_detail) reads straight past our
+		// 0x150 allocation into the next struct and interprets garbage as pointers ->
+		// "Invalid fixup, address is neither virtual nor physical". Proof: a real 2-geo
+		// oracle's shader carries 11 params with +0x14 = 0x01800130, not 9 / 0x01500100.
+		// The rock survived a year of testing only because its preset genuinely WAS
+		// normal_spec. v1 has exactly ONE verified parameter template, so v1 may only ever
+		// DECLARE that preset: substitute rather than lie, and report what was substituted.
+		// The real fix is a per-preset register table (the P2 material lane).
 		// The shader OBJECT *is* the 0x30 param block (oracle: shader ptr-array entries
 		// point straight at it - there is NO intermediate struct).
-		const FString Preset = (G.Preset == TEXT("default")) ? TEXT("normal_spec") : G.Preset;
+		const FString RawPreset = (G.Preset == TEXT("default")) ? TEXT("normal_spec") : G.Preset;
+		const bool bTemplated = RawPreset.Equals(TEXT("normal_spec"), ESearchCase::IgnoreCase);
+		if (!bTemplated) { SubstitutedPresets.Add(RawPreset); }
+		const FString Preset = bTemplated ? RawPreset : TEXT("normal_spec");
 		TArray<uint8> Blk; Blk.AddZeroed(0x30);
 		RudeYbn::PPTR(Blk, 0x00, OTbl);
 		RudeYbn::PU32(Blk, 0x08, RudeYtd::Joaat(Preset));
@@ -3644,9 +3664,15 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 
 	int32 TotalVerts = 0, TotalTris = 0;
 	for (const FGeo& G : Geos) { TotalVerts += G.Pos.Num(); TotalTris += G.Indices.Num() / 3; }
+	FString SubList;
+	for (const FString& S : SubstitutedPresets)
+	{
+		SubList += (SubList.IsEmpty() ? TEXT("\"") : TEXT(",\"")) + S + TEXT("\"");
+	}
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"ydrPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"bytes\":%d,\"segSize\":%d,\"sysFlags\":\"0x%08x\"}"),
-		*OutYdrPath, Geos.Num(), TotalVerts, TotalTris, Out.Num(), Seg.Num(), SysFlag);
+		TEXT("{\"ok\":true,\"ydrPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"bytes\":%d,")
+		TEXT("\"segSize\":%d,\"sysFlags\":\"0x%08x\",\"presetsSubstitutedToNormalSpec\":[%s]}"),
+		*OutYdrPath, Geos.Num(), TotalVerts, TotalTris, Out.Num(), Seg.Num(), SysFlag, *SubList);
 #else
 	return Fail(TEXT("editor-only"));
 #endif
