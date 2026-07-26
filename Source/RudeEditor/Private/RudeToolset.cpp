@@ -1312,7 +1312,9 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	for (int32 GeoIdx = 0; GeoIdx < Geos.Num(); ++GeoIdx)
 	{
 		const RudeYdr::FGeo& Geo = Geos[GeoIdx];
-		const FString ShaderName = Geo.ShaderIndex < Shaders.Num()
+		// lower bound matters: ShaderIndex comes from FCString::Atoi on untrusted XML, and a
+		// negative value passed an upper-bound-only check straight into TArray's fatal RangeCheck.
+		const FString ShaderName = Shaders.IsValidIndex(Geo.ShaderIndex)
 			? Shaders[Geo.ShaderIndex].Preset : TEXT("default");
 		const FString SlotName = FString::Printf(TEXT("%s__%d"), *ShaderName, GeoIdx);
 		SlotNames.Add(SlotName);
@@ -1341,7 +1343,9 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 			const int32 I0 = Geo.Indices[T * 3 + 0];
 			const int32 I1 = Geo.Indices[T * 3 + 1];
 			const int32 I2 = Geo.Indices[T * 3 + 2];
-			if (I0 >= VertexIDs.Num() || I1 >= VertexIDs.Num() || I2 >= VertexIDs.Num())
+			// NEGATIVE indices must be rejected too - these come from FCString::Atoi on untrusted
+			// XML, and an upper-bound-only check let -1 through into TArray's fatal RangeCheck.
+			if (!VertexIDs.IsValidIndex(I0) || !VertexIDs.IsValidIndex(I1) || !VertexIDs.IsValidIndex(I2))
 			{
 				continue;
 			}
@@ -2767,7 +2771,17 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 	if (Gfx.Num() % GP) { Gfx.AddZeroed(GP - (Gfx.Num() % GP)); }
 
 	// ---- system segment: pgDictionary<grcTexture> at CW's observed offsets ----
-	const int32 TEX_BASE = 0x450, TEX_SZ = 0x90, NAME_SLOT = 0x20;
+	const int32 TEX_BASE = 0x450, TEX_SZ = 0x90;
+	// NAME_SLOT was a fixed 0x20. RAGE texture names routinely exceed 31 chars (~10% of the Cayo
+	// set), and the write loop below bounds only against the segment end - so a >=32-char name lost
+	// its NUL and bled into the next slot, and the LAST name spilled into the pointer array's
+	// never-written high dwords (chars 36+ landed in pointer[0]'s high dword => an invalid tagged
+	// 64-bit pointer). The layout is fixup-driven, so the stride does not have to be 0x20: widen it
+	// UNIFORMLY to fit the longest name + NUL, 16-byte aligned. Short-name dictionaries (the
+	// in-game-proven rude_rockwall_tex, 17 chars) keep the 0x20 stride and stay byte-identical.
+	int32 LongestName = 0;
+	for (const auto& T : Texs) { LongestName = FMath::Max(LongestName, T.Name.Len()); }
+	const int32 NAME_SLOT = FMath::Max(0x20, ((LongestName + 1 + 15) / 16) * 16);
 	TArray<int32> TexOff, NameOff;
 	for (int32 i = 0; i < N; ++i) { TexOff.Add(TEX_BASE + i * TEX_SZ); }
 	const int32 NamesStart = TEX_BASE + N * TEX_SZ;
@@ -2808,7 +2822,9 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 	for (int32 i = 0; i < N; ++i)
 	{
 		const FString& Nm = Texs[i].Name;
-		for (int32 k = 0; k < Nm.Len() && (NameOff[i] + k) < (int32)SysSize; ++k)
+		// clamp to the slot (leaving the NUL) as well as the segment - NAME_SLOT is sized to fit
+		// the longest name above, so this cannot truncate; it is a backstop, not the mechanism.
+		for (int32 k = 0; k < Nm.Len() && k < NAME_SLOT - 1 && (NameOff[i] + k) < (int32)SysSize; ++k)
 		{
 			Sys[NameOff[i] + k] = (uint8)Nm[k];
 		}
@@ -3137,6 +3153,16 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 		}
 	}
 	if (CV.Num() > 65535) { return Fail(TEXT("collision verts exceed 65535")); }
+	// u16 COUNT CEILINGS (pinned 2026-07-26). The vertex guard above is NOT sufficient: BVH leaf
+	// PolyStart and the m_Trees start/end node indices are u16 in the real format, and a closed
+	// mesh runs ~2 triangles per vertex - so a mesh can pass the vertex guard and still wrap the
+	// polygon index, emitting a bound whose tail leaves point back at the start of the poly array
+	// (silently wrong collision, no crash). Real large bounds solve this with MULTIPLE composite
+	// children; this writer emits one, so refuse until it does. Nodes ~= 0.5-0.8*NP.
+	if ((CI.Num() / 3) > 65535)
+	{
+		return Fail(TEXT("collision triangles exceed 65535 (u16 BVH poly index) - split the mesh"));
+	}
 
 	// --- page plan: page size = pow2 >= the largest single block (a block may NEVER
 	// span a page boundary; RAGE pages are independently relocatable - the in-game
@@ -3149,17 +3175,33 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	}
 	Largest = FMath::Max(Largest, (uint32)(CI.Num() / 3) * 16u);   // bound polys; node array is smaller
 	Largest = FMath::Max(Largest, (uint32)CV.Num() * 6u);
+	// Blocks that scale with the GEOMETRY COUNT rather than with vertex/index counts. Omitting
+	// these was a hole in the no-span law: a mesh with many tiny polygon groups could emit a
+	// geoBounds/ptr-array block larger than PAGE, and Emit() below only page-aligns blocks that
+	// FIT in a page - an oversized one straddles the boundary (the ERR_MEM_MULTIALLOC_FREE class).
+	{
+		const uint32 NG = (uint32)Geos.Num();
+		Largest = FMath::Max(Largest, (NG + 1) * 0x20u);   // geoBounds (N+1 pairs when N>1)
+		Largest = FMath::Max(Largest, NG * 8u);            // geometry ptr array
+		Largest = FMath::Max(Largest, NG * 8u);            // shader ptr array
+		Largest = FMath::Max(Largest, NG * 2u);            // shader map
+	}
 	const int32 PAGE = (int32)FMath::RoundUpToPowerOfTwo(Largest);
 
 	// --- segment writer: header reserved @0, page-aware Emit ---
 	TArray<uint8> Seg; Seg.AddZeroed(0xd0);
-	auto Emit = [&Seg, PAGE](const TArray<uint8>& D, int32 Align = 16) -> int32
+	bool bPageOverflow = false;
+	auto Emit = [&Seg, PAGE, &bPageOverflow](const TArray<uint8>& D, int32 Align = 16) -> int32
 	{
 		if (Seg.Num() % Align) { Seg.AddZeroed(Align - (Seg.Num() % Align)); }
 		if (D.Num() <= PAGE && (Seg.Num() % PAGE) + D.Num() > PAGE)
 		{
 			Seg.AddZeroed(PAGE - (Seg.Num() % PAGE));
 		}
+		// Backstop: PAGE is computed from every block we know about, so this cannot fire today.
+		// If a future block is added without feeding the plan above, fail LOUDLY rather than
+		// emitting a torn file that crashes the client with no diagnosis.
+		else if (D.Num() > PAGE) { bPageOverflow = true; }
 		const int32 O = Seg.Num(); Seg.Append(D); return O;
 	};
 	auto EmitStr = [&](const FString& S) -> int32
@@ -3289,7 +3331,17 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 
 	// --- per-geometry: VB struct, IB struct, geometry struct ---
 	TArray<int32> OGeoStructs;
-	TArray<uint8> GeoBounds; GeoBounds.AddZeroed(Geos.Num() * 0x20);
+	// geoBounds: for N>1 the real format is N+1 vec4-pairs - pair[0] = the UNION AABB, then one
+	// pair per geometry. For N==1 it is exactly ONE pair (no union). Pinned 2026-07-26 against 47
+	// grmModels in 25 real v165 ydrs (12 multi-geo drawables recomputed from their own vertex
+	// buffers: pair[1+i]==geo[i] accepted 12/12, pair[i]==geo[i] rejected 12/12). The old code
+	// emitted N pairs unconditionally - correct only for the single-geometry oracle it came from.
+	// See ENGINEERING_LOG "ydr binary format" CORRECTED block.
+	const int32 NGeo = Geos.Num();
+	const bool bGeoUnion = NGeo > 1;
+	const int32 GeoBoundsPairs = bGeoUnion ? NGeo + 1 : 1;
+	TArray<uint8> GeoBounds; GeoBounds.AddZeroed(GeoBoundsPairs * 0x20);
+	FVector3f UnionMin(FLT_MAX), UnionMax(-FLT_MAX);
 	TArray<uint8> ShaderMap; ShaderMap.AddZeroed(FMath::Max(Geos.Num() * 2, 8));
 	for (int32 gi = 0; gi < Geos.Num(); ++gi)
 	{
@@ -3323,9 +3375,18 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 		FVector3f GMin(FLT_MAX), GMax(-FLT_MAX);
 		for (const FVector3f& P : G.Pos) { GMin = GMin.ComponentMin(P); GMax = GMax.ComponentMax(P); }
 		const float Mn[3] = { GMin.X, GMin.Y, GMin.Z }, Mx[3] = { GMax.X, GMax.Y, GMax.Z };
-		RudeYbn::PVEC3(GeoBounds, gi * 0x20, Mn);
-		RudeYbn::PVEC3(GeoBounds, gi * 0x20 + 0x10, Mx);
+		const int32 GbPair = (bGeoUnion ? gi + 1 : gi) * 0x20;   // pair 0 is the union when N>1
+		RudeYbn::PVEC3(GeoBounds, GbPair, Mn);
+		RudeYbn::PVEC3(GeoBounds, GbPair + 0x10, Mx);
+		UnionMin = UnionMin.ComponentMin(GMin); UnionMax = UnionMax.ComponentMax(GMax);
 		RudeYbn::PU16(ShaderMap, gi * 2, (uint16)gi);
+	}
+	if (bGeoUnion)
+	{
+		const float Un[3] = { UnionMin.X, UnionMin.Y, UnionMin.Z };
+		const float Ux[3] = { UnionMax.X, UnionMax.Y, UnionMax.Z };
+		RudeYbn::PVEC3(GeoBounds, 0x00, Un);
+		RudeYbn::PVEC3(GeoBounds, 0x10, Ux);
 	}
 	const int32 OGeoBounds = Emit(GeoBounds);
 	const int32 OShaderMap = Emit(ShaderMap);
@@ -3338,7 +3399,11 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	RudeYbn::PU16(Model, 0x10, (uint16)Geos.Num()); RudeYbn::PU16(Model, 0x12, (uint16)Geos.Num());
 	RudeYbn::PPTR(Model, 0x18, OGeoBounds);
 	RudeYbn::PPTR(Model, 0x20, OShaderMap);
-	RudeYbn::PU32(Model, 0x2c, 0x000100ffu);
+	// +0x2c = RenderMask (u8 @+0x2c, 0xff = the XML lane's RenderMask 255) | 0 @+0x2d |
+	// GEOMETRY COUNT (u16 @+0x2e). Pinned 2026-07-26: +0x2e == ngeo in 47/47 real v165 grmModels.
+	// Was hardcoded 0x000100ffu, which is this expression at N==1 - so the in-game-proven
+	// single-geometry artifact is byte-unchanged by this fix.
+	RudeYbn::PU32(Model, 0x2c, 0x000000ffu | ((uint32)Geos.Num() << 16));
 	const int32 OModel = Emit(Model);
 	TArray<uint8> ModelArr; ModelArr.AddZeroed(8);
 	RudeYbn::PPTR(ModelArr, 0, OModel);
@@ -3557,6 +3622,12 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	Seg.SetNumZeroed((int32)Padded);
 	RudeYbn::PU32(Seg, OBm + 0x08, NPages);   // blockmap page count
 
+	if (bPageOverflow)
+	{
+		return Fail(TEXT("internal: a block exceeded the page size and would span a page boundary ")
+		            TEXT("(no-span law) - a block was added without feeding the page plan"));
+	}
+
 	int32 ZSize = FCompression::CompressMemoryBound(NAME_Zlib, Seg.Num());
 	TArray<uint8> Z; Z.SetNumUninitialized(ZSize);
 	if (!FCompression::CompressMemory(NAME_Zlib, Z.GetData(), ZSize, Seg.GetData(), Seg.Num()))
@@ -3626,6 +3697,13 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	const int32 NV = Verts.Num(), NP = Indices.Num() / 3;
 	if (NV == 0 || NP == 0) { return Fail(TEXT("no collision geometry")); }
 	if (NV > 65535) { return Fail(TEXT("vertex count exceeds 65535 (u16 poly indices) - split the mesh")); }
+	// u16 COUNT CEILING (pinned 2026-07-26) - the vertex guard above is NOT sufficient. BVH leaf
+	// PolyStart (node+0x0c) and the m_Trees start/end node indices are u16 in the real format;
+	// a closed mesh runs ~2 triangles per vertex, so NP wraps at ~32.8k verts - INSIDE the range
+	// the vertex guard allows. The result passed every in-code check and emitted a bound whose
+	// tail leaves index back into the start of the poly array: silently wrong collision, ok:true.
+	// Real large bounds use MULTIPLE composite children; this writer emits exactly one.
+	if (NP > 65535) { return Fail(TEXT("triangle count exceeds 65535 (u16 BVH poly index) - split the mesh")); }
 	// (page size is derived from the largest block below - the uniform-P pager, same as
 	// ExportYdrBinary; no struct may span a page boundary, and none can by construction)
 
