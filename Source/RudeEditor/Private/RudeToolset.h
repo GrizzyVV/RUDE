@@ -105,6 +105,20 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString CaptureView(const FString& CamSpec, const FString& OutPng);
 
+	// Create the RUDE FILEBASE: a seeded folder tree the user exports their own game
+	// files into, shaped to their ACTUAL install so build-version-accurate assets stay
+	// separable. The same asset name exists in base, update and many DLCs, so the tree
+	// encodes LOAD ORDER as numeric prefixes (higher wins): 00_base < 10_update < 20_dlc/NNN_name.
+	// FilebaseRoot: where to create it. GameRoot: the user's GTA V install (its
+	// update/x64/dlcpacks folders are enumerated - directory names only, no archive is
+	// opened or decrypted). Options: "CORE" (default; core type folders per DLC) or
+	// "ALL" (every type folder everywhere).
+	// Writes _FILEBASE.json (sources + order + build fingerprint) and README.md.
+	// Returns JSON: {ok, root, dlcPacks, baseArchives, foldersCreated}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString CreateFilebase(const FString& FilebaseRoot, const FString& GameRoot,
+	                              const FString& Options);
+
 	// THE THREAD-PULL: one call ingests a whole map area from the corpus.
 	// 1) builds an archetype index from every .ytyp XML under <CorpusRoot>/ytyp
 	// 2) parses <CorpusRoot>/ymap/<YmapPrefix>*.xml entities (import-lane transforms)

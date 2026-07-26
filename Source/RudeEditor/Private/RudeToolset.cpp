@@ -1668,6 +1668,163 @@ FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng)
 	return Fail(TEXT("no perspective level viewport"));
 }
 
+// ---- RUDE FILEBASE ---------------------------------------------------------------
+// The user exports their own game files into this tree. Its job is to keep
+// BUILD-VERSION-ACCURATE assets separable: the same name (prop_x.ydr) legitimately
+// exists in the base game, in update.rpf, and in several DLC packs, and the LAST one
+// in load order is the one the game actually uses. Numeric prefixes make that order
+// explicit on disk, so a resolver just walks folders high-to-low.
+namespace RudeFilebase
+{
+	// Types RUDE consumes directly, then context types worth keeping alongside.
+	static const TCHAR* CORE_TYPES[] = { TEXT("ydr"), TEXT("ydd"), TEXT("ytd"), TEXT("ybn"),
+	                                     TEXT("ytyp"), TEXT("ymap") };
+	static const TCHAR* ALL_TYPES[] = { TEXT("ydr"), TEXT("ydd"), TEXT("ytd"), TEXT("ybn"),
+	                                    TEXT("ytyp"), TEXT("ymap"), TEXT("yft"), TEXT("ycd"),
+	                                    TEXT("ynv"), TEXT("ynd"), TEXT("yed"), TEXT("ymt"),
+	                                    TEXT("ymf"), TEXT("ypt"), TEXT("yld"), TEXT("awc"),
+	                                    TEXT("rel"), TEXT("meta"), TEXT("gxt2"), TEXT("xml") };
+
+	static int32 MakeTypeFolders(const FString& Base, bool bAll)
+	{
+		int32 n = 0;
+		const TCHAR* const* Types = bAll ? ALL_TYPES : CORE_TYPES;
+		const int32 Count = bAll ? UE_ARRAY_COUNT(ALL_TYPES) : UE_ARRAY_COUNT(CORE_TYPES);
+		for (int32 i = 0; i < Count; ++i)
+		{
+			if (IFileManager::Get().MakeDirectory(*(Base / Types[i]), true)) { ++n; }
+		}
+		return n;
+	}
+}
+
+FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString& GameRoot,
+                                     const FString& Options)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	IFileManager& FM = IFileManager::Get();
+	if (!FPaths::DirectoryExists(GameRoot)) { return Fail(TEXT("GameRoot does not exist")); }
+	const bool bAll = Options.TrimStartAndEnd().Equals(TEXT("ALL"), ESearchCase::IgnoreCase);
+
+	// --- read the user's install: base archives + DLC pack NAMES (directory listing
+	// only; nothing is opened, decrypted, copied or redistributed) ---
+	TArray<FString> BaseArchives;
+	FM.FindFiles(BaseArchives, *(GameRoot / TEXT("*.rpf")), true, false);
+	BaseArchives.Sort();
+
+	TArray<FString> DlcDirs;
+	const FString DlcRoot = GameRoot / TEXT("update/x64/dlcpacks");
+	FM.FindFiles(DlcDirs, *(DlcRoot / TEXT("*")), false, true);
+	// Heuristic order: year-bearing pack names are newer, so they sort last; otherwise
+	// alphabetical. NOT authoritative - the real order lives in dlclist.xml inside the
+	// encrypted update.rpf. The manifest says so, and _manifest/ has a slot for it.
+	DlcDirs.Sort([](const FString& A, const FString& B)
+	{
+		auto YearOf = [](const FString& S) -> int32
+		{
+			for (int32 Y = 2013; Y <= 2035; ++Y)
+			{
+				if (S.Contains(FString::FromInt(Y))) { return Y; }
+			}
+			return 0;
+		};
+		const int32 YA = YearOf(A), YB = YearOf(B);
+		if (YA != YB) { return YA < YB; }
+		return A < B;
+	});
+
+	// --- build the tree ---
+	int32 Folders = 0;
+	auto Mk = [&](const FString& P) { if (FM.MakeDirectory(*P, true)) { ++Folders; } };
+	Mk(FilebaseRoot);
+	Mk(FilebaseRoot / TEXT("_manifest"));
+	Mk(FilebaseRoot / TEXT("_incoming"));
+	const FString BaseDir = FilebaseRoot / TEXT("00_base");
+	const FString UpdDir = FilebaseRoot / TEXT("10_update");
+	Mk(BaseDir); Mk(UpdDir);
+	Folders += RudeFilebase::MakeTypeFolders(BaseDir, true);   // base/update hold everything
+	Folders += RudeFilebase::MakeTypeFolders(UpdDir, true);
+	const FString DlcOut = FilebaseRoot / TEXT("20_dlc");
+	Mk(DlcOut);
+	FString DlcJson;
+	for (int32 i = 0; i < DlcDirs.Num(); ++i)
+	{
+		const FString Name = FPaths::GetCleanFilename(DlcDirs[i]);
+		const FString Dir = DlcOut / FString::Printf(TEXT("%03d_%s"), i + 1, *Name);
+		Mk(Dir);
+		Folders += RudeFilebase::MakeTypeFolders(Dir, bAll);
+		DlcJson += FString::Printf(TEXT("%s\n  {\"order\": %d, \"name\": \"%s\", \"folder\": \"%s\"}"),
+			i ? TEXT(",") : TEXT(""), i + 1, *Name, *FPaths::GetCleanFilename(Dir));
+	}
+
+	// --- build fingerprint: identifies WHICH game build this filebase was cut for ---
+	FString ExeName = TEXT("GTA5.exe");
+	int64 ExeSize = FM.FileSize(*(GameRoot / ExeName));
+	if (ExeSize <= 0) { ExeName = TEXT("GTA5_Enhanced.exe"); ExeSize = FM.FileSize(*(GameRoot / ExeName)); }
+	const FDateTime ExeStamp = FM.GetTimeStamp(*(GameRoot / ExeName));
+
+	FString BaseJson;
+	for (int32 i = 0; i < BaseArchives.Num(); ++i)
+	{
+		BaseJson += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(", ") : TEXT(""), *BaseArchives[i]);
+	}
+	const FString Manifest = FString::Printf(TEXT(
+		"{\n"
+		" \"filebaseVersion\": 1,\n"
+		" \"createdBy\": \"RUDE CreateFilebase\",\n"
+		" \"gameRoot\": \"%s\",\n"
+		" \"build\": { \"exe\": \"%s\", \"bytes\": %lld, \"modified\": \"%s\" },\n"
+		" \"precedence\": [\"00_base\", \"10_update\", \"20_dlc/<order>_<name>\"],\n"
+		" \"precedenceNote\": \"Later wins. A name present in several sources resolves to the "
+		"highest-ordered copy - that is what makes the filebase build-version-accurate.\",\n"
+		" \"dlcOrderAuthoritative\": false,\n"
+		" \"dlcOrderNote\": \"Order below is a heuristic (year-bearing names last, else "
+		"alphabetical). The authoritative list is dlclist.xml inside update.rpf; drop it into "
+		"_manifest/ and the order can be corrected.\",\n"
+		" \"baseArchives\": [%s],\n"
+		" \"dlcPacks\": [%s\n ]\n}\n"),
+		*GameRoot.ReplaceCharWithEscapedChar(), *ExeName, ExeSize, *ExeStamp.ToString(),
+		*BaseJson, *DlcJson);
+	FFileHelper::SaveStringToFile(Manifest, *(FilebaseRoot / TEXT("_FILEBASE.json")),
+		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+
+	const FString Readme = FString::Printf(TEXT(
+		"# RUDE Filebase\n\n"
+		"Export your OWN game files into this tree. Nothing here ships with RUDE and no game\n"
+		"data belongs in any repository.\n\n"
+		"## Why the numbers\n"
+		"The same asset name exists in several places (base game, update.rpf, many DLC packs).\n"
+		"The game uses the LAST one in load order, so this tree makes order explicit:\n\n"
+		"    00_base/      lowest precedence - the base x64*.rpf / common.rpf archives\n"
+		"    10_update/    update.rpf - overrides base\n"
+		"    20_dlc/NNN_<name>/   DLC packs, NNN = load order (higher wins)\n\n"
+		"Export each source into its OWN folder. Do not merge them: keeping duplicates apart is\n"
+		"exactly what lets RUDE resolve the build-version-accurate copy.\n\n"
+		"## Inside each source\n"
+		"Files go in a folder named for their type: `ydr/ ydd/ ytd/ ybn/ ytyp/ ymap/ ...`\n"
+		"(XML exports keep their full name, e.g. `ydr/prop_bench_01.ydr.xml`.)\n"
+		"Missing type folders are fine - create them as you export.\n\n"
+		"## Slots\n"
+		"    _manifest/    drop dlclist.xml / setup2.xml here to pin the authoritative DLC order\n"
+		"    _incoming/    staging area for unsorted exports\n\n"
+		"## This filebase was cut for\n"
+		"    %s  (%s, %lld bytes, modified %s)\n"
+		"    %d base archives, %d DLC packs\n\n"
+		"If you patch the game, re-run CreateFilebase: the build fingerprint in _FILEBASE.json\n"
+		"is how a mismatch gets noticed before it corrupts a project.\n"),
+		*GameRoot, *ExeName, ExeSize, *ExeStamp.ToString(), BaseArchives.Num(), DlcDirs.Num());
+	FFileHelper::SaveStringToFile(Readme, *(FilebaseRoot / TEXT("README.md")),
+		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+
+	return FString::Printf(TEXT(
+		"{\"ok\":true,\"root\":\"%s\",\"dlcPacks\":%d,\"baseArchives\":%d,\"foldersCreated\":%d,"
+		"\"typeMode\":\"%s\"}"),
+		*FilebaseRoot, DlcDirs.Num(), BaseArchives.Num(), Folders, bAll ? TEXT("ALL") : TEXT("CORE"));
+}
+
 FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
                                     const FString& DestMeshFolder, const FString& Filter)
 {
