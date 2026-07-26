@@ -105,6 +105,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString CaptureView(const FString& CamSpec, const FString& OutPng);
 
+	// File a FLAT export dump into the filebase. You export from CodeWalker into any
+	// folder (it dumps files flat); this sorts them by type into the right precedence
+	// slot, so nobody hand-sorts anything.
+	// DumpFolder: the folder you exported into. SourceName: "base", "update", or a DLC
+	// pack name (e.g. "mpbiker"); leave EMPTY to use the dump folder's own name.
+	// FilebaseRoot: the filebase. Move: "MOVE" (default) or "COPY".
+	// Returns JSON: {ok, source, dest, filed, byType:{...}, skipped}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString IngestExport(const FString& DumpFolder, const FString& SourceName,
+	                            const FString& FilebaseRoot, const FString& Move);
+
 	// Create the RUDE FILEBASE: a seeded folder tree the user exports their own game
 	// files into, shaped to their ACTUAL install so build-version-accurate assets stay
 	// separable. The same asset name exists in base, update and many DLCs, so the tree

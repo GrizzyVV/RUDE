@@ -1698,6 +1698,101 @@ namespace RudeFilebase
 	}
 }
 
+FString URudeToolset::IngestExport(const FString& DumpFolder, const FString& SourceName,
+                                   const FString& FilebaseRoot, const FString& Move)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	IFileManager& FM = IFileManager::Get();
+	if (!FPaths::DirectoryExists(DumpFolder)) { return Fail(TEXT("DumpFolder does not exist")); }
+	if (!FPaths::DirectoryExists(FilebaseRoot)) { return Fail(TEXT("FilebaseRoot does not exist - run CreateFilebase first")); }
+	const bool bMove = !Move.TrimStartAndEnd().Equals(TEXT("COPY"), ESearchCase::IgnoreCase);
+
+	FString Src = SourceName.TrimStartAndEnd();
+	if (Src.IsEmpty())
+	{
+		FString Trimmed = DumpFolder;
+		while (Trimmed.EndsWith(TEXT("/")) || Trimmed.EndsWith(TEXT("\\")))
+		{
+			Trimmed.LeftChopInline(1);
+		}
+		Src = FPaths::GetCleanFilename(Trimmed);
+	}
+	const FString SrcLower = Src.ToLower();
+
+	// resolve the destination slot: base / update / a numbered DLC folder
+	FString Dest;
+	if (SrcLower == TEXT("base") || SrcLower.StartsWith(TEXT("x64")) || SrcLower == TEXT("common"))
+	{
+		Dest = FilebaseRoot / TEXT("00_base");
+	}
+	else if (SrcLower.StartsWith(TEXT("update")))
+	{
+		Dest = FilebaseRoot / TEXT("10_update");
+	}
+	else
+	{
+		TArray<FString> DlcDirs;
+		FM.FindFiles(DlcDirs, *(FilebaseRoot / TEXT("20_dlc") / TEXT("*")), false, true);
+		for (const FString& D : DlcDirs)
+		{
+			// folders are NNN_<name>; match on the name half so callers never type numbers
+			FString Name = FPaths::GetCleanFilename(D);
+			int32 us;
+			if (Name.FindChar(TEXT('_'), us)) { Name = Name.Mid(us + 1); }
+			if (Name.Equals(SrcLower, ESearchCase::IgnoreCase))
+			{
+				Dest = FilebaseRoot / TEXT("20_dlc") / FPaths::GetCleanFilename(D);
+				break;
+			}
+		}
+		if (Dest.IsEmpty())
+		{
+			return Fail(FString::Printf(
+				TEXT("unknown source '%s' - use base, update, or a DLC pack name from _FILEBASE.json"), *Src));
+		}
+	}
+
+	// every file, recursively; type = the extension before any .xml
+	TArray<FString> Files;
+	FM.FindFilesRecursive(Files, *DumpFolder, TEXT("*.*"), true, false);
+	TMap<FString, int32> ByType;
+	int32 Filed = 0, Skipped = 0;
+	for (const FString& F : Files)
+	{
+		FString Name = FPaths::GetCleanFilename(F);
+		FString Type = FPaths::GetExtension(Name).ToLower();
+		if (Type == TEXT("xml"))
+		{
+			// prop_x.ydr.xml -> ydr
+			FString Base = FPaths::GetBaseFilename(Name);
+			Type = FPaths::GetExtension(Base).ToLower();
+		}
+		if (Type.IsEmpty() || Type == TEXT("rpf")) { ++Skipped; continue; }
+		const FString TypeDir = Dest / Type;
+		FM.MakeDirectory(*TypeDir, true);
+		const FString Target = TypeDir / Name;
+		bool bOk = bMove ? FM.Move(*Target, *F, true) : (FM.Copy(*Target, *F, true) == COPY_OK);
+		if (bOk) { ++Filed; ByType.FindOrAdd(Type)++; }
+		else { ++Skipped; }
+		if (Filed && Filed % 2000 == 0)
+		{
+			UE_LOG(LogTemp, Display, TEXT("[RUDE] IngestExport %d filed..."), Filed);
+		}
+	}
+	FString TypeJson;
+	for (const TPair<FString, int32>& P : ByType)
+	{
+		TypeJson += FString::Printf(TEXT("%s\"%s\":%d"), TypeJson.IsEmpty() ? TEXT("") : TEXT(","),
+			*P.Key, P.Value);
+	}
+	return FString::Printf(TEXT(
+		"{\"ok\":true,\"source\":\"%s\",\"dest\":\"%s\",\"filed\":%d,\"byType\":{%s},\"skipped\":%d}"),
+		*Src, *FPaths::GetCleanFilename(Dest), Filed, *TypeJson, Skipped);
+}
+
 FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString& GameRoot,
                                      const FString& Options)
 {
@@ -1745,8 +1840,13 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 	const FString BaseDir = FilebaseRoot / TEXT("00_base");
 	const FString UpdDir = FilebaseRoot / TEXT("10_update");
 	Mk(BaseDir); Mk(UpdDir);
-	Folders += RudeFilebase::MakeTypeFolders(BaseDir, true);   // base/update hold everything
-	Folders += RudeFilebase::MakeTypeFolders(UpdDir, true);
+	// Type folders are created ON DEMAND by IngestExport - pre-seeding hundreds of empty
+	// ones only made the tree look like work the user has to do. "ALL" restores them.
+	if (bAll)
+	{
+		Folders += RudeFilebase::MakeTypeFolders(BaseDir, true);
+		Folders += RudeFilebase::MakeTypeFolders(UpdDir, true);
+	}
 	const FString DlcOut = FilebaseRoot / TEXT("20_dlc");
 	Mk(DlcOut);
 	FString DlcJson;
@@ -1755,7 +1855,7 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 		const FString Name = FPaths::GetCleanFilename(DlcDirs[i]);
 		const FString Dir = DlcOut / FString::Printf(TEXT("%03d_%s"), i + 1, *Name);
 		Mk(Dir);
-		Folders += RudeFilebase::MakeTypeFolders(Dir, bAll);
+		if (bAll) { Folders += RudeFilebase::MakeTypeFolders(Dir, false); }
 		DlcJson += FString::Printf(TEXT("%s\n  {\"order\": %d, \"name\": \"%s\", \"folder\": \"%s\"}"),
 			i ? TEXT(",") : TEXT(""), i + 1, *Name, *FPaths::GetCleanFilename(Dir));
 	}
@@ -1793,28 +1893,34 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 
 	const FString Readme = FString::Printf(TEXT(
 		"# RUDE Filebase\n\n"
-		"Export your OWN game files into this tree. Nothing here ships with RUDE and no game\n"
-		"data belongs in any repository.\n\n"
-		"## Why the numbers\n"
-		"The same asset name exists in several places (base game, update.rpf, many DLC packs).\n"
-		"The game uses the LAST one in load order, so this tree makes order explicit:\n\n"
-		"    00_base/      lowest precedence - the base x64*.rpf / common.rpf archives\n"
-		"    10_update/    update.rpf - overrides base\n"
-		"    20_dlc/NNN_<name>/   DLC packs, NNN = load order (higher wins)\n\n"
-		"Export each source into its OWN folder. Do not merge them: keeping duplicates apart is\n"
-		"exactly what lets RUDE resolve the build-version-accurate copy.\n\n"
-		"## Inside each source\n"
-		"Files go in a folder named for their type: `ydr/ ydd/ ytd/ ybn/ ytyp/ ymap/ ...`\n"
-		"(XML exports keep their full name, e.g. `ydr/prop_bench_01.ydr.xml`.)\n"
-		"Missing type folders are fine - create them as you export.\n\n"
+		"## How to use this (the whole procedure)\n\n"
+		"**1.** In CodeWalker, open ONE source (e.g. `x64a.rpf`, or `update.rpf`, or a DLC's\n"
+		"`dlc.rpf`) and export what you want as XML. Dump it anywhere - a flat folder is fine,\n"
+		"do NOT sort it.\n\n"
+		"**2.** Tell RUDE to file it:\n\n"
+		"    IngestExport(DumpFolder, SourceName, FilebaseRoot)\n"
+		"      SourceName = \"base\", \"update\", or the DLC pack name (e.g. \"mpbiker\")\n\n"
+		"RUDE sorts every file by type into the correct precedence slot. You never create a\n"
+		"folder, never type a number, never sort anything by hand.\n\n"
+		"**3.** Repeat per source. Start with `base` and `update` - that is the city; DLC packs\n"
+		"only matter when you want their content.\n\n"
+		"## What the numbers mean (you can ignore them)\n"
+		"The same asset name exists in the base game, in update.rpf, and in several DLC packs;\n"
+		"the game uses the LAST one in load order. The folders encode that order so RUDE always\n"
+		"resolves the build-accurate copy:\n\n"
+		"    00_base/             the base x64*.rpf / common.rpf archives\n"
+		"    10_update/           update.rpf - overrides base\n"
+		"    20_dlc/NNN_<name>/   DLC packs, higher NNN wins\n\n"
+		"Type folders (`ydr/ ytd/ ybn/ ...`) are created for you as files arrive.\n"
+		"Keep sources in their own slots - not merging them is what makes this work.\n\n"
 		"## Slots\n"
-		"    _manifest/    drop dlclist.xml / setup2.xml here to pin the authoritative DLC order\n"
-		"    _incoming/    staging area for unsorted exports\n\n"
+		"    _manifest/    drop dlclist.xml here if you can export it (pins the exact DLC order)\n"
+		"    _incoming/    scratch space if you want somewhere to dump before ingesting\n\n"
 		"## This filebase was cut for\n"
 		"    %s  (%s, %lld bytes, modified %s)\n"
 		"    %d base archives, %d DLC packs\n\n"
-		"If you patch the game, re-run CreateFilebase: the build fingerprint in _FILEBASE.json\n"
-		"is how a mismatch gets noticed before it corrupts a project.\n"),
+		"Re-run CreateFilebase after a game patch: the build fingerprint in _FILEBASE.json is how\n"
+		"a mismatch gets caught before it corrupts a project.\n"),
 		*GameRoot, *ExeName, ExeSize, *ExeStamp.ToString(), BaseArchives.Num(), DlcDirs.Num());
 	FFileHelper::SaveStringToFile(Readme, *(FilebaseRoot / TEXT("README.md")),
 		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
