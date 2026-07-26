@@ -9,7 +9,10 @@
 
 // RUDE toolset - RAGE (GTA V) format import/export tools.
 // Import CodeWalker-XML drawables as StaticMesh assets, with the RUDE
-// GTA<->UE transform convention applied (cm scale, Y mirror, winding flip).
+// GTA<->UE transform convention applied: cm scale, Y mirror, and triangle
+// winding PASSED THROUGH AS-IS. (Under the Y-mirror, RAGE winding already faces
+// outward in UE - reversing it renders inside-out. Only the OBJ lane reverses,
+// because UE's OBJ importer adds its own handedness flip.)
 UCLASS()
 class URudeToolset : public UToolsetDefinition
 {
@@ -175,13 +178,17 @@ public:
 	// page-aligned graphics segment + segment flags + raw deflate) was reversed from
 	// our own CW diff pair and byte-verified (tools/write_ytd.py; ENGINEERING_LOG
 	// "RSC7 binary container"). This is P5 step 1 - deleting CodeWalker for textures.
-	// TextureSpecs: comma-separated entries "ContentPath;RageName[;Usage]" (Usage in
-	// DIFFUSE|NORMAL|SPECULAR; drives grcTexture semantics). OutYtdPath: absolute *.ytd.
-	// MaxDim: box-downscale any texture whose W or H exceeds this (power-of-two halving);
-	// "0"/empty = no cap. Uncompressed A8R8G8B8 is heavy - a 4096^2 = 64MB and FiveM will
-	// crash the GPU on oversized assets, so cap until DXT/BC compression lands (v2).
-	// v1 emits A8R8G8B8, 1 mip, 4MB-page-aligned graphics. Returns JSON:
-	// {ok, ytdPath, textures, bytes, sysFlags, gfxFlags} or {ok:false, error}.
+	// TextureSpecs: comma-separated entries "ContentPath;RageName[;Usage[;Format]]".
+	//   Usage  = DIFFUSE|NORMAL|SPECULAR (drives grcTexture semantics).
+	//   Format = AUTO|DXT1|DXT5|ATI2|RAW. AUTO (default) picks ATI2 for NORMAL, DXT5 when
+	//            the source has meaningful alpha, else DXT1.
+	// Emits a full mip chain, stopping at 4x4 (the min DXT block - sub-4 mips break the
+	// streamer's per-mip size math), and 4MB-page-aligned graphics.
+	// OutYtdPath: absolute *.ytd. MaxDim: box-downscale any texture whose W or H exceeds
+	// this (power-of-two halving); "0"/empty = no cap. Mainly relevant to RAW, which is
+	// uncompressed A8R8G8B8 and heavy (a 4096^2 = 64MB, and FiveM can fault the GPU on
+	// oversized assets). Texture names may be any length - the name region is sized to fit.
+	// Returns JSON: {ok, ytdPath, textures, bytes, sysFlags, gfxFlags} or {ok:false, error}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath,
 	                               const FString& MaxDim);

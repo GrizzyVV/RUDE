@@ -23,7 +23,8 @@ Free forever. No paywall, no premium tier, no strings. Ever.
 | **Export binary `.ydr`/`.ybn`/`.ytd` — no CodeWalker** | Clean-room RSC7 writers (`ExportYdrBinary`, `ExportYbnBinary`, `ExportYtdBinary`), validated in live FiveM: meshes with embedded collision, world collision bounds, DXT/BC texture dictionaries with mip chains |
 | Author placements in UE → FiveM | `ExportYtyp` + `ExportYmap` emit the archetype/placement layer (XML, FiveM Legacy loads it natively) with the in-game-proven collision flag model and manifest |
 | Import GTA V drawables into UE | `ImportYdr` (+`ImportYdrBatch`): CodeWalker-XML → `UStaticMesh` with per-shader material instances (RAGE RenderBucket-driven opaque/cutout/decal routing), textures bound by name, PIE-walkable collision |
-| Ingest whole map areas | `ImportScene`: scene manifest → one actor per ymap with instanced-static-mesh components (48k entities in one call) |
+| Ingest whole map areas | `ImportMapArea`: one call walks ytyp archetypes → ymap entities → every referenced drawable → spawns the area. `ImportScene` does the placement step from a manifest: one actor per ymap with instanced-static-mesh components (48k entities in one call) |
+| Set up your own game files | `CreateFilebase` seeds a load-order-aware tree (base < update < DLC) and `IngestExport` files a flat export dump into it by type — directory names only, no archive is opened |
 | Import texture dictionaries | `ImportYtd`: ytd XML + decoded pixels → `UTexture2D` with usage-correct semantics (normal maps, sRGB) |
 | Agent-native operation | RUDE registers an MCP toolset inside the editor — AI agents drive imports/exports as first-class tools. Humans get the same functions as Blueprint-callable nodes |
 
