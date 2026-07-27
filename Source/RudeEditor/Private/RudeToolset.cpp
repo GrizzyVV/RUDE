@@ -2579,13 +2579,74 @@ namespace RudeYdrBin
 		return true;
 	}
 
-	// One geometry's vertex-buffer description, decoded from grcFvf.
+	// ---- VERTEX DECLARATION DECODE ----------------------------------------------------------
+	// Derived empirically from all 3,479 real base-game v165 ydrs / 17,370 geometries (see
+	// ENGINEERING_LOG "ydr vertex declaration"). 14 distinct declarations exist; our WRITER only
+	// ever emits mask 0x59 / stride 36, which is just 43% of the corpus - so a reader that assumes
+	// one layout silently misreads the other 57%.
+	// LAW: channels are laid out in ASCENDING BIT-INDEX order; a channel's offset is the sum of the
+	// sizes of all lower set bits. The grcFvf u64 is a full 16-slot TYPE TABLE indexed by channel
+	// bit (nibble i = type of channel i), NOT packed per used channel - which is why it is the same
+	// constant 0x7755555555996996 in 17,370/17,370 geometries.
+	enum : int32 { CH_POS = 0, CH_BLENDW = 1, CH_BLENDI = 2, CH_NRM = 3, CH_COL0 = 4,
+	               CH_COL1 = 5, CH_TC0 = 6, CH_TANGENT = 14, CH_BINORMAL = 15 };
+
+	// nibble -> byte size. Only 5/6/7/9 occur in the map corpus; everything else is UNOBSERVED.
+	// Peds/vehicles/DLC use half-float and packed types that are certainly among the rest, so an
+	// unknown nibble must SKIP the geometry with a diagnosable message - never guess a size, or a
+	// wrong stride scrambles every vertex after the first (the "deformed mesh" class).
+	static int32 NibbleSize(uint8 N)
+	{
+		switch (N)
+		{
+			case 5: return 8;    // float2
+			case 6: return 12;   // float3
+			case 7: return 16;   // float4
+			case 9: return 4;    // ubyte4 / D3DCOLOR
+			default: return -1;  // NOT OBSERVED in the map corpus - refuse rather than guess
+		}
+	}
+
 	struct FDecl
 	{
 		uint32 Mask = 0;
 		int32 Stride = 0;
-		int32 PosOfs = -1, NrmOfs = -1, Col0Ofs = -1, UV0Ofs = -1;   // -1 = channel absent
+		int32 Ofs[16];    // -1 = channel absent
+		FDecl() { for (int32 i = 0; i < 16; ++i) { Ofs[i] = -1; } }
+		bool Has(int32 Ch) const { return Ch >= 0 && Ch < 16 && Ofs[Ch] >= 0; }
 	};
+
+	static bool BuildDecl(uint32 Mask, uint64 Nibbles, int32 DeclStride, FDecl& Out, FString& Error)
+	{
+		Out = FDecl();
+		Out.Mask = Mask;
+		int32 Off = 0;
+		for (int32 Bit = 0; Bit < 16; ++Bit)
+		{
+			if (((Mask >> Bit) & 1u) == 0) { continue; }
+			const uint8 Nb = (uint8)((Nibbles >> (Bit * 4)) & 0xFull);
+			const int32 Sz = NibbleSize(Nb);
+			if (Sz < 0)
+			{
+				Error = FString::Printf(
+					TEXT("unsupported vertex channel type: mask 0x%x bit %d has nibble 0x%x "
+					     "(only float2/3/4 and ubyte4 are derived from the map corpus)"), Mask, Bit, Nb);
+				return false;
+			}
+			Out.Ofs[Bit] = Off;
+			Off += Sz;
+		}
+		// The stride is declared in three places and agrees in 17,370/17,370, so a mismatch here
+		// means the declaration is not one we understand - refuse instead of misaligning.
+		if (Off != DeclStride)
+		{
+			Error = FString::Printf(TEXT("computed stride %d != declared %d for mask 0x%x"),
+			                        Off, DeclStride, Mask);
+			return false;
+		}
+		Out.Stride = Off;
+		return true;
+	}
 }
 
 // ======================= ExportYtdBinary - clean-room .ytd (RSC7 v13) =======================
@@ -4225,19 +4286,34 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 		}
 	}
 
-	// --- models -> geometries ---
-	if (PtrModels == 0) { return Fail(TEXT("no ModelsHigh (hdr+0x50 is null)")); }
+	// --- models -> geometries, over ALL FOUR LOD arrays ---
+	// +0x50 High, +0x58 Med, +0x60 Low, +0x68 Vlow are all real {ptrArray*, u16 count} arrays.
+	// Walking only +0x50 loses 21.2% of the corpus's geometries (3,677 of 17,370). ⚠ +0xa0 is a
+	// byte-identical ALIAS of +0x50 in 3,479/3,479 files - walking it too would double-count.
+	static const int32 LodSlot[4] = { 0x50, 0x58, 0x60, 0x68 };
+	static const TCHAR* LodName[4] = { TEXT("high"), TEXT("med"), TEXT("low"), TEXT("vlow") };
+
+	int32 TotalGeo = 0, TotalVerts = 0, TotalTris = 0, BadIdx = 0;
+	int32 DeclOk = 0, DeclBad = 0, PosInAabb = 0, PosOutAabb = 0, NanVerts = 0, NoNormal = 0;
+	FString FirstDeclError;
+	TSet<FString> Decls;
+	FString ModelJson;
+	bool bAnyModels = false;
+
+	for (int32 lod = 0; lod < 4; ++lod)
+	{
+	uint32 PtrLod = 0;
+	RudeYdrBin::U32(S, LodSlot[lod], PtrLod);
+	if (PtrLod == 0) { continue; }
 	int32 MH = 0;
-	if (!R.Resolve(PtrModels, 0x10, MH)) { return Fail(TEXT("ModelsHigh pointer does not resolve")); }
+	if (!R.Resolve(PtrLod, 0x10, MH)) { continue; }
 	uint32 PtrMArr = 0; uint16 NMod = 0;
 	RudeYdrBin::U32(S, MH + 0x00, PtrMArr);
 	RudeYdrBin::U16(S, MH + 0x08, NMod);
 	int32 MArr = 0;
-	if (NMod == 0 || !R.Resolve(PtrMArr, (int32)NMod * 8, MArr)) { return Fail(TEXT("model array does not resolve")); }
+	if (NMod == 0 || !R.Resolve(PtrMArr, (int32)NMod * 8, MArr)) { continue; }
+	bAnyModels = true;
 
-	int32 TotalGeo = 0, TotalVerts = 0, TotalTris = 0, BadIdx = 0;
-	TSet<FString> Decls;
-	FString ModelJson;
 	for (int32 mi = 0; mi < NMod; ++mi)
 	{
 		uint32 PtrM = 0;
@@ -4266,34 +4342,79 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 			RudeYdrBin::U32(S, GArr + gi * 8, PtrG);
 			int32 G = 0;
 			if (!R.Resolve(PtrG, 0x80, G)) { continue; }
-			uint32 PtrVB = 0, PtrIB = 0, IdxCount = 0, TriCount = 0, Stride = 0;
-			uint16 VCnt = 0;
+			uint32 PtrVB = 0, PtrIB = 0, IdxCount = 0, TriCount = 0;
+			uint16 VCnt = 0, Stride16 = 0;
 			RudeYdrBin::U32(S, G + 0x18, PtrVB);
 			RudeYdrBin::U32(S, G + 0x38, PtrIB);
 			RudeYdrBin::U32(S, G + 0x58, IdxCount);
 			RudeYdrBin::U32(S, G + 0x5c, TriCount);
 			RudeYdrBin::U16(S, G + 0x60, VCnt);
-			RudeYdrBin::U32(S, G + 0x70, Stride);
+			// ⚠ grmGeometry+0x70 is a U16, not a u32. +0x72 is non-zero on skinned geometries
+			// (mask 0x405f), where a u32 read yields 983,100 instead of 60 - prop_bin_14b.ydr.
+			RudeYdrBin::U16(S, G + 0x70, Stride16);
+			const uint32 Stride = (uint32)Stride16;
 
 			// vertex buffer + its declaration
-			uint32 Mask = 0; uint16 FvfStride = 0; uint8 ChanCount = 0;
-			int32 VB = 0, VData = 0; bool bVGfx = false;
+			uint32 Mask = 0; uint16 FvfStride = 0; uint8 ChanCount = 0; uint64 Nibbles = 0;
+			int32 VB = 0, VData = 0; bool bVGfx = false, bHaveVData = false;
 			if (R.Resolve(PtrVB, 0x40, VB))
 			{
 				uint32 PtrVData = 0, PtrFvf = 0;
 				RudeYdrBin::U32(S, VB + 0x10, PtrVData);
 				RudeYdrBin::U32(S, VB + 0x30, PtrFvf);
 				bVGfx = (PtrVData >> 28) == 6;
-				R.Resolve(PtrVData, (int32)VCnt * (int32)FMath::Max(Stride, 1u), VData);
+				bHaveVData = R.Resolve(PtrVData, (int32)VCnt * (int32)FMath::Max(Stride, 1u), VData) != nullptr;
 				int32 Fvf = 0;
 				if (R.Resolve(PtrFvf, 0x10, Fvf))
 				{
 					RudeYdrBin::U32(S, Fvf + 0x00, Mask);
 					RudeYdrBin::U16(S, Fvf + 0x04, FvfStride);
 					uint8 CC = 0; RudeYdrBin::Rd(S, Fvf + 0x07, &CC, 1); ChanCount = CC;
+					RudeYdrBin::Rd(S, Fvf + 0x08, &Nibbles, 8);
 				}
 			}
 			Decls.Add(FString::Printf(TEXT("mask=0x%x,stride=%u,chans=%u"), Mask, Stride, ChanCount));
+
+			// --- DECODE the declaration and verify positions against this geometry's own AABB ---
+			// This is the gate that catches a wrong layout: a misread position lands outside the
+			// box the file itself declares. 17,370/17,370 real geometries pass, so anything less
+			// than 100% here means the decode is wrong, not the data.
+			RudeYdrBin::FDecl Decl;
+			FString DeclErr;
+			const bool bDecl = RudeYdrBin::BuildDecl(Mask, Nibbles, (int32)Stride, Decl, DeclErr);
+			if (bDecl) { ++DeclOk; } else { ++DeclBad; if (FirstDeclError.IsEmpty()) { FirstDeclError = DeclErr; } }
+			if (bDecl && !Decl.Has(RudeYdrBin::CH_NRM)) { ++NoNormal; }
+			if (bDecl && bHaveVData && bGB)
+			{
+				// per-geometry AABB: pair[gi+1] when N>1 (pair[0] is the union), else pair[0]
+				const int32 PairOfs = GB + ((NGeo > 1) ? (gi + 1) : 0) * 0x20;
+				float Mn[3], Mx[3];
+				bool bBox = true;
+				for (int32 a = 0; a < 3; ++a)
+				{
+					bBox &= RudeYdrBin::F32(S, PairOfs + a * 4, Mn[a]);
+					bBox &= RudeYdrBin::F32(S, PairOfs + 0x10 + a * 4, Mx[a]);
+				}
+				if (bBox)
+				{
+					const int32 PO = Decl.Ofs[RudeYdrBin::CH_POS];
+					for (int32 v = 0; v < (int32)VCnt; ++v)
+					{
+						float P[3];
+						bool bR = true;
+						for (int32 a = 0; a < 3; ++a) { bR &= RudeYdrBin::F32(S, VData + v * (int32)Stride + PO + a * 4, P[a]); }
+						if (!bR) { break; }
+						if (!FMath::IsFinite(P[0]) || !FMath::IsFinite(P[1]) || !FMath::IsFinite(P[2]))
+						{
+							++NanVerts; continue;   // real shipped assets contain NaN verts
+						}
+						const float E = 0.01f;
+						const bool bIn = P[0] >= Mn[0]-E && P[0] <= Mx[0]+E && P[1] >= Mn[1]-E
+						              && P[1] <= Mx[1]+E && P[2] >= Mn[2]-E && P[2] <= Mx[2]+E;
+						if (bIn) { ++PosInAabb; } else { ++PosOutAabb; }
+					}
+				}
+			}
 
 			// index buffer: confirm u16 indices stay inside the vertex count
 			int32 MaxIdx = -1;
@@ -4324,21 +4445,29 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 			TotalVerts += (int32)VCnt; TotalTris += (int32)TriCount; ++TotalGeo;
 		}
 		ModelJson += FString::Printf(
-			TEXT("%s{\"model\":%d,\"geoCount\":%u,\"countAt0x2e\":%u,\"renderMask\":%u,")
+			TEXT("%s{\"lod\":\"%s\",\"model\":%d,\"geoCount\":%u,\"countAt0x2e\":%u,\"renderMask\":%u,")
 			TEXT("\"geoBoundsPairs\":%d,\"geoBoundsResolves\":%s,\"geos\":[%s]}"),
-			mi ? TEXT(",") : TEXT(""), mi, NGeo, NGeo2e, Rm & 0xFF, Pairs,
-			bGB ? TEXT("true") : TEXT("false"), *GeoJson);
+			ModelJson.IsEmpty() ? TEXT("") : TEXT(","), LodName[lod], mi, NGeo, NGeo2e, Rm & 0xFF,
+			Pairs, bGB ? TEXT("true") : TEXT("false"), *GeoJson);
 	}
+	}   // LOD arrays
+
+	if (!bAnyModels) { return Fail(TEXT("no model arrays resolve at hdr+0x50/58/60/68")); }
 
 	FString DeclJson;
 	for (const FString& D : Decls) { DeclJson += (DeclJson.IsEmpty() ? TEXT("\"") : TEXT(",\"")) + D + TEXT("\""); }
 
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"name\":\"%s\",\"version\":%u,\"sysSize\":%d,\"gfxSize\":%d,")
-		TEXT("\"hasEmbeddedBound\":%s,\"shaderCount\":%d,\"models\":%d,\"geometries\":%d,")
-		TEXT("\"vertices\":%d,\"triangles\":%d,\"indicesOutOfRange\":%d,\"declarations\":[%s],")
-		TEXT("\"shaders\":[%s],\"detail\":[%s]}"),
+		TEXT("\"hasEmbeddedBound\":%s,\"shaderCount\":%d,\"geometries\":%d,")
+		TEXT("\"vertices\":%d,\"triangles\":%d,\"indicesOutOfRange\":%d,")
+		TEXT("\"declsDecoded\":%d,\"declsUnsupported\":%d,\"declError\":\"%s\",")
+		TEXT("\"posInAabb\":%d,\"posOutOfAabb\":%d,\"nanVerts\":%d,\"geosWithoutNormal\":%d,")
+		TEXT("\"declarations\":[%s],\"shaders\":[%s],\"detail\":[%s]}"),
 		*DrawName, R.Version, R.Sys.Num(), R.Gfx.Num(),
-		PtrBound ? TEXT("true") : TEXT("false"), NumShaders, (int32)NMod, TotalGeo,
-		TotalVerts, TotalTris, BadIdx, *DeclJson, *ShaderJson, *ModelJson);
+		PtrBound ? TEXT("true") : TEXT("false"), NumShaders, TotalGeo,
+		TotalVerts, TotalTris, BadIdx,
+		DeclOk, DeclBad, *FirstDeclError,
+		PosInAabb, PosOutAabb, NanVerts, NoNormal,
+		*DeclJson, *ShaderJson, *ModelJson);
 }
