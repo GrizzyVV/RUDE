@@ -2616,6 +2616,206 @@ namespace RudeYdrBin
 		bool Has(int32 Ch) const { return Ch >= 0 && Ch < 16 && Ofs[Ch] >= 0; }
 	};
 
+	static bool BuildDecl(uint32 Mask, uint64 Nibbles, int32 DeclStride, FDecl& Out, FString& Error);
+
+	// ---- SELF-VERIFICATION: the export gate, run on our own freshly-built bytes -----------------
+	// Wired into ExportYdrBinary so it CANNOT ship a violation, rather than relying on someone
+	// remembering to run an offline script. Uses the reader, so there is ONE implementation of the
+	// law (duplication is what caused crash #6 in the first place).
+	// Checks, all of which correspond to a real in-game crash we paid for:
+	//   #6  SINGLE OWNERSHIP - RAGE's fixup rewrites a pointer slot in place and is NOT idempotent,
+	//       so a block reached from 2 owners is resolved twice -> "address is neither virtual nor
+	//       physical". Counted by IN-DEGREE; the two sanctioned aliases (hdr+0xa0 == hdr+0x50, and
+	//       vertex data reached via VB+0x20 / grmGeometry+0x78) are simply not counted as edges.
+	//   ①  geoBounds must be N+1 pairs (union first) when N>1, and grmModel+0x2e == geometry count.
+	//   decl - every emitted vertex declaration must decode to exactly the declared stride.
+	struct FVerify
+	{
+		int32 SharedBlocks = 0;
+		int32 DeclBad = 0;
+		int32 BoundsBad = 0;
+		FString FirstProblem;
+	};
+
+	static void Note(FVerify& V, const FString& What)
+	{
+		if (V.FirstProblem.IsEmpty()) { V.FirstProblem = What; }
+	}
+
+	// Records an owner for a target; the SECOND owner of any target is a violation.
+	static void Own(TMap<int32, int32>& InDeg, FVerify& V, uint32 Tagged, const FString& Label)
+	{
+		if ((Tagged >> 28) != 5) { return; }              // only system-segment blocks here
+		const int32 Off = (int32)(Tagged & 0x0FFFFFFFu);
+		if (Off == 0) { return; }
+		int32& N = InDeg.FindOrAdd(Off);
+		if (++N > 1)
+		{
+			++V.SharedBlocks;
+			Note(V, FString::Printf(TEXT("block @0x%x has %d owners (%s) - non-idempotent fixup "
+			                             "will resolve it %d times"), Off, N, *Label, N));
+		}
+	}
+
+	// Verify a drawable we just built, in place, before it is compressed and written.
+	static FVerify VerifyDrawable(const TArray<uint8>& Sys)
+	{
+		FVerify V;
+		TMap<int32, int32> InDeg;
+		auto P = [&Sys](int32 O) -> uint32 { uint32 X = 0; U32(Sys, O, X); return X; };
+		auto Deref = [&Sys](uint32 T, int32 Need, int32& O) -> bool
+		{
+			if ((T >> 28) != 5) { return false; }
+			O = (int32)(T & 0x0FFFFFFFu);
+			return O >= 0 && O + Need <= Sys.Num();
+		};
+
+		Own(InDeg, V, P(0x08), TEXT("hdr+0x08 blockmap"));
+		Own(InDeg, V, P(0x10), TEXT("hdr+0x10 ShaderGroup"));
+		Own(InDeg, V, P(0x50), TEXT("hdr+0x50 ModelsHigh"));
+		Own(InDeg, V, P(0xa8), TEXT("hdr+0xa8 name"));
+		Own(InDeg, V, P(0xc8), TEXT("hdr+0xc8 Bound"));
+		// hdr+0xa0 intentionally NOT counted - byte-identical alias of +0x50 in 3,479/3,479 real files.
+
+		// ShaderGroup -> shaders -> param tables -> texture stubs -> stub name strings
+		int32 SG = 0;
+		if (Deref(P(0x10), 0x40, SG))
+		{
+			Own(InDeg, V, P(SG + 0x10), TEXT("SG+0x10 shaderArr"));
+			uint16 NSh = 0; U16(Sys, SG + 0x18, NSh);
+			int32 Arr = 0;
+			if (Deref(P(SG + 0x10), (int32)NSh * 8, Arr))
+			{
+				for (int32 si = 0; si < (int32)NSh; ++si)
+				{
+					Own(InDeg, V, P(Arr + si * 8), FString::Printf(TEXT("shaderArr[%d]"), si));
+					int32 Blk = 0;
+					if (!Deref(P(Arr + si * 8), 0x30, Blk)) { continue; }
+					Own(InDeg, V, P(Blk + 0x00), FString::Printf(TEXT("shader%d paramTable"), si));
+					uint32 NPar = 0; U32(Sys, Blk + 0x10, NPar);
+					const int32 PC = (int32)(NPar & 0xFFFF);
+					int32 Tbl = 0;
+					if (PC <= 0 || PC > 64 || !Deref(P(Blk + 0x00), PC * 16, Tbl)) { continue; }
+					for (int32 pi = 0; pi < PC; ++pi)
+					{
+						int32 Stub = 0;
+						if (!Deref(P(Tbl + pi * 16 + 8), 0x34, Stub)) { continue; }
+						uint32 Marker = 0; U32(Sys, Stub + 0x30, Marker);
+						if (Marker != 0x00020001u) { continue; }   // inline vec4, not a texture stub
+						Own(InDeg, V, P(Tbl + pi * 16 + 8), FString::Printf(TEXT("shader%d.param[%d] stub"), si, pi));
+						Own(InDeg, V, P(Stub + 0x28), FString::Printf(TEXT("shader%d stub name"), si));
+					}
+				}
+			}
+		}
+
+		// models -> grmModel -> geometries -> VB/IB/fvf/data
+		int32 MH = 0;
+		if (Deref(P(0x50), 0x10, MH))
+		{
+			Own(InDeg, V, P(MH + 0x00), TEXT("modelsHdr ptrArr"));
+			uint16 NMod = 0; U16(Sys, MH + 0x08, NMod);
+			int32 MArr = 0;
+			if (Deref(P(MH + 0x00), (int32)NMod * 8, MArr))
+			{
+				for (int32 mi = 0; mi < (int32)NMod; ++mi)
+				{
+					Own(InDeg, V, P(MArr + mi * 8), FString::Printf(TEXT("modelArr[%d]"), mi));
+					int32 M = 0;
+					if (!Deref(P(MArr + mi * 8), 0x30, M)) { continue; }
+					Own(InDeg, V, P(M + 0x08), TEXT("model geoArr"));
+					Own(InDeg, V, P(M + 0x18), TEXT("model geoBounds"));
+					Own(InDeg, V, P(M + 0x20), TEXT("model shaderMap"));
+					uint16 NGeo = 0, NGeo2e = 0;
+					U16(Sys, M + 0x10, NGeo);
+					U16(Sys, M + 0x2e, NGeo2e);
+					if (NGeo2e != NGeo)
+					{
+						++V.BoundsBad;
+						Note(V, FString::Printf(TEXT("grmModel+0x2e is %u but geometry count is %u"), NGeo2e, NGeo));
+					}
+					// geoBounds: N+1 pairs (union first) when N>1, exactly 1 pair when N==1
+					const int32 Pairs = (NGeo > 1) ? ((int32)NGeo + 1) : 1;
+					int32 GB = 0;
+					if (!Deref(P(M + 0x18), Pairs * 0x20, GB))
+					{
+						++V.BoundsBad;
+						Note(V, FString::Printf(TEXT("geoBounds does not span %d pairs for %u geometries"),
+						                        Pairs, NGeo));
+					}
+					int32 GArr = 0;
+					if (!Deref(P(M + 0x08), (int32)NGeo * 8, GArr)) { continue; }
+					for (int32 gi = 0; gi < (int32)NGeo; ++gi)
+					{
+						Own(InDeg, V, P(GArr + gi * 8), FString::Printf(TEXT("geoArr[%d]"), gi));
+						int32 G = 0;
+						if (!Deref(P(GArr + gi * 8), 0x80, G)) { continue; }
+						Own(InDeg, V, P(G + 0x18), FString::Printf(TEXT("geo%d VB"), gi));
+						Own(InDeg, V, P(G + 0x38), FString::Printf(TEXT("geo%d IB"), gi));
+						// geo+0x78 NOT counted - sanctioned vertex-data alias
+						int32 VB = 0;
+						if (Deref(P(G + 0x18), 0x40, VB))
+						{
+							Own(InDeg, V, P(VB + 0x10), FString::Printf(TEXT("geo%d vertex data"), gi));
+							Own(InDeg, V, P(VB + 0x30), FString::Printf(TEXT("geo%d grcFvf"), gi));
+							// VB+0x20 NOT counted - sanctioned vertex-data alias
+							uint16 Stride16 = 0; U16(Sys, G + 0x70, Stride16);
+							uint32 Mask = 0; uint64 Nib = 0;
+							int32 Fvf = 0;
+							if (Deref(P(VB + 0x30), 0x10, Fvf))
+							{
+								U32(Sys, Fvf + 0x00, Mask);
+								Rd(Sys, Fvf + 0x08, &Nib, 8);
+								FDecl D; FString E;
+								if (!BuildDecl(Mask, Nib, (int32)Stride16, D, E))
+								{
+									++V.DeclBad;
+									Note(V, FString::Printf(TEXT("geo%d declaration: %s"), gi, *E));
+								}
+							}
+						}
+						int32 IB = 0;
+						if (Deref(P(G + 0x38), 0x20, IB))
+						{
+							Own(InDeg, V, P(IB + 0x10), FString::Printf(TEXT("geo%d index data"), gi));
+						}
+					}
+				}
+			}
+		}
+
+		// embedded bound: composite -> children -> per-child arrays -> BVH nodes/trees
+		int32 Comp = 0;
+		if (Deref(P(0xc8), 0x80, Comp))
+		{
+			Own(InDeg, V, P(Comp + 0x70), TEXT("composite children array"));
+			uint16 NCh = 0; U16(Sys, Comp + 0x78, NCh);
+			int32 CArr = 0;
+			if (Deref(P(Comp + 0x70), (int32)NCh * 8, CArr))
+			{
+				for (int32 ci = 0; ci < (int32)NCh; ++ci)
+				{
+					Own(InDeg, V, P(CArr + ci * 8), FString::Printf(TEXT("child[%d]"), ci));
+					int32 Ch = 0;
+					if (!Deref(P(CArr + ci * 8), 0x150, Ch)) { continue; }
+					static const int32 ChildPtrs[5] = { 0x88, 0xb0, 0xf0, 0x118, 0x130 };
+					for (int32 k = 0; k < 5; ++k)
+					{
+						Own(InDeg, V, P(Ch + ChildPtrs[k]),
+						    FString::Printf(TEXT("child[%d]+0x%x"), ci, ChildPtrs[k]));
+					}
+					int32 Bvh = 0;
+					if (Deref(P(Ch + 0x130), 0x80, Bvh))
+					{
+						Own(InDeg, V, P(Bvh + 0x00), FString::Printf(TEXT("child[%d] BVH nodes"), ci));
+						Own(InDeg, V, P(Bvh + 0x70), FString::Printf(TEXT("child[%d] m_Trees"), ci));
+					}
+				}
+			}
+		}
+		return V;
+	}
+
 	static bool BuildDecl(uint32 Mask, uint64 Nibbles, int32 DeclStride, FDecl& Out, FString& Error)
 	{
 		Out = FDecl();
@@ -3834,6 +4034,22 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 		            TEXT("(no-span law) - a block was added without feeding the page plan"));
 	}
 
+	// ⭐ SELF-VERIFY BEFORE WRITING. Every check here maps to an in-game crash already paid for:
+	// single ownership (#6), the geoBounds N+1 / +0x2e geometry-count law (①), and vertex
+	// declarations that decode to the declared stride. Wired in rather than left to an offline
+	// script, because a gate nobody remembers to run is not a gate. Refuse rather than emit - a
+	// corrupt resource costs an editor rebuild plus a game restart to diagnose.
+	{
+		const RudeYdrBin::FVerify V = RudeYdrBin::VerifyDrawable(Seg);
+		if (V.SharedBlocks > 0 || V.DeclBad > 0 || V.BoundsBad > 0)
+		{
+			return Fail(FString::Printf(
+				TEXT("SELF-CHECK FAILED, refusing to write: %d shared block(s), %d bad declaration(s), ")
+				TEXT("%d bounds/count problem(s). First: %s"),
+				V.SharedBlocks, V.DeclBad, V.BoundsBad, *V.FirstProblem));
+		}
+	}
+
 	int32 ZSize = FCompression::CompressMemoryBound(NAME_Zlib, Seg.Num());
 	TArray<uint8> Z; Z.SetNumUninitialized(ZSize);
 	if (!FCompression::CompressMemory(NAME_Zlib, Z.GetData(), ZSize, Seg.GetData(), Seg.Num()))
@@ -3857,7 +4073,8 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	}
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"ydrPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"bytes\":%d,")
-		TEXT("\"segSize\":%d,\"sysFlags\":\"0x%08x\",\"presetsSubstitutedToNormalSpec\":[%s]}"),
+		TEXT("\"segSize\":%d,\"sysFlags\":\"0x%08x\",\"selfCheck\":\"passed (single-ownership + ")
+		TEXT("geoBounds/count + declarations)\",\"presetsSubstitutedToNormalSpec\":[%s]}"),
 		*OutYdrPath, Geos.Num(), TotalVerts, TotalTris, Out.Num(), Seg.Num(), SysFlag, *SubList);
 #else
 	return Fail(TEXT("editor-only"));
@@ -4457,14 +4674,23 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 	FString DeclJson;
 	for (const FString& D : Decls) { DeclJson += (DeclJson.IsEmpty() ? TEXT("\"") : TEXT(",\"")) + D + TEXT("\""); }
 
+	// Run the same single-ownership gate the writer uses, so ANY ydr can be audited - not just one
+	// we just built. ⚠ ADVISORY here, not a verdict: sharing a grcTexture stub is LEGAL in
+	// EMBEDDED-texdict mode (the pgDictionary owns the texture once), which real R* files use, so a
+	// non-zero count on a game file is not necessarily a defect. The HARD refusal stays in
+	// ExportYdrBinary, where we know we emit external-ytd stubs and sharing is always wrong.
+	const RudeYdrBin::FVerify Vf = RudeYdrBin::VerifyDrawable(R.Sys);
+
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"name\":\"%s\",\"version\":%u,\"sysSize\":%d,\"gfxSize\":%d,")
+		TEXT("\"sharedBlocks\":%d,\"declsRejected\":%d,\"boundsProblems\":%d,\"firstProblem\":\"%s\",")
 		TEXT("\"hasEmbeddedBound\":%s,\"shaderCount\":%d,\"geometries\":%d,")
 		TEXT("\"vertices\":%d,\"triangles\":%d,\"indicesOutOfRange\":%d,")
 		TEXT("\"declsDecoded\":%d,\"declsUnsupported\":%d,\"declError\":\"%s\",")
 		TEXT("\"posInAabb\":%d,\"posOutOfAabb\":%d,\"nanVerts\":%d,\"geosWithoutNormal\":%d,")
 		TEXT("\"declarations\":[%s],\"shaders\":[%s],\"detail\":[%s]}"),
 		*DrawName, R.Version, R.Sys.Num(), R.Gfx.Num(),
+		Vf.SharedBlocks, Vf.DeclBad, Vf.BoundsBad, *Vf.FirstProblem,
 		PtrBound ? TEXT("true") : TEXT("false"), NumShaders, TotalGeo,
 		TotalVerts, TotalTris, BadIdx,
 		DeclOk, DeclBad, *FirstDeclError,
