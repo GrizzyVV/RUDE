@@ -2,6 +2,7 @@
 #include "Modules/ModuleManager.h"
 #include "Misc/CoreDelegates.h"
 #include "RudeToolset.h"
+#include "RudeToolPanel.h"
 #include "ToolsetRegistry/UToolsetRegistry.h"
 
 // ⚠ LOADING PHASE IS LOAD-BEARING (changed PostEngineInit -> Default, 2026-07-27).
@@ -18,9 +19,17 @@ class FRudeEditorModule : public IModuleInterface
 public:
 	virtual void StartupModule() override
 	{
+		// The human surface. Slate needs an application, which a commandlet run does not have -
+		// registering a tab spawner headless would assert, so gate on it. The CLI is unaffected.
+		if (FSlateApplication::IsInitialized())
+		{
+			SRudeToolPanel::RegisterTabSpawner();
+			bTabRegistered = true;
+		}
+
 		if (!TryRegister())
 		{
-			PostInitHandle = FCoreDelegates::OnPostEngineInit.AddLambda([this]()
+			PostInitHandle = FCoreDelegates::GetOnPostEngineInit().AddLambda([this]()
 			{
 				if (!TryRegister())
 				{
@@ -35,9 +44,14 @@ public:
 
 	virtual void ShutdownModule() override
 	{
+		if (bTabRegistered && FSlateApplication::IsInitialized())
+		{
+			SRudeToolPanel::UnregisterTabSpawner();
+			bTabRegistered = false;
+		}
 		if (PostInitHandle.IsValid())
 		{
-			FCoreDelegates::OnPostEngineInit.Remove(PostInitHandle);
+			FCoreDelegates::GetOnPostEngineInit().Remove(PostInitHandle);
 			PostInitHandle.Reset();
 		}
 		if (UToolsetRegistry::IsAvailable()
@@ -63,6 +77,7 @@ private:
 	}
 
 	FDelegateHandle PostInitHandle;
+	bool bTabRegistered = false;
 };
 
 IMPLEMENT_MODULE(FRudeEditorModule, RudeEditor)
