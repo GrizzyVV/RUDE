@@ -205,6 +205,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
 	static FString ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath);
 
+	// Parse a BINARY FiveM/GTA V .ydr (RSC7 v165) and report its whole drawable graph as JSON.
+	// This is the READ side's foundation: RUDE can write binary but until now could only READ
+	// CodeWalker XML, so real game binaries (e.g. from a QUARRY-extracted filebase) could not
+	// reach the importer. Verifies the parse before it is wired to the mesh builder.
+	// Reads untrusted files: every access is bounds-checked, malformed input returns {ok:false}.
+	// A v159 drawable is reported as GTA V ENHANCED rather than silently misread.
+	// BinPath: absolute path to a *.ydr. Returns JSON: {ok, name, version, sysSize, gfxSize,
+	// hasEmbeddedBound, shaderCount, models, geometries, vertices, triangles,
+	// indicesOutOfRange, declarations:[...], shaders:[{hash,params,textures}],
+	// detail:[{model, geoCount, countAt0x2e, geoBoundsPairs, geos:[...]}]}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	static FString ProbeYdrBinary(const FString& BinPath);
+
 	// Export a UStaticMesh's collision directly to a binary FiveM .ybn (RSC7 v43) -
 	// CLEAN-ROOM, no CodeWalker. P5 step 2. Emits a phBoundComposite wrapping one
 	// phBoundGeometryBVH: quantized vertices, 16-byte triangles, u8 material indices,

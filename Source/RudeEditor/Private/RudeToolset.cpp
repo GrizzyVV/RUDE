@@ -2481,6 +2481,113 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		NumYmaps, NumEntities, NumInstances, NumProxies, MeshCache.Num(), Missing.Num(), *TopMissing);
 }
 
+// ======================= RudeYdrBin - READING binary .ydr (RSC7 v165) =======================
+// The import side's keystone: RUDE could WRITE binary but only READ CodeWalker XML, so QUARRY's
+// output (real game binaries) could not reach the importer at all. This parses the container and
+// the drawable graph into the SAME RudeYdr::FGeo intermediate the XML lane produces, so the proven
+// mesh builder is reused rather than duplicated (today's crash #6 was a duplication bug - do not
+// grow a second mesh builder).
+// Struct map: ENGINEERING_LOG "ydr binary format". Everything here reads UNTRUSTED bytes from the
+// user's own game files, so every access is bounds-checked and a malformed file must return an
+// error, never crash the editor.
+namespace RudeYdrBin
+{
+	struct FRes
+	{
+		TArray<uint8> Sys;      // system (virtual) segment
+		TArray<uint8> Gfx;      // graphics (physical) segment - often empty (gfxFlags size 0)
+		uint32 Version = 0;
+
+		// A stored pointer is tagged: high nibble 5 = system, 6 = graphics; low 28 bits = offset.
+		// Returns the segment and validates the whole [off, off+Need) span before any read.
+		const TArray<uint8>* Resolve(uint32 Tagged, int32 Need, int32& OutOff) const
+		{
+			const uint32 Tag = Tagged >> 28;
+			const int32 Off = (int32)(Tagged & 0x0FFFFFFFu);
+			const TArray<uint8>* S = (Tag == 5) ? &Sys : ((Tag == 6) ? &Gfx : nullptr);
+			if (!S || Off < 0 || Need < 0 || Off + Need > S->Num()) { return nullptr; }
+			OutOff = Off;
+			return S;
+		}
+	};
+
+	static bool Rd(const TArray<uint8>& B, int32 Off, void* Dst, int32 N)
+	{
+		if (Off < 0 || N < 0 || Off + N > B.Num()) { return false; }
+		FMemory::Memcpy(Dst, B.GetData() + Off, N);
+		return true;
+	}
+	static bool U16(const TArray<uint8>& B, int32 O, uint16& V) { return Rd(B, O, &V, 2); }
+	static bool U32(const TArray<uint8>& B, int32 O, uint32& V) { return Rd(B, O, &V, 4); }
+	static bool F32(const TArray<uint8>& B, int32 O, float& V) { return Rd(B, O, &V, 4); }
+
+	// Total bytes described by an RSC7 flag word's page plan. base = 0x200<<ss, class-k page =
+	// base<<k, counts packed at fixed bit positions. Same scheme the writer's pager encodes.
+	static uint32 SegSizeFromFlags(uint32 Flags)
+	{
+		static const int32 KBit[9] = { 27, 26, 25, 24, 17, 11, 7, 5, 4 };
+		static const uint32 KMask[9] = { 1, 1, 1, 1, 0x7F, 0x3F, 0xF, 3, 1 };
+		const uint32 F = Flags & 0x0FFFFFFFu;
+		const uint32 Base = 0x200u << (F & 0xFu);
+		uint32 Total = 0;
+		for (int32 k = 0; k <= 8; ++k)
+		{
+			Total += ((F >> KBit[k]) & KMask[k]) * (Base << k);
+		}
+		return Total;
+	}
+
+	// RSC7 file -> inflated system + graphics segments.
+	static bool LoadFile(const FString& Path, FRes& Out, FString& Error)
+	{
+		TArray<uint8> File;
+		if (!FFileHelper::LoadFileToArray(File, *Path)) { Error = TEXT("cannot read file"); return false; }
+		if (File.Num() < 16) { Error = TEXT("shorter than an RSC7 header"); return false; }
+		if (File[0] != 'R' || File[1] != 'S' || File[2] != 'C' || File[3] != '7')
+		{
+			Error = TEXT("not an RSC7 container (no 'RSC7' magic)");
+			return false;
+		}
+		uint32 Ver = 0, SysF = 0, GfxF = 0;
+		U32(File, 4, Ver); U32(File, 8, SysF); U32(File, 12, GfxF);
+		if (Ver != 165)
+		{
+			// v159 = the GTA V ENHANCED drawable; loading it into a Legacy pipeline is the
+			// classic "Invalid fixup" report, so name the mismatch explicitly.
+			Error = FString::Printf(TEXT("version %u is not a Legacy drawable (want v165%s)"), Ver,
+				Ver == 159 ? TEXT("; v159 = GTA V Enhanced") : TEXT(""));
+			return false;
+		}
+		const uint32 SysSize = SegSizeFromFlags(SysF);
+		const uint32 GfxSize = SegSizeFromFlags(GfxF);
+		if (SysSize == 0 || SysSize > (1u << 30)) { Error = TEXT("implausible system segment size"); return false; }
+
+		// The body is headerless (raw) DEFLATE of [system | graphics].
+		TArray<uint8> Blob;
+		Blob.SetNumUninitialized((int32)(SysSize + GfxSize));
+		int32 OutSize = Blob.Num();
+		if (!FCompression::UncompressMemory(NAME_Zlib, Blob.GetData(), OutSize,
+		                                   File.GetData() + 16, File.Num() - 16,
+		                                   COMPRESS_NoFlags, -15))
+		{
+			Error = TEXT("raw-DEFLATE inflate failed (truncated, or an Oodle-packed resource)");
+			return false;
+		}
+		Out.Version = Ver;
+		Out.Sys.Append(Blob.GetData(), (int32)SysSize);
+		if (GfxSize > 0) { Out.Gfx.Append(Blob.GetData() + SysSize, (int32)GfxSize); }
+		return true;
+	}
+
+	// One geometry's vertex-buffer description, decoded from grcFvf.
+	struct FDecl
+	{
+		uint32 Mask = 0;
+		int32 Stride = 0;
+		int32 PosOfs = -1, NrmOfs = -1, Col0Ofs = -1, UV0Ofs = -1;   // -1 = channel absent
+	};
+}
+
 // ======================= ExportYtdBinary - clean-room .ytd (RSC7 v13) =======================
 // Reverse-engineered from our own CW-roundtripped diff pair + verified byte-identical
 // (tools/write_ytd.py, docs/ENGINEERING_LOG "RSC7 binary container"). No CodeWalker code read.
@@ -4030,4 +4137,208 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 #else
 	return Fail(TEXT("editor-only"));
 #endif
+}
+
+// ======================= ProbeYdrBinary - verify the binary READ path =======================
+// Step 1 of the import side: prove the C++ parse of a real binary .ydr before wiring it to the
+// mesh builder. Reports the whole drawable graph as JSON so it can be diffed against an
+// independent parse and against ExportYdrBinary's own output (round-trip).
+FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+
+	RudeYdrBin::FRes R;
+	FString Err;
+	if (!RudeYdrBin::LoadFile(BinPath, R, Err)) { return Fail(Err); }
+	const TArray<uint8>& S = R.Sys;
+
+	uint32 PtrSG = 0, PtrModels = 0, PtrName = 0, PtrBound = 0;
+	RudeYdrBin::U32(S, 0x10, PtrSG);
+	RudeYdrBin::U32(S, 0x50, PtrModels);
+	RudeYdrBin::U32(S, 0xa8, PtrName);
+	RudeYdrBin::U32(S, 0xc8, PtrBound);
+
+	// drawable name (plain ASCII, NUL-terminated)
+	FString DrawName;
+	{
+		int32 O = 0;
+		if (R.Resolve(PtrName, 1, O))
+		{
+			while (O < S.Num() && S[O] != 0 && DrawName.Len() < 128) { DrawName.AppendChar((TCHAR)S[O++]); }
+		}
+	}
+
+	// --- shaders: hash + the texture-stub names each one references ---
+	int32 NumShaders = 0;
+	FString ShaderJson;
+	if (PtrSG != 0)
+	{
+		int32 SG = 0;
+		if (!R.Resolve(PtrSG, 0x40, SG)) { return Fail(TEXT("ShaderGroup pointer does not resolve")); }
+		uint32 PtrArr = 0; uint16 NSh = 0;
+		RudeYdrBin::U32(S, SG + 0x10, PtrArr);
+		RudeYdrBin::U16(S, SG + 0x18, NSh);
+		int32 Arr = 0;
+		if (NSh > 0 && R.Resolve(PtrArr, (int32)NSh * 8, Arr))
+		{
+			NumShaders = (int32)NSh;
+			for (int32 si = 0; si < NSh; ++si)
+			{
+				uint32 PtrBlk = 0;
+				RudeYdrBin::U32(S, Arr + si * 8, PtrBlk);
+				int32 Blk = 0;
+				if (!R.Resolve(PtrBlk, 0x30, Blk)) { continue; }
+				uint32 Hash = 0, NPar = 0, PtrTbl = 0;
+				RudeYdrBin::U32(S, Blk + 0x08, Hash);
+				RudeYdrBin::U32(S, Blk + 0x10, NPar);
+				RudeYdrBin::U32(S, Blk + 0x00, PtrTbl);
+				const int32 ParCount = (int32)(NPar & 0xFFFF);
+				FString Texs;
+				int32 Tbl = 0;
+				if (ParCount > 0 && ParCount <= 64 && R.Resolve(PtrTbl, ParCount * 16, Tbl))
+				{
+					for (int32 pi = 0; pi < ParCount; ++pi)
+					{
+						uint32 PtrVal = 0;
+						RudeYdrBin::U32(S, Tbl + pi * 16 + 8, PtrVal);
+						int32 Stub = 0;
+						if (!R.Resolve(PtrVal, 0x34, Stub)) { continue; }
+						uint32 Marker = 0;
+						RudeYdrBin::U32(S, Stub + 0x30, Marker);
+						if (Marker != 0x00020001u) { continue; }   // not a grcTexture stub
+						uint32 PtrTexName = 0;
+						RudeYdrBin::U32(S, Stub + 0x28, PtrTexName);
+						int32 NO = 0;
+						if (!R.Resolve(PtrTexName, 1, NO)) { continue; }
+						FString TN;
+						while (NO < S.Num() && S[NO] != 0 && TN.Len() < 96) { TN.AppendChar((TCHAR)S[NO++]); }
+						if (!TN.IsEmpty()) { Texs += (Texs.IsEmpty() ? TEXT("\"") : TEXT(",\"")) + TN + TEXT("\""); }
+					}
+				}
+				ShaderJson += FString::Printf(
+					TEXT("%s{\"hash\":\"0x%08x\",\"params\":%d,\"textures\":[%s]}"),
+					si ? TEXT(",") : TEXT(""), Hash, ParCount, *Texs);
+			}
+		}
+	}
+
+	// --- models -> geometries ---
+	if (PtrModels == 0) { return Fail(TEXT("no ModelsHigh (hdr+0x50 is null)")); }
+	int32 MH = 0;
+	if (!R.Resolve(PtrModels, 0x10, MH)) { return Fail(TEXT("ModelsHigh pointer does not resolve")); }
+	uint32 PtrMArr = 0; uint16 NMod = 0;
+	RudeYdrBin::U32(S, MH + 0x00, PtrMArr);
+	RudeYdrBin::U16(S, MH + 0x08, NMod);
+	int32 MArr = 0;
+	if (NMod == 0 || !R.Resolve(PtrMArr, (int32)NMod * 8, MArr)) { return Fail(TEXT("model array does not resolve")); }
+
+	int32 TotalGeo = 0, TotalVerts = 0, TotalTris = 0, BadIdx = 0;
+	TSet<FString> Decls;
+	FString ModelJson;
+	for (int32 mi = 0; mi < NMod; ++mi)
+	{
+		uint32 PtrM = 0;
+		RudeYdrBin::U32(S, MArr + mi * 8, PtrM);
+		int32 M = 0;
+		if (!R.Resolve(PtrM, 0x30, M)) { continue; }
+		uint32 PtrGArr = 0, PtrGB = 0, Rm = 0;
+		uint16 NGeo = 0, NGeo2e = 0;
+		RudeYdrBin::U32(S, M + 0x08, PtrGArr);
+		RudeYdrBin::U16(S, M + 0x10, NGeo);
+		RudeYdrBin::U32(S, M + 0x18, PtrGB);
+		RudeYdrBin::U32(S, M + 0x2c, Rm);
+		RudeYdrBin::U16(S, M + 0x2e, NGeo2e);
+		int32 GArr = 0;
+		if (NGeo == 0 || !R.Resolve(PtrGArr, (int32)NGeo * 8, GArr)) { continue; }
+
+		// geoBounds is N+1 vec4-pairs when N>1 (union first), exactly 1 pair when N==1
+		const int32 Pairs = (NGeo > 1) ? (NGeo + 1) : 1;
+		int32 GB = 0;
+		const bool bGB = R.Resolve(PtrGB, Pairs * 0x20, GB) != nullptr;
+
+		FString GeoJson;
+		for (int32 gi = 0; gi < NGeo; ++gi)
+		{
+			uint32 PtrG = 0;
+			RudeYdrBin::U32(S, GArr + gi * 8, PtrG);
+			int32 G = 0;
+			if (!R.Resolve(PtrG, 0x80, G)) { continue; }
+			uint32 PtrVB = 0, PtrIB = 0, IdxCount = 0, TriCount = 0, Stride = 0;
+			uint16 VCnt = 0;
+			RudeYdrBin::U32(S, G + 0x18, PtrVB);
+			RudeYdrBin::U32(S, G + 0x38, PtrIB);
+			RudeYdrBin::U32(S, G + 0x58, IdxCount);
+			RudeYdrBin::U32(S, G + 0x5c, TriCount);
+			RudeYdrBin::U16(S, G + 0x60, VCnt);
+			RudeYdrBin::U32(S, G + 0x70, Stride);
+
+			// vertex buffer + its declaration
+			uint32 Mask = 0; uint16 FvfStride = 0; uint8 ChanCount = 0;
+			int32 VB = 0, VData = 0; bool bVGfx = false;
+			if (R.Resolve(PtrVB, 0x40, VB))
+			{
+				uint32 PtrVData = 0, PtrFvf = 0;
+				RudeYdrBin::U32(S, VB + 0x10, PtrVData);
+				RudeYdrBin::U32(S, VB + 0x30, PtrFvf);
+				bVGfx = (PtrVData >> 28) == 6;
+				R.Resolve(PtrVData, (int32)VCnt * (int32)FMath::Max(Stride, 1u), VData);
+				int32 Fvf = 0;
+				if (R.Resolve(PtrFvf, 0x10, Fvf))
+				{
+					RudeYdrBin::U32(S, Fvf + 0x00, Mask);
+					RudeYdrBin::U16(S, Fvf + 0x04, FvfStride);
+					uint8 CC = 0; RudeYdrBin::Rd(S, Fvf + 0x07, &CC, 1); ChanCount = CC;
+				}
+			}
+			Decls.Add(FString::Printf(TEXT("mask=0x%x,stride=%u,chans=%u"), Mask, Stride, ChanCount));
+
+			// index buffer: confirm u16 indices stay inside the vertex count
+			int32 MaxIdx = -1;
+			int32 IB = 0;
+			if (R.Resolve(PtrIB, 0x20, IB))
+			{
+				uint32 PtrIData = 0, IBCount = 0;
+				RudeYdrBin::U32(S, IB + 0x08, IBCount);
+				RudeYdrBin::U32(S, IB + 0x10, PtrIData);
+				int32 IData = 0;
+				const int32 NIdx = (int32)FMath::Min(IdxCount, IBCount);
+				if (NIdx > 0 && R.Resolve(PtrIData, NIdx * 2, IData))
+				{
+					for (int32 k = 0; k < NIdx; ++k)
+					{
+						uint16 V = 0; RudeYdrBin::U16(S, IData + k * 2, V);
+						MaxIdx = FMath::Max(MaxIdx, (int32)V);
+					}
+				}
+			}
+			if (MaxIdx >= (int32)VCnt) { ++BadIdx; }
+
+			GeoJson += FString::Printf(
+				TEXT("%s{\"geo\":%d,\"verts\":%u,\"tris\":%u,\"stride\":%u,\"fvfStride\":%u,")
+				TEXT("\"mask\":\"0x%x\",\"chans\":%u,\"maxIdx\":%d,\"vertsInGfxSeg\":%s}"),
+				gi ? TEXT(",") : TEXT(""), gi, VCnt, TriCount, Stride, FvfStride, Mask, ChanCount,
+				MaxIdx, bVGfx ? TEXT("true") : TEXT("false"));
+			TotalVerts += (int32)VCnt; TotalTris += (int32)TriCount; ++TotalGeo;
+		}
+		ModelJson += FString::Printf(
+			TEXT("%s{\"model\":%d,\"geoCount\":%u,\"countAt0x2e\":%u,\"renderMask\":%u,")
+			TEXT("\"geoBoundsPairs\":%d,\"geoBoundsResolves\":%s,\"geos\":[%s]}"),
+			mi ? TEXT(",") : TEXT(""), mi, NGeo, NGeo2e, Rm & 0xFF, Pairs,
+			bGB ? TEXT("true") : TEXT("false"), *GeoJson);
+	}
+
+	FString DeclJson;
+	for (const FString& D : Decls) { DeclJson += (DeclJson.IsEmpty() ? TEXT("\"") : TEXT(",\"")) + D + TEXT("\""); }
+
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"name\":\"%s\",\"version\":%u,\"sysSize\":%d,\"gfxSize\":%d,")
+		TEXT("\"hasEmbeddedBound\":%s,\"shaderCount\":%d,\"models\":%d,\"geometries\":%d,")
+		TEXT("\"vertices\":%d,\"triangles\":%d,\"indicesOutOfRange\":%d,\"declarations\":[%s],")
+		TEXT("\"shaders\":[%s],\"detail\":[%s]}"),
+		*DrawName, R.Version, R.Sys.Num(), R.Gfx.Num(),
+		PtrBound ? TEXT("true") : TEXT("false"), NumShaders, (int32)NMod, TotalGeo,
+		TotalVerts, TotalTris, BadIdx, *DeclJson, *ShaderJson, *ModelJson);
 }
