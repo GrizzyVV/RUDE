@@ -20,5 +20,11 @@
 			"Name": "ToolsetRegistry",
 			"Enabled": true
 		}
-	]
+	],
+	"CreatedByURL": "https://github.com/GrizzyVV",
+	"DocsURL": "https://github.com/GrizzyVV/RUDE",
+	"MarketplaceURL": "https://github.com/GrizzyVV/RUDE",
+	"SupportURL": "https://github.com/GrizzyVV/RUDE",
+	"IsExperimentalVersion": false,
+	"Installed": false
 }

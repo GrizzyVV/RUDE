@@ -3231,10 +3231,22 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	}
 
 	// --- grcFvf (GTAV1): mask 0x59, stride 36, 4 channels, format nibbles ---
-	TArray<uint8> Fvf; Fvf.AddZeroed(0x10);
-	RudeYbn::PU32(Fvf, 0x00, 0x59); RudeYbn::PU16(Fvf, 0x04, 36); Fvf[0x07] = 4;
-	RudeYbn::PU32(Fvf, 0x08, 0x55996996u); RudeYbn::PU32(Fvf, 0x0c, 0x77555555u);
-	const int32 OFvf = Emit(Fvf);
+	// ⛔⛔ CRASH #6: this used to be emitted ONCE here and pointed at by EVERY vertex buffer.
+	// RAGE FORBIDS SHARED OWNERSHIP: datResource fixup rewrites a pointer slot IN PLACE and is
+	// NOT idempotent, so a block reached from N owners is fixed up N times - the 2nd pass reads
+	// an ALREADY-RESOLVED 64-bit address whose high nibble is neither 5 nor 6, which is verbatim
+	// "address is neither virtual nor physical". Real files never alias an fvf: 0 of 3,479
+	// base-game v165 ydrs share one, and 17,370/17,370 geometries carry their OWN - dt1_02_groundb
+	// pays for 7 byte-identical 16-byte fvfs in consecutive slots rather than alias. Impossible to
+	// see at N==1, which is exactly why the single-geometry rock loads and every multi-material
+	// export died. Now emitted per geometry, inside the loop below.
+	auto MakeFvf = [&]() -> int32
+	{
+		TArray<uint8> Fvf; Fvf.AddZeroed(0x10);
+		RudeYbn::PU32(Fvf, 0x00, 0x59); RudeYbn::PU16(Fvf, 0x04, 36); Fvf[0x07] = 4;
+		RudeYbn::PU32(Fvf, 0x08, 0x55996996u); RudeYbn::PU32(Fvf, 0x0c, 0x77555555u);
+		return Emit(Fvf);
+	};
 	const int32 OName = EmitStr(MeshName);
 
 	// (vector parameter values are emitted INLINE inside each shader's contiguous
@@ -3242,19 +3254,25 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 
 	// --- per-shader: texture stubs (0x50: refcount, name*, 0x00020001), param table,
 	//     param block, shader struct ---
-	TMap<FString, int32> TexStubByName;
+	// ⛔⛔ CRASH #6 (the other half): these stubs used to be MEMOIZED BY NAME, so two shaders
+	// referencing the same texture shared one grcTexture stub AND one ASCII name string. Same
+	// non-idempotent-fixup violation as the fvf above: a doubly-owned block is fixed up twice and
+	// the second pass sees an already-resolved address -> "neither virtual nor physical".
+	// R* never does this in EXTERNAL-ytd mode: 0 of 2,299 external-texdict files share a stub,
+	// while 789 of them hit exactly this situation and DUPLICATE instead (db_apart_02_ carries 4
+	// separate stubs AND 4 separate copies of "HW_tpageDingB_RO_01"). Sharing IS legal in
+	// EMBEDDED-texdict mode, but only because the pgDictionary owns and places the texture once -
+	// we emit external stubs, so we must duplicate. Memoization removed deliberately; the few
+	// wasted bytes are the price of single ownership.
 	auto TexStub = [&](const FString& Name) -> int32
 	{
 		const FString L = Name.ToLower();
-		if (int32* F = TexStubByName.Find(L)) { return *F; }
-		const int32 NameOfs = EmitStr(L);
+		const int32 NameOfs = EmitStr(L);   // fresh string per stub, also single-owner
 		TArray<uint8> St; St.AddZeroed(0x50);
 		RudeYbn::PU32(St, 0x04, 1);
 		RudeYbn::PPTR(St, 0x28, NameOfs);
 		RudeYbn::PU32(St, 0x30, 0x00020001u);
-		const int32 O = Emit(St);
-		TexStubByName.Add(L, O);
-		return O;
+		return Emit(St);
 	};
 	TArray<int32> ShaderOfs;
 	TSet<FString> SubstitutedPresets;   // presets we had no verified param template for (crash #5)
@@ -3375,7 +3393,7 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 		RudeYbn::PPTR(Vb, 0x10, OVData[gi]);
 		RudeYbn::PU32(Vb, 0x18, (uint32)G.Pos.Num());
 		RudeYbn::PPTR(Vb, 0x20, OVData[gi]);
-		RudeYbn::PPTR(Vb, 0x30, OFvf);
+		RudeYbn::PPTR(Vb, 0x30, MakeFvf());   // OWN fvf per geometry - never shared (crash #6)
 		const int32 OVb = Emit(Vb);
 		TArray<uint8> Ib; Ib.AddZeroed(0x60);
 		RudeYbn::PU32(Ib, 0x00, 0x4061d158u); RudeYbn::PU32(Ib, 0x04, 1);
