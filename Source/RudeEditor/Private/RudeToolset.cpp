@@ -3,6 +3,8 @@
 
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/ARFilter.h"
+#include "AssetCompilingManager.h"
+#include "FileHelpers.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
 #include "Materials/Material.h"
@@ -20,6 +22,8 @@
 #include "UObject/Package.h"
 #include "XmlFile.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "Components/PointLightComponent.h"
+#include "Components/SpotLightComponent.h"
 #include "Dom/JsonObject.h"
 #include "Editor.h"
 #include "Engine/World.h"
@@ -1150,6 +1154,14 @@ FString URudeToolset::Ping()
 	return TEXT("RUDE 0.1.0 - RAGE <-> Unreal Development Environment. Toolset alive.");
 }
 
+// Build a UStaticMesh asset (plus its per-slot MaterialInstances) from ONE drawable-shaped
+// XML node - the body every import lane shares. DrawableRoot may be a standalone <Drawable>
+// root or a <Fragment>'s inner <Drawable> (both via ImportYdr), or a <DrawableDictionary>
+// <Item> (ImportYddEntry) - anything carrying ShaderGroup + DrawableModelsHigh children.
+// MeshName is the ASSET name, decided by the CALLER (file stem, <Name>, or dictionary entry).
+static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName,
+                                  const FString& DestFolder);
+
 FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolder)
 {
 	auto Fail = [](const FString& Why)
@@ -1198,6 +1210,17 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		}
 	}
 
+	return ImportDrawableNode(Root, Name, DestFolder);
+}
+
+static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName,
+                                  const FString& DestFolder)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+
 	// Shader presets + their texture parameter bindings
 	struct FShaderDef
 	{
@@ -1207,7 +1230,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		TMap<FString, FString> AllTex;       // every Texture param: samplerName -> texName (terrain layers)
 	};
 	TArray<FShaderDef> Shaders;
-	if (const FXmlNode* SG = Root->FindChildNode(TEXT("ShaderGroup")))
+	if (const FXmlNode* SG = DrawableRoot->FindChildNode(TEXT("ShaderGroup")))
 	{
 		if (const FXmlNode* Sh = SG->FindChildNode(TEXT("Shaders")))
 		{
@@ -1250,7 +1273,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 
 	// Geometries under DrawableModelsHigh
 	TArray<RudeYdr::FGeo> Geos;
-	if (const FXmlNode* High = Root->FindChildNode(TEXT("DrawableModelsHigh")))
+	if (const FXmlNode* High = DrawableRoot->FindChildNode(TEXT("DrawableModelsHigh")))
 	{
 		for (const FXmlNode* ModelItem : High->GetChildrenNodes())
 		{
@@ -1274,7 +1297,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	}
 
 	// Create the StaticMesh asset
-	const FString PackageName = DestFolder / Name;
+	const FString PackageName = DestFolder / MeshName;
 	if (!FPackageName::IsValidLongPackageName(PackageName))
 	{
 		return Fail(FString::Printf(TEXT("bad package name: %s"), *PackageName));
@@ -1284,7 +1307,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	{
 		return Fail(TEXT("CreatePackage failed"));
 	}
-	UStaticMesh* Mesh = NewObject<UStaticMesh>(Package, FName(*Name), RF_Public | RF_Standalone);
+	UStaticMesh* Mesh = NewObject<UStaticMesh>(Package, FName(*MeshName), RF_Public | RF_Standalone);
 	if (!Mesh)
 	{
 		return Fail(TEXT("NewObject<UStaticMesh> failed"));
@@ -1476,9 +1499,9 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		else if (Master)
 		{
 			// MI per unique shader CONFIG: /Game/RUDE/Materials/Instances/<prop>/MI_<prop>_<idx>
-			const FString MIName = FString::Printf(TEXT("MI_%s_%d"), *Name, GeoIdx);
+			const FString MIName = FString::Printf(TEXT("MI_%s_%d"), *MeshName, GeoIdx);
 			const FString MIPackageName =
-				FString::Printf(TEXT("/Game/RUDE/Materials/Instances/%s/%s"), *Name, *MIName);
+				FString::Printf(TEXT("/Game/RUDE/Materials/Instances/%s/%s"), *MeshName, *MIName);
 			if (UPackage* MIPackage = CreatePackage(*MIPackageName))
 			{
 				// TRUE edit-in-place (same law as textures): reuse an existing MI on
@@ -1576,6 +1599,98 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"boundTextures\":%d,\"slots\":[%s]}"),
 		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures, *SlotsJson);
+}
+
+// Jenkins one-at-a-time over the LOWERCASED name - RAGE's name hash, pinned to QUARRY's
+// convention (quarry/ngcrypto.py joaat: lowercase input; the unresolvable-name fallback is
+// spelled "hash_%08X", UPPERCASE hex). ymap<->ytyp<->dictionary joins are hash-to-hash, so
+// matching by hash is the join's native form, not a workaround.
+static uint32 RudeJoaat(const FString& Name)
+{
+	uint32 H = 0;
+	for (const TCHAR C : Name)
+	{
+		H += static_cast<uint8>(FChar::ToLower(C));
+		H += H << 10;
+		H ^= H >> 6;
+	}
+	H += H << 3;
+	H ^= H >> 11;
+	H += H << 15;
+	return H;
+}
+
+FString URudeToolset::ImportYddEntry(const FString& XmlPath, const FString& EntryName,
+                                     const FString& DestFolder)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	const FString Entry = EntryName.TrimStartAndEnd();
+	if (Entry.IsEmpty())
+	{
+		return Fail(TEXT("EntryName is empty"));
+	}
+	FXmlFile Xml(XmlPath);
+	if (!Xml.IsValid())
+	{
+		return Fail(FString::Printf(TEXT("XML load failed: %s"), *Xml.GetLastError()));
+	}
+	const FXmlNode* Root = Xml.GetRootNode();
+	if (!Root || Root->GetTag() != TEXT("DrawableDictionary"))
+	{
+		return Fail(TEXT("root is not <DrawableDictionary>"));
+	}
+
+	// Entry match, hash-tolerant BOTH ways (measured corpus 2026-07-28: every sampled ydd
+	// entry <Name> is a hash_%08X spelling; ytyp-side archetype names are hash_ in 72,067 of
+	// 72,074 - so either side of the join may be the unresolved spelling of the other):
+	//   1) plain case-insensitive name equality
+	//   2) the entry is hash_<joaat(EntryName)> - we were given the real name
+	//   3) EntryName is hash_XXXXXXXX and joaat(entry name) matches it - the entry resolved
+	const FString WantHashName = FString::Printf(TEXT("hash_%08X"), RudeJoaat(Entry));
+	uint32 WantHash = 0;
+	bool bEntryIsHashName = false;
+	if (Entry.Len() == 13 && Entry.StartsWith(TEXT("hash_"), ESearchCase::IgnoreCase))
+	{
+		bEntryIsHashName = true;
+		WantHash = static_cast<uint32>(FCString::Strtoui64(*Entry.Mid(5), nullptr, 16));
+	}
+
+	const FXmlNode* Found = nullptr;
+	int32 Entries = 0;
+	FString Available;   // leading entry names for the loud not-found error
+	for (const FXmlNode* Item : Root->GetChildrenNodes())
+	{
+		const FXmlNode* NameN = Item->FindChildNode(TEXT("Name"));
+		const FString ItemName = NameN ? NameN->GetContent().TrimStartAndEnd() : FString();
+		++Entries;
+		if (ItemName.IsEmpty())
+		{
+			continue;
+		}
+		if (Available.Len() < 512)
+		{
+			Available += (Available.IsEmpty() ? TEXT("") : TEXT(", ")) + ItemName;
+		}
+		if (ItemName.Equals(Entry, ESearchCase::IgnoreCase) ||
+		    ItemName.Equals(WantHashName, ESearchCase::IgnoreCase) ||
+		    (bEntryIsHashName && RudeJoaat(ItemName) == WantHash))
+		{
+			Found = Item;
+			break;
+		}
+	}
+	if (!Found)
+	{
+		return Fail(FString::Printf(
+			TEXT("entry '%s' not found in %s (%d entries; also tried %s). Entries here: %s"),
+			*Entry, *FPaths::GetCleanFilename(XmlPath), Entries, *WantHashName, *Available));
+	}
+	// The ENTRY name becomes the asset name - it is the archetype-facing identity; the item's
+	// own <Name> is usually an unresolvable hash_ spelling of the same thing.
+	return ImportDrawableNode(Found, Entry, DestFolder);
 }
 
 // Translucent sea material - a reference surface, deliberately simple (no waves/refraction;
@@ -1971,6 +2086,137 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 		*FilebaseRoot, DlcDirs.Num(), BaseArchives.Num(), Folders, bAll ? TEXT("ALL") : TEXT("CORE"));
 }
 
+// ---- shared corpus resolution (ImportMapArea + ImportMlo) --------------------------------
+// The archetype index and the per-drawable ydr/yft/ydd import lane started life inside
+// ImportMapArea (in-game-proven: downtown 13,135 instances, LOG "FRAGMENT LANE"). ImportMlo
+// needs the SAME resolution for an MLO's interior entities - factored out rather than
+// copied, so the two tools cannot drift. Behavior-preserving extraction, not a rewrite.
+struct FRudeArchetypeIndex
+{
+	TMap<FString, FString> ArchToAsset;   // lowercase archetype name -> lowercase drawable asset
+	TSet<FString> FragmentAssets;         // assets that resolve under yft/ instead of ydr/
+	TMap<FString, FString> DictEntries;   // entry mesh name -> ydd dictionary stem (under ydd/)
+};
+
+// Optional MLO lookup riding the index walk: the walk already parses every ytyp once, and a
+// second whole-corpus scan for one archetype would double the tool's dominant XML cost.
+// Matching is hash-tolerant BOTH ways, the ImportYddEntry convention - MLO archetype names
+// are hash_XXXXXXXX in the corpus whenever the reverse table lacks them (e.g. the trailer
+// interior stores as hash_CB21C865 == joaat("ch3_01_trlr_int")).
+struct FRudeMloSearch
+{
+	FString Wanted;                // caller's spelling
+	FString WantHashName;          // "hash_%08X" of joaat(Wanted)
+	uint32 WantHash = 0;           // parsed hash when Wanted is itself hash_XXXXXXXX
+	bool bWantedIsHashName = false;
+	FString FoundFile;             // absolute path of the declaring ytyp XML
+	FString FoundName;             // the archetype <name> as the corpus stores it
+	int32 MloSeen = 0;             // CMloArchetypeDef items encountered corpus-wide
+	FString Sample;                // leading MLO names for the loud not-found error
+};
+
+static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeIndex& Out,
+                                      FString& Error, FRudeMloSearch* MloSearch)
+{
+	TArray<FString> YtypFiles;
+	IFileManager::Get().FindFiles(YtypFiles, *(CorpusRoot / TEXT("ytyp") / TEXT("*.xml")), true, false);
+	for (const FString& F : YtypFiles)
+	{
+		FXmlFile Xml(CorpusRoot / TEXT("ytyp") / F);
+		if (!Xml.IsValid()) { continue; }
+		const FXmlNode* Root = Xml.GetRootNode();
+		const FXmlNode* Arche = Root ? Root->FindChildNode(TEXT("archetypes")) : nullptr;
+		if (!Arche) { continue; }
+		for (const FXmlNode* Item : Arche->GetChildrenNodes())
+		{
+			// MLO lookup first: MLO archetypes are ASSET_TYPE_ASSETLESS, so the index
+			// gate below skips them and their name must be read here.
+			if (MloSearch && Item->GetAttribute(TEXT("type")) == TEXT("CMloArchetypeDef"))
+			{
+				const FXmlNode* MloN = Item->FindChildNode(TEXT("name"));
+				const FString MloName = MloN ? MloN->GetContent().TrimStartAndEnd() : FString();
+				if (!MloName.IsEmpty())
+				{
+					++MloSearch->MloSeen;
+					if (MloSearch->Sample.Len() < 400)
+					{
+						MloSearch->Sample += FString::Printf(TEXT("%s%s"),
+							MloSearch->Sample.IsEmpty() ? TEXT("") : TEXT(", "), *MloName);
+					}
+					if (MloSearch->FoundFile.IsEmpty() &&
+					    (MloName.Equals(MloSearch->Wanted, ESearchCase::IgnoreCase) ||
+					     MloName.Equals(MloSearch->WantHashName, ESearchCase::IgnoreCase) ||
+					     (MloSearch->bWantedIsHashName && RudeJoaat(MloName) == MloSearch->WantHash)))
+					{
+						MloSearch->FoundFile = CorpusRoot / TEXT("ytyp") / F;
+						MloSearch->FoundName = MloName;
+					}
+				}
+			}
+			const FXmlNode* NameN = Item->FindChildNode(TEXT("name"));
+			const FXmlNode* AssetN = Item->FindChildNode(TEXT("assetName"));
+			const FXmlNode* TypeN = Item->FindChildNode(TEXT("assetType"));
+			if (!NameN || !AssetN) { continue; }
+			// drawable + fragment + drawable-dictionary archetypes resolve (fragments via
+			// QUARRY's yft.xml, visual drawable v1; dictionary archetypes via the ydd
+			// entry-selection lane). A dictionary archetype's mesh is ONE entry inside
+			// <drawableDictionary>'s ydd, and the ARCHETYPE name names that entry
+			// (measured corpus-wide 2026-07-28: 72,074/72,074 dict archetypes carry a
+			// plain dict name and name==assetName; the join to the entry is hash-to-hash).
+			const FString AType = TypeN ? TypeN->GetContent().TrimStartAndEnd() : FString();
+			const bool bDrawableArch = AType.IsEmpty() || AType == TEXT("ASSET_TYPE_DRAWABLE");
+			const bool bFragmentArch = AType == TEXT("ASSET_TYPE_FRAGMENT");
+			const bool bDictArch = AType == TEXT("ASSET_TYPE_DRAWABLEDICTIONARY");
+			if (!bDrawableArch && !bFragmentArch && !bDictArch) { continue; }
+			const FString ArchLower = NameN->GetContent().TrimStartAndEnd().ToLower();
+			if (bDictArch)
+			{
+				const FXmlNode* DictN = Item->FindChildNode(TEXT("drawableDictionary"));
+				const FString Dict = DictN ? DictN->GetContent().TrimStartAndEnd().ToLower() : FString();
+				if (Dict.IsEmpty()) { continue; }   // nothing to resolve against -> proxy cube
+				// the manifest "drawable" stays the ENTRY (=archetype) name, so ImportScene's
+				// name-based mesh lookup works unchanged
+				Out.ArchToAsset.Add(ArchLower, ArchLower);
+				Out.DictEntries.Add(ArchLower, Dict);
+				continue;
+			}
+			const FString AssetLower = AssetN->GetContent().TrimStartAndEnd().ToLower();
+			Out.ArchToAsset.Add(ArchLower, AssetLower);
+			if (bFragmentArch) { Out.FragmentAssets.Add(AssetLower); }
+		}
+	}
+	if (Out.ArchToAsset.Num() == 0)
+	{
+		Error = TEXT("no archetypes indexed - check CorpusRoot/ytyp");
+		return false;
+	}
+	UE_LOG(LogTemp, Display,
+		TEXT("[RUDE] archetype index: %d (fragment %d, dictionary-entry %d)"),
+		Out.ArchToAsset.Num(), Out.FragmentAssets.Num(), Out.DictEntries.Num());
+	return true;
+}
+
+// Resolve ONE indexed drawable to its corpus XML and import it (skip-if-exists) - dictionary
+// entries live INSIDE their dict's ydd XML (one file, many drawables); plain drawables and
+// fragments stay one-file-per-asset under ydr/ and yft/. The skip check runs on the ENTRY
+// mesh name for all three lanes.
+static void ImportIndexedDrawable(const FString& CorpusRoot, const FRudeArchetypeIndex& Index,
+                                  const FString& Drawable, const FString& DestMeshFolder,
+                                  int32& MeshOk, int32& MeshSkip, int32& MeshFail, int32& MeshMissing)
+{
+	const FString* Dict = Index.DictEntries.Find(Drawable);
+	const bool bFrag = !Dict && Index.FragmentAssets.Contains(Drawable);
+	const FString XmlPath = Dict
+		? CorpusRoot / TEXT("ydd") / (*Dict + TEXT(".ydd.xml"))
+		: CorpusRoot / (bFrag ? TEXT("yft") : TEXT("ydr"))
+			/ (Drawable + (bFrag ? TEXT(".yft.xml") : TEXT(".ydr.xml")));
+	if (!FPaths::FileExists(XmlPath)) { ++MeshMissing; return; }
+	if (FPackageName::DoesPackageExist(DestMeshFolder / Drawable)) { ++MeshSkip; return; }
+	const FString R = Dict ? URudeToolset::ImportYddEntry(XmlPath, Drawable, DestMeshFolder)
+	                       : URudeToolset::ImportYdr(XmlPath, DestMeshFolder);
+	if (R.Contains(TEXT("\"ok\":true"))) { ++MeshOk; } else { ++MeshFail; }
+}
+
 FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
                                     const FString& DestMeshFolder, const FString& Filter)
 {
@@ -1979,38 +2225,14 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
 	};
 	// ---- 1) archetype index from every ytyp XML (name -> drawable assetName) ----
-	TMap<FString, FString> ArchToAsset;
-	TSet<FString> FragmentAssets;   // assets that resolve under yft/ instead of ydr/
+	// (factored to BuildCorpusArchetypeIndex, shared with ImportMlo - behavior unchanged)
+	FRudeArchetypeIndex Index;
 	{
-		TArray<FString> YtypFiles;
-		IFileManager::Get().FindFiles(YtypFiles, *(CorpusRoot / TEXT("ytyp") / TEXT("*.xml")), true, false);
-		for (const FString& F : YtypFiles)
+		FString IndexErr;
+		if (!BuildCorpusArchetypeIndex(CorpusRoot, Index, IndexErr, /*MloSearch*/ nullptr))
 		{
-			FXmlFile Xml(CorpusRoot / TEXT("ytyp") / F);
-			if (!Xml.IsValid()) { continue; }
-			const FXmlNode* Root = Xml.GetRootNode();
-			const FXmlNode* Arche = Root ? Root->FindChildNode(TEXT("archetypes")) : nullptr;
-			if (!Arche) { continue; }
-			for (const FXmlNode* Item : Arche->GetChildrenNodes())
-			{
-				const FXmlNode* NameN = Item->FindChildNode(TEXT("name"));
-				const FXmlNode* AssetN = Item->FindChildNode(TEXT("assetName"));
-				const FXmlNode* TypeN = Item->FindChildNode(TEXT("assetType"));
-				if (!NameN || !AssetN) { continue; }
-				// drawable + fragment archetypes resolve (fragments via QUARRY's yft.xml, visual
-				// drawable v1). ydd-dictionary archetypes stay proxy cubes until the
-				// entry-selection lane exists - a dictionary XML holds MANY drawables and the
-				// importer has no way to pick one yet.
-				const FString AType = TypeN ? TypeN->GetContent().TrimStartAndEnd() : FString();
-				const bool bDrawableArch = AType.IsEmpty() || AType == TEXT("ASSET_TYPE_DRAWABLE");
-				const bool bFragmentArch = AType == TEXT("ASSET_TYPE_FRAGMENT");
-				if (!bDrawableArch && !bFragmentArch) { continue; }
-				const FString AssetLower = AssetN->GetContent().TrimStartAndEnd().ToLower();
-				ArchToAsset.Add(NameN->GetContent().TrimStartAndEnd().ToLower(), AssetLower);
-				if (bFragmentArch) { FragmentAssets.Add(AssetLower); }
-			}
+			return Fail(IndexErr);
 		}
-		if (ArchToAsset.Num() == 0) { return Fail(TEXT("no archetypes indexed - check CorpusRoot/ytyp")); }
 	}
 	// ---- 2) parse ymaps -> manifest scenes (IMPORT-lane transforms: pos Y-mirror*100,
 	// quat = (x,-y,z,w) - the boardwalk-anchored map, NOT the export involution) ----
@@ -2074,7 +2296,7 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 			};
 			const FXmlNode* LodN = E->FindChildNode(TEXT("lodLevel"));
 			const FString Lod = LodN ? LodN->GetContent().TrimStartAndEnd() : FString();
-			const FString* Asset = ArchToAsset.Find(Arch);
+			const FString* Asset = Index.ArchToAsset.Find(Arch);
 			++TotalEnts; ++SceneEnts;
 			if (Asset) { ++Resolved; NeededDrawables.Add(*Asset); }
 			EntJson += FString::Printf(TEXT(
@@ -2102,17 +2324,13 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 		return Fail(TEXT("failed to write area manifest"));
 	}
 	// ---- 3) import every referenced drawable present in the corpus (skip-if-exists) ----
-	int32 MeshOk = 0, MeshSkip = 0, MeshFail = 0, MeshMissing = 0, Done = 0;
+	// (per-drawable lane selection factored to ImportIndexedDrawable, shared with ImportMlo)
+	int32 MeshOk = 0, MeshSkip = 0, MeshFail = 0, MeshMissing = 0, Done = 0, DictNeeded = 0;
 	for (const FString& D : NeededDrawables)
 	{
 		++Done;
-		const bool bFrag = FragmentAssets.Contains(D);
-		const FString YdrPath = CorpusRoot / (bFrag ? TEXT("yft") : TEXT("ydr"))
-			/ (D + (bFrag ? TEXT(".yft.xml") : TEXT(".ydr.xml")));
-		if (!FPaths::FileExists(YdrPath)) { ++MeshMissing; continue; }
-		if (FPackageName::DoesPackageExist(DestMeshFolder / D)) { ++MeshSkip; continue; }
-		const FString R = ImportYdr(YdrPath, DestMeshFolder);
-		if (R.Contains(TEXT("\"ok\":true"))) { ++MeshOk; } else { ++MeshFail; }
+		if (Index.DictEntries.Contains(D)) { ++DictNeeded; }
+		ImportIndexedDrawable(CorpusRoot, Index, D, DestMeshFolder, MeshOk, MeshSkip, MeshFail, MeshMissing);
 		if (Done % 100 == 0)
 		{
 			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportMapArea meshes %d/%d (ok %d, skip %d, fail %d)"),
@@ -2123,6 +2341,9 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
 		}
 	}
+	UE_LOG(LogTemp, Display,
+		TEXT("[RUDE] ImportMapArea dictionary-entry drawables: %d of %d needed (ok %d, skip %d, fail %d, missing %d overall)"),
+		DictNeeded, NeededDrawables.Num(), MeshOk, MeshSkip, MeshFail, MeshMissing);
 	// ---- 4) spawn through the proven ImportScene path ----
 	const FString Spawn = ImportScene(ManifestPath, DestMeshFolder, Filter);
 	return FString::Printf(TEXT(
@@ -2219,6 +2440,581 @@ FString URudeToolset::ImportArea(const FString& AreaName, const FString& Catalog
 			*Want, Substrings));
 	}
 	return Fail(FString::Printf(TEXT("unknown area '%s' - run with an empty AreaName to list them"), *Want));
+}
+
+// One tunable, deliberately named: no measured RAGE->UE photometric law exists (LOG
+// "EXTENSIONS DECODED" carries the LIGHT FIELDS, not their units). RAGE MLO intensities
+// cluster ~1-20; read directly as candela those are invisible, so v1 scales them into a
+// plausible domestic range (a "5" bulb -> 500 cd). 🧠 AGENT CALL, UNCALIBRATED - Matt's
+// eyes tune this one constant; nothing else in the importer encodes brightness.
+static const float RudeMloLightCandelaScale = 100.f;
+
+FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArchetypeName,
+                                const FString& DestMeshFolder, const FString& Filter)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	const FString Wanted = MloArchetypeName.TrimStartAndEnd();
+	if (Wanted.IsEmpty()) { return Fail(TEXT("MloArchetypeName is empty")); }
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+
+	// ---- 1) ONE corpus walk: archetype index (resolves the interior's entities) + MLO
+	// lookup riding it (hash-tolerant both ways - see FRudeMloSearch) ----
+	FRudeMloSearch Search;
+	Search.Wanted = Wanted;
+	Search.WantHashName = FString::Printf(TEXT("hash_%08X"), RudeJoaat(Wanted));
+	if (Wanted.Len() == 13 && Wanted.StartsWith(TEXT("hash_"), ESearchCase::IgnoreCase))
+	{
+		Search.bWantedIsHashName = true;
+		Search.WantHash = static_cast<uint32>(FCString::Strtoui64(*Wanted.Mid(5), nullptr, 16));
+	}
+	FRudeArchetypeIndex Index;
+	{
+		FString IndexErr;
+		if (!BuildCorpusArchetypeIndex(CorpusRoot, Index, IndexErr, &Search))
+		{
+			return Fail(IndexErr);
+		}
+	}
+	if (Search.FoundFile.IsEmpty())
+	{
+		return Fail(FString::Printf(
+			TEXT("MLO archetype '%s' not found (also tried %s) among %d MLO archetypes under %s. Leading names: %s"),
+			*Wanted, *Search.WantHashName, Search.MloSeen, *(CorpusRoot / TEXT("ytyp")), *Search.Sample));
+	}
+
+	// ---- 2) parse the declaring ytyp's MLO node ----
+	FXmlFile Xml(Search.FoundFile);
+	if (!Xml.IsValid())
+	{
+		return Fail(FString::Printf(TEXT("XML load failed: %s"), *Xml.GetLastError()));
+	}
+	const FXmlNode* Root = Xml.GetRootNode();
+	const FXmlNode* Arche = Root ? Root->FindChildNode(TEXT("archetypes")) : nullptr;
+	const FXmlNode* Mlo = nullptr;
+	if (Arche)
+	{
+		for (const FXmlNode* Item : Arche->GetChildrenNodes())
+		{
+			if (Item->GetAttribute(TEXT("type")) != TEXT("CMloArchetypeDef")) { continue; }
+			const FXmlNode* N = Item->FindChildNode(TEXT("name"));
+			if (N && N->GetContent().TrimStartAndEnd().Equals(Search.FoundName, ESearchCase::IgnoreCase))
+			{
+				Mlo = Item;
+				break;
+			}
+		}
+	}
+	if (!Mlo)
+	{
+		return Fail(FString::Printf(TEXT("re-parse lost archetype '%s' in %s - file changed mid-run?"),
+			*Search.FoundName, *FPaths::GetCleanFilename(Search.FoundFile)));
+	}
+
+	// "x y z" space-separated element CONTENT (posn/direction/extents/attachedObjects use the
+	// scalar-list rendering: <=10 values inline, 11+ wrapped ten-per-line - so ALWAYS
+	// whitespace-parse the whole content, never split on newlines; the FXmlFile line-structure
+	// lesson from the vertex parser applies here too).
+	auto Vec3Content = [](const FXmlNode* N, FVector& Out) -> bool
+	{
+		if (!N) { return false; }
+		TArray<FString> T;
+		N->GetContent().ParseIntoArrayWS(T);
+		if (T.Num() < 3) { return false; }
+		Out = FVector(FCString::Atod(*T[0]), FCString::Atod(*T[1]), FCString::Atod(*T[2]));
+		return true;
+	};
+	auto Val = [](const FXmlNode* P, const TCHAR* Tag, double Def) -> double
+	{
+		const FXmlNode* N = P->FindChildNode(Tag);
+		return N ? FCString::Atod(*N->GetAttribute(TEXT("value"))) : Def;
+	};
+
+	// CLightAttrDef fields the importer consumes; everything else the emitter carries
+	// (flags/timeFlags/corona*/vol*/shadow*/cullingPlane/projectedTextureKey/tangent/
+	// falloffExponent) is deliberately NOT mapped - see the header comment for why each.
+	struct FMloLight
+	{
+		FVector LocalPos = FVector::ZeroVector;   // UE cm, entity-local (posn + offsetPosition)
+		FVector LocalDir = FVector(0, 0, -1);     // UE, entity-local
+		FLinearColor Color = FLinearColor::White;
+		float Intensity = 0.f;
+		float Falloff = 0.f;                      // GTA metres
+		float ConeInner = 0.f, ConeOuter = 0.f;   // degrees (half-angles)
+		int32 Type = -1;                          // 1 point / 2 spot / 4 capsule (observed set)
+		float ExtentX = 0.f;                      // capsule length (metres)
+	};
+	struct FMloEntity
+	{
+		FString ArchLower;
+		FTransform Xf;          // MLO-LOCAL, UE space (import-lane transform)
+		int32 Room = -1;        // index into Rooms (from rooms' attachedObjects)
+		int32 Portal = -1;      // index into Portals (doors attach to portals, not rooms)
+		TArray<FMloLight> Lights;
+	};
+	TArray<FMloEntity> Ents;
+	int32 OtherExtensions = 0, LightsSkipped = 0;
+	FString LightProblem;
+
+	if (const FXmlNode* EntsN = Mlo->FindChildNode(TEXT("entities")))
+	{
+		for (const FXmlNode* E : EntsN->GetChildrenNodes())
+		{
+			const FXmlNode* AN = E->FindChildNode(TEXT("archetypeName"));
+			const FXmlNode* Pos = E->FindChildNode(TEXT("position"));
+			if (!AN || !Pos) { continue; }
+			FMloEntity Ent;
+			Ent.ArchLower = AN->GetContent().TrimStartAndEnd().ToLower();
+			// MLO-LOCAL transform through the pinned IMPORT-lane convention (pos Y-mirror*100,
+			// quat = (x,-y,z,w)) - identical to ImportMapArea's manifest transforms, so a later
+			// Build Interior can place the whole root at a CMloInstanceDef world transform
+			// without touching the entities.
+			const double Px = FCString::Atod(*Pos->GetAttribute(TEXT("x")));
+			const double Py = FCString::Atod(*Pos->GetAttribute(TEXT("y")));
+			const double Pz = FCString::Atod(*Pos->GetAttribute(TEXT("z")));
+			double Qx = 0, Qy = 0, Qz = 0, Qw = 1;
+			if (const FXmlNode* Rot = E->FindChildNode(TEXT("rotation")))
+			{
+				Qx = FCString::Atod(*Rot->GetAttribute(TEXT("x")));
+				Qy = FCString::Atod(*Rot->GetAttribute(TEXT("y")));
+				Qz = FCString::Atod(*Rot->GetAttribute(TEXT("z")));
+				Qw = FCString::Atod(*Rot->GetAttribute(TEXT("w")));
+			}
+			FQuat Q(Qx, -Qy, Qz, Qw);
+			Q.Normalize();
+			Ent.Xf = FTransform(Q, FVector(Px * 100.0, -Py * 100.0, Pz * 100.0),
+				FVector(Val(E, TEXT("scaleXY"), 1.0), Val(E, TEXT("scaleXY"), 1.0), Val(E, TEXT("scaleZ"), 1.0)));
+
+			// per-entity extensions: consume CExtensionDefLightEffect instances; COUNT the
+			// rest (doors/spawn points/particles...) so the verdict says what v1 left behind.
+			if (const FXmlNode* Ext = E->FindChildNode(TEXT("extensions")))
+			{
+				for (const FXmlNode* X : Ext->GetChildrenNodes())
+				{
+					if (X->GetAttribute(TEXT("type")) != TEXT("CExtensionDefLightEffect"))
+					{
+						++OtherExtensions;
+						continue;
+					}
+					FVector Off(0, 0, 0);
+					if (const FXmlNode* O = X->FindChildNode(TEXT("offsetPosition")))
+					{
+						Off = FVector(FCString::Atod(*O->GetAttribute(TEXT("x"))),
+						              FCString::Atod(*O->GetAttribute(TEXT("y"))),
+						              FCString::Atod(*O->GetAttribute(TEXT("z"))));
+					}
+					const FXmlNode* Inst = X->FindChildNode(TEXT("instances"));
+					if (!Inst) { continue; }
+					for (const FXmlNode* L : Inst->GetChildrenNodes())
+					{
+						FVector P, D;
+						TArray<FString> ColT;
+						if (const FXmlNode* C = L->FindChildNode(TEXT("colour")))
+						{
+							C->GetContent().ParseIntoArrayWS(ColT);
+						}
+						if (!Vec3Content(L->FindChildNode(TEXT("posn")), P) ||
+						    !Vec3Content(L->FindChildNode(TEXT("direction")), D) || ColT.Num() < 3)
+						{
+							// The emitter has NO silent defaults (LOG "MLO EMISSION"), so a
+							// missing field here means corrupt input - count it, name the first.
+							++LightsSkipped;
+							if (LightProblem.IsEmpty())
+							{
+								LightProblem = FString::Printf(
+									TEXT("entity %d: light instance missing posn/colour/direction"), Ents.Num());
+							}
+							continue;
+						}
+						FMloLight ML;
+						ML.LocalPos = FVector((P.X + Off.X) * 100.0, -(P.Y + Off.Y) * 100.0, (P.Z + Off.Z) * 100.0);
+						ML.LocalDir = FVector(D.X, -D.Y, D.Z);   // same Y-mirror as every import-lane vector
+						ML.Color = FLinearColor(
+							FCString::Atof(*ColT[0]) / 255.f,
+							FCString::Atof(*ColT[1]) / 255.f,
+							FCString::Atof(*ColT[2]) / 255.f);
+						ML.Intensity = (float)Val(L, TEXT("intensity"), 0.0);
+						ML.Falloff = (float)Val(L, TEXT("falloff"), 0.0);
+						ML.ConeInner = (float)Val(L, TEXT("coneInnerAngle"), 0.0);
+						ML.ConeOuter = (float)Val(L, TEXT("coneOuterAngle"), 0.0);
+						ML.Type = (int32)Val(L, TEXT("lightType"), -1.0);
+						FVector Ex(0, 0, 0);
+						Vec3Content(L->FindChildNode(TEXT("extents")), Ex);
+						ML.ExtentX = (float)Ex.X;
+						Ent.Lights.Add(ML);
+					}
+				}
+			}
+			Ents.Add(MoveTemp(Ent));
+		}
+	}
+
+	// rooms + portals: membership comes from their attachedObjects index lists (0-based into
+	// <entities>; oracle-proven in-range corpus-wide, so an out-of-range index is corrupt
+	// input - counted loudly, never clamped).
+	struct FMloRoom { FString Name; FString NameLower; };
+	struct FMloPortal { int32 From = -1; int32 To = -1; };
+	TArray<FMloRoom> Rooms;
+	TArray<FMloPortal> Portals;
+	int32 BadRefs = 0;
+	if (const FXmlNode* RoomsN = Mlo->FindChildNode(TEXT("rooms")))
+	{
+		for (const FXmlNode* R : RoomsN->GetChildrenNodes())
+		{
+			FMloRoom Room;
+			if (const FXmlNode* N = R->FindChildNode(TEXT("name")))
+			{
+				Room.Name = N->GetContent().TrimStartAndEnd();
+			}
+			Room.NameLower = Room.Name.ToLower();
+			const int32 RoomIdx = Rooms.Add(Room);
+			if (const FXmlNode* AO = R->FindChildNode(TEXT("attachedObjects")))
+			{
+				TArray<FString> T;
+				AO->GetContent().ParseIntoArrayWS(T);
+				for (const FString& S : T)
+				{
+					const int32 EIdx = FCString::Atoi(*S);
+					if (Ents.IsValidIndex(EIdx)) { Ents[EIdx].Room = RoomIdx; }
+					else { ++BadRefs; }
+				}
+			}
+		}
+	}
+	if (const FXmlNode* PortalsN = Mlo->FindChildNode(TEXT("portals")))
+	{
+		for (const FXmlNode* P : PortalsN->GetChildrenNodes())
+		{
+			FMloPortal Portal;
+			Portal.From = (int32)Val(P, TEXT("roomFrom"), -1.0);
+			Portal.To = (int32)Val(P, TEXT("roomTo"), -1.0);
+			const int32 PortalIdx = Portals.Add(Portal);
+			if (const FXmlNode* AO = P->FindChildNode(TEXT("attachedObjects")))
+			{
+				TArray<FString> T;
+				AO->GetContent().ParseIntoArrayWS(T);
+				for (const FString& S : T)
+				{
+					const int32 EIdx = FCString::Atoi(*S);
+					if (Ents.IsValidIndex(EIdx)) { Ents[EIdx].Portal = PortalIdx; }
+					else { ++BadRefs; }
+				}
+			}
+		}
+	}
+	// entity sets: SUMMARIZED, not spawned (v1) - they are optional overlays the game toggles
+	// at runtime (LOG "MLO INTERIORS"), so spawning them all would misrepresent the interior.
+	FString SetsJson;
+	int32 NumSets = 0;
+	if (const FXmlNode* Sets = Mlo->FindChildNode(TEXT("entitySets")))
+	{
+		for (const FXmlNode* S : Sets->GetChildrenNodes())
+		{
+			const FXmlNode* SN = S->FindChildNode(TEXT("name"));
+			const FXmlNode* SE = S->FindChildNode(TEXT("entities"));
+			SetsJson += FString::Printf(TEXT("%s{\"name\":\"%s\",\"entities\":%d}"),
+				NumSets ? TEXT(",") : TEXT(""),
+				SN ? *SN->GetContent().TrimStartAndEnd() : TEXT(""),
+				SE ? SE->GetChildrenNodes().Num() : 0);
+			++NumSets;
+		}
+	}
+
+	// ---- Filter = ROOM-name list (🧠 agent's design; see header comment) ----
+	TSet<FString> RoomFilter;
+	{
+		const FString F = Filter.TrimStartAndEnd();
+		if (!F.IsEmpty() && !F.Equals(TEXT("ALL"), ESearchCase::IgnoreCase))
+		{
+			TArray<FString> Toks;
+			F.ParseIntoArray(Toks, TEXT(","), true);
+			for (FString T : Toks)
+			{
+				T.TrimStartAndEndInline();
+				if (!T.IsEmpty()) { RoomFilter.Add(T.ToLower()); }
+			}
+		}
+	}
+	FString RoomNamesJson, RoomNamesPlain;
+	for (int32 i = 0; i < Rooms.Num(); ++i)
+	{
+		RoomNamesJson += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(",") : TEXT(""), *Rooms[i].Name);
+		RoomNamesPlain += FString::Printf(TEXT("%s%s"), i ? TEXT(", ") : TEXT(""), *Rooms[i].Name);
+	}
+	for (const FString& Tok : RoomFilter)
+	{
+		bool bKnown = false;
+		for (const FMloRoom& R : Rooms)
+		{
+			if (R.NameLower == Tok) { bKnown = true; break; }
+		}
+		if (!bKnown)
+		{
+			return Fail(FString::Printf(TEXT("Filter room '%s' is not a room of %s - rooms here: %s"),
+				*Tok, *Search.FoundName, *RoomNamesPlain));
+		}
+	}
+	auto RoomPasses = [&](int32 RoomIdx) -> bool
+	{
+		return RoomFilter.IsEmpty() ||
+			(Rooms.IsValidIndex(RoomIdx) && RoomFilter.Contains(Rooms[RoomIdx].NameLower));
+	};
+	auto Passes = [&](const FMloEntity& E) -> bool
+	{
+		if (E.Room >= 0) { return RoomPasses(E.Room); }
+		if (Portals.IsValidIndex(E.Portal))
+		{
+			// a door belongs to BOTH sides of its portal - it spawns when either room does
+			return RoomPasses(Portals[E.Portal].From) || RoomPasses(Portals[E.Portal].To);
+		}
+		return RoomFilter.IsEmpty();
+	};
+	int32 Unroomed = 0;
+	for (const FMloEntity& E : Ents)
+	{
+		if (E.Room < 0 && E.Portal < 0) { ++Unroomed; }
+	}
+
+	// ---- 3) import every referenced drawable present in the corpus (skip-if-exists;
+	// the exact ydr/yft/ydd lane ImportMapArea proved, via the shared helper) ----
+	TSet<FString> Needed;
+	for (const FMloEntity& E : Ents)
+	{
+		if (!Passes(E)) { continue; }
+		if (const FString* Asset = Index.ArchToAsset.Find(E.ArchLower)) { Needed.Add(*Asset); }
+	}
+	int32 MeshOk = 0, MeshSkip = 0, MeshFail = 0, MeshMissing = 0, Done = 0;
+	for (const FString& D : Needed)
+	{
+		++Done;
+		ImportIndexedDrawable(CorpusRoot, Index, D, DestMeshFolder, MeshOk, MeshSkip, MeshFail, MeshMissing);
+		if (Done % 100 == 0)
+		{
+			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportMlo meshes %d/%d (ok %d, skip %d, fail %d)"),
+				Done, Needed.Num(), MeshOk, MeshSkip, MeshFail);
+			// KEEPFLAGS (= RF_Standalone in editor), NEVER RF_NoFlags - a no-keep GC deletes
+			// the unsaved meshes this very run imported (the GC-sweep law).
+			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+		}
+	}
+
+	// ---- 4) spawn: rooms' entities at MLO-LOCAL transforms, root at the WORLD ORIGIN ----
+	// Idempotent respawn is per-ARCHETYPE and clear-by-TAG (🧠 agent's call): OFPA can rewrite
+	// folder paths (BUILD_AREA_DESIGN R12), and a folder clear would also kill OTHER imported
+	// interiors. Every actor of this interior carries IdTag, so root + room actors all die
+	// here even though DestroyActor does not cascade to attached children.
+	const FName IdTag(*(TEXT("RUDE_MLO:") + Search.FoundName));
+	{
+		TArray<AActor*> Stale;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			if (It->Tags.Contains(IdTag)) { Stale.Add(*It); }
+		}
+		for (AActor* A : Stale) { World->DestroyActor(A); }
+	}
+	// Outliner label prefers the caller's REAL spelling when the corpus stores only the hash
+	// (labels are cosmetic; TAGS carry the corpus spelling as the deterministic identity).
+	const FString Label = (Search.FoundName.StartsWith(TEXT("hash_")) && !Search.bWantedIsHashName)
+		? Wanted : Search.FoundName;
+
+	AActor* RootActor = World->SpawnActor<AActor>();
+	if (!RootActor) { return Fail(TEXT("root actor spawn failed")); }
+	{
+		USceneComponent* RootComp = NewObject<USceneComponent>(RootActor, TEXT("Root"));
+		RootActor->SetRootComponent(RootComp);
+		RootComp->SetMobility(EComponentMobility::Static);
+		RootComp->RegisterComponent();
+		RootActor->AddInstanceComponent(RootComp);
+		RootActor->SetActorLabel(TEXT("MLO_") + Label);
+		RootActor->SetFolderPath(FName(TEXT("RUDE_MLO")));
+		RootActor->Tags.Add(IdTag);
+		RootActor->Tags.Add(FName(TEXT("RUDE_MLO_ROOT")));
+	}
+
+	// One actor per room (plus a portal-doors bucket and an unroomed bucket when needed),
+	// attached under the root; inside each, the proven ImportScene ISM pattern - one
+	// InstancedStaticMeshComponent per unique drawable, proxy cubes for corpus holes.
+	struct FBucket
+	{
+		AActor* Actor = nullptr;
+		USceneComponent* Root = nullptr;
+		TMap<FString, UInstancedStaticMeshComponent*> IsmByMesh;
+		int32 NumLights = 0;
+	};
+	TMap<int32, FBucket> Buckets;   // room index; -2 = portal-attached, -3 = unroomed
+	auto GetBucket = [&](int32 Key) -> FBucket*
+	{
+		if (FBucket* B = Buckets.Find(Key)) { return B; }
+		AActor* A = World->SpawnActor<AActor>();
+		if (!A) { return nullptr; }
+		USceneComponent* R = NewObject<USceneComponent>(A, TEXT("Root"));
+		A->SetRootComponent(R);
+		R->SetMobility(EComponentMobility::Static);
+		R->RegisterComponent();
+		A->AddInstanceComponent(R);
+		const FString Suffix = (Key >= 0) ? Rooms[Key].Name
+			: FString(Key == -2 ? TEXT("portalDoors") : TEXT("unroomed"));
+		A->SetActorLabel(Label + TEXT("_") + Suffix);
+		A->SetFolderPath(FName(TEXT("RUDE_MLO")));
+		A->Tags.Add(IdTag);
+		A->Tags.Add((Key >= 0) ? FName(*(TEXT("RUDE_MLO_Room:") + Rooms[Key].Name))
+			: FName(Key == -2 ? TEXT("RUDE_MLO_Portal") : TEXT("RUDE_MLO_Room:(none)")));
+		A->AttachToActor(RootActor, FAttachmentTransformRules::KeepWorldTransform);
+		return &Buckets.Add(Key, FBucket{ A, R });
+	};
+	auto GetBucketIsm = [&](int32 Key, const FString& MeshKey, UStaticMesh* Mesh)
+		-> UInstancedStaticMeshComponent*
+	{
+		FBucket* B = GetBucket(Key);
+		if (!B) { return nullptr; }
+		if (UInstancedStaticMeshComponent** Found = B->IsmByMesh.Find(MeshKey)) { return *Found; }
+		UInstancedStaticMeshComponent* Ism = NewObject<UInstancedStaticMeshComponent>(
+			B->Actor, FName(*FString::Printf(TEXT("ISM_%d"), B->IsmByMesh.Num())));
+		Ism->SetStaticMesh(Mesh);
+		Ism->SetMobility(EComponentMobility::Static);
+		Ism->SetupAttachment(B->Root);
+		Ism->RegisterComponent();
+		B->Actor->AddInstanceComponent(Ism);
+		B->IsmByMesh.Add(MeshKey, Ism);
+		return Ism;
+	};
+
+	UStaticMesh* ProxyCube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	TMap<FString, UStaticMesh*> MeshCache;   // lowercase drawable -> mesh (nullptr = known-missing)
+	int32 Spawned = 0, Proxies = 0, NumLights = 0, Unresolved = 0;
+	for (int32 i = 0; i < Ents.Num(); ++i)
+	{
+		const FMloEntity& E = Ents[i];
+		if (!Passes(E)) { continue; }
+		const int32 Key = (E.Room >= 0) ? E.Room : (E.Portal >= 0 ? -2 : -3);
+
+		const FString* Asset = Index.ArchToAsset.Find(E.ArchLower);
+		UStaticMesh* Mesh = nullptr;
+		if (Asset)
+		{
+			if (UStaticMesh** Cached = MeshCache.Find(*Asset)) { Mesh = *Cached; }
+			else
+			{
+				Mesh = LoadObject<UStaticMesh>(nullptr, *(DestMeshFolder / *Asset));
+				MeshCache.Add(*Asset, Mesh);
+			}
+		}
+		else { ++Unresolved; }
+		if (Mesh)
+		{
+			if (UInstancedStaticMeshComponent* Ism = GetBucketIsm(Key, *Asset, Mesh))
+			{
+				Ism->AddInstance(E.Xf, /*bWorldSpace*/ true);
+				++Spawned;
+			}
+		}
+		else if (ProxyCube)
+		{
+			if (UInstancedStaticMeshComponent* Ism = GetBucketIsm(Key, TEXT("proxy"), ProxyCube))
+			{
+				Ism->AddInstance(E.Xf, /*bWorldSpace*/ true);
+				++Proxies;
+			}
+		}
+
+		// lights: one component per CLightAttrDef instance, on the entity's room actor
+		for (const FMloLight& L : E.Lights)
+		{
+			FBucket* B = GetBucket(Key);
+			if (!B) { continue; }
+			ULocalLightComponent* LC = nullptr;
+			if (L.Type == 2)
+			{
+				USpotLightComponent* Spot = NewObject<USpotLightComponent>(B->Actor,
+					FName(*FString::Printf(TEXT("Light_%d_%d"), i, B->NumLights)));
+				// RAGE cone angles are half-angle degrees like UE's; UE's outer cone tops out
+				// at 80, so RAGE's 90-degree hemisphere washes clamp (documented narrowing).
+				Spot->SetOuterConeAngle(FMath::Clamp(L.ConeOuter, 1.f, 80.f));
+				Spot->SetInnerConeAngle(FMath::Clamp(L.ConeInner, 0.f, Spot->OuterConeAngle));
+				LC = Spot;
+			}
+			else if (L.Type == 1 || L.Type == 4)
+			{
+				UPointLightComponent* Pt = NewObject<UPointLightComponent>(B->Actor,
+					FName(*FString::Printf(TEXT("Light_%d_%d"), i, B->NumLights)));
+				if (L.Type == 4)
+				{
+					// capsule: a line emitter along `direction` - UE's point light expresses
+					// exactly that as SourceLength (extents.x carries the length, measured on
+					// the corpus tube lights).
+					Pt->SetSourceLength(FMath::Max(0.f, L.ExtentX) * 100.f);
+				}
+				LC = Pt;
+			}
+			else
+			{
+				// only 1/2/4 are observed in the resolved corpus - an unknown type is refused
+				// loudly per light, never guessed into some default shape
+				++LightsSkipped;
+				if (LightProblem.IsEmpty())
+				{
+					LightProblem = FString::Printf(
+						TEXT("entity %d: lightType %d has no derived mapping (observed set: 1 point / 2 spot / 4 capsule)"),
+						i, L.Type);
+				}
+				continue;
+			}
+			// Movable, not Static: the imported content has no lightmap-UV story, so the whole
+			// RUDE lighting model is dynamic-only (BUILD_AREA_DESIGN section 4) - a Static light
+			// here would render as unbuilt preview forever.
+			LC->SetMobility(EComponentMobility::Movable);
+			LC->SetupAttachment(B->Root);
+			LC->RegisterComponent();
+			B->Actor->AddInstanceComponent(LC);
+			LC->SetLightColor(L.Color);
+			LC->SetIntensityUnits(ELightUnits::Candelas);
+			LC->SetIntensity(L.Intensity * RudeMloLightCandelaScale);
+			LC->SetAttenuationRadius(FMath::Max(10.f, L.Falloff * 100.f));   // falloff metres -> cm
+			const FVector WPos = E.Xf.TransformPosition(L.LocalPos);
+			FRotator WRot = FRotator::ZeroRotator;
+			const FVector WDir = E.Xf.TransformVectorNoScale(L.LocalDir);
+			if (!WDir.IsNearlyZero())
+			{
+				WRot = FRotationMatrix::MakeFromX(WDir.GetSafeNormal()).Rotator();
+			}
+			LC->SetWorldLocationAndRotation(WPos, WRot);
+			++B->NumLights;
+			++NumLights;
+		}
+	}
+	World->MarkPackageDirty();
+
+	// portal summary: room names when the indices resolve, raw indices otherwise
+	auto RoomLabel = [&Rooms](int32 Idx) -> FString
+	{
+		return Rooms.IsValidIndex(Idx) ? Rooms[Idx].Name : FString::FromInt(Idx);
+	};
+	FString PortalsJson;
+	for (int32 i = 0; i < Portals.Num(); ++i)
+	{
+		PortalsJson += FString::Printf(TEXT("%s\"%s->%s\""), i ? TEXT(",") : TEXT(""),
+			*RoomLabel(Portals[i].From), *RoomLabel(Portals[i].To));
+	}
+	const FString LightProblemJson = LightProblem.IsEmpty()
+		? FString()
+		: FString::Printf(TEXT("\"lightProblem\":\"%s\","), *LightProblem);
+	return FString::Printf(TEXT(
+		"{\"ok\":true,\"archetype\":\"%s\",\"requested\":\"%s\",\"ytyp\":\"%s\","
+		"\"rooms\":%d,\"roomNames\":[%s],\"portals\":%d,\"portalRooms\":[%s],"
+		"\"entitySets\":[%s],\"entities\":%d,\"spawned\":%d,\"proxies\":%d,"
+		"\"unresolvedArchetypes\":%d,\"lights\":%d,\"lightsSkipped\":%d,%s"
+		"\"otherExtensions\":%d,\"badAttachedRefs\":%d,\"unroomedEntities\":%d,"
+		"\"meshesImported\":%d,\"meshesSkipped\":%d,\"meshesFailed\":%d,"
+		"\"meshesMissingFromCorpus\":%d}"),
+		*Search.FoundName, *Wanted, *FPaths::GetCleanFilename(Search.FoundFile),
+		Rooms.Num(), *RoomNamesJson, Portals.Num(), *PortalsJson,
+		*SetsJson, Ents.Num(), Spawned, Proxies,
+		Unresolved, NumLights, LightsSkipped, *LightProblemJson,
+		OtherExtensions, BadRefs, Unroomed,
+		MeshOk, MeshSkip, MeshFail, MeshMissing);
 }
 
 // Ported from the in-game-proven tools/emit_ytyp.py - the archetype flag +
@@ -2478,6 +3274,90 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"imported\":%d,\"skipped\":%d,\"failed\":%d,\"failedFiles\":[%s]}"),
 		Imported, Skipped, Failed, *FailedFiles);
+}
+
+FString URudeToolset::SaveAssets()
+{
+	// ⛔ THE COMPILE-BEFORE-SAVE LAW, ENFORCED HERE (it was documented but wired NOWHERE - the
+	// BUILD_AREA_DESIGN grounded catch): saving while async texture/mesh builds are in flight is
+	// exactly the 381-asset bulkdata corruption incident. Block until every compilation settles,
+	// THEN save. This is the single choke point every agent chain saves through.
+	FAssetCompilingManager::Get().FinishAllCompilation();
+	// Content packages only: FEditorFileUtils::SaveDirtyPackages with bSaveMapPackages=false -
+	// an agent persisting its imports must not silently commit the operator's level edits.
+	const bool bOk = FEditorFileUtils::SaveDirtyPackages(
+		/*bPromptUserToSave*/ false, /*bSaveMapPackages*/ false,
+		/*bSaveContentPackages*/ true, /*bFastSave*/ false,
+		/*bNotifyNoPackagesSaved*/ false, /*bCanBeDeclined*/ false);
+	return FString::Printf(TEXT("{\"ok\":%s}"), bOk ? TEXT("true") : TEXT("false"));
+}
+
+FString URudeToolset::ImportYtdBatch(const FString& ListPath, const FString& DestFolder,
+                                     const FString& Mode)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	TArray<FString> Lines;
+	if (!FFileHelper::LoadFileToStringArray(Lines, *ListPath))
+	{
+		return Fail(TEXT("cannot read list file"));
+	}
+	const bool bForce = Mode.TrimStartAndEnd().Equals(TEXT("FORCE"), ESearchCase::IgnoreCase);
+	int32 Imported = 0, Textures = 0, Skipped = 0, Failed = 0;
+	FString FailedFiles;
+	for (int32 i = 0; i < Lines.Num(); ++i)
+	{
+		const FString Path = Lines[i].TrimStartAndEnd();
+		if (Path.IsEmpty()) { continue; }
+		FString Txd = FPaths::GetBaseFilename(Path);
+		Txd.RemoveFromEnd(TEXT(".ytd"));
+		// The pixel folder is DERIVED: QUARRY writes "<stem>/" beside the XML and resolve
+		// carries the sidecar with the winning copy - the pair is self-describing.
+		const FString PixelFolder = FPaths::GetPath(Path) / Txd;
+		// Skip-if-exists on the txd's CONTENT FOLDER on disk (assets inside are named per
+		// texture, unknowable here). FORCE re-imports in place - the texture-refresh law says
+		// fresh packages, and ImportYtd's own edit-in-place handling owns that concern.
+		const FString ContentDir = FPackageName::LongPackageNameToFilename(DestFolder / Txd, TEXT(""));
+		if (!bForce && IFileManager::Get().DirectoryExists(*ContentDir))
+		{
+			++Skipped;
+			continue;
+		}
+		const FString R = ImportYtd(Path, PixelFolder, DestFolder);
+		if (R.Contains(TEXT("\"ok\":true")))
+		{
+			++Imported;
+			// accumulate the per-txd texture count from the tool's own verdict
+			const int32 At = R.Find(TEXT("\"imported\":"));
+			if (At != INDEX_NONE)
+			{
+				Textures += FCString::Atoi(*R.Mid(At + 11));
+			}
+		}
+		else
+		{
+			++Failed;
+			if (Failed <= 30)
+			{
+				FailedFiles += FString::Printf(TEXT("%s\"%s\""), FailedFiles.IsEmpty() ? TEXT("") : TEXT(","), *Txd);
+			}
+		}
+		if ((i + 1) % 25 == 0)
+		{
+			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportYtdBatch %d/%d (ok %d, skip %d, fail %d, tex %d)"),
+				i + 1, Lines.Num(), Imported, Skipped, Failed, Textures);
+		}
+		if ((i + 1) % 100 == 0)
+		{
+			// Textures are heavy; keep memory flat - KEEPFLAGS, never RF_NoFlags (the GC-sweep law)
+			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+		}
+	}
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"imported\":%d,\"texturesImported\":%d,\"skipped\":%d,\"failed\":%d,\"failedFiles\":[%s]}"),
+		Imported, Textures, Skipped, Failed, *FailedFiles);
 }
 
 FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& MeshFolder,

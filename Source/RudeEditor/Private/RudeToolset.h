@@ -33,6 +33,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring one GTA V model into Unreal as a Static Mesh you can edit."))
 	static FString ImportYdr(const FString& XmlPath, const FString& DestFolder);
 
+	// Import ONE named entry of a ydd XML dictionary (.ydd.xml) as a UStaticMesh asset.
+	// A <DrawableDictionary> holds MANY drawables; EntryName picks one, matched against each
+	// entry's <Name> case-insensitively and by joaat hash BOTH ways (entries are usually named
+	// hash_XXXXXXXX - the lowercase-joaat of the original name, spelled uppercase-hex; the
+	// ymap<->ytyp<->dictionary joins are hash-to-hash). The imported MESH takes EntryName
+	// (the archetype-facing identity), not the entry's own often-unresolvable <Name>.
+	// XmlPath: absolute path to a *.ydd.xml file. DestFolder: content folder for the asset.
+	// Returns ImportYdr's JSON shape; an unknown entry errors loudly, listing what IS there.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring one model out of a GTA V model dictionary file into Unreal as a Static Mesh. Give the name of the entry you want."))
+	static FString ImportYddEntry(const FString& XmlPath, const FString& EntryName,
+	                              const FString& DestFolder);
+
 	// Import a ytd XML manifest (.ytd.xml) as UTexture2D assets with correct
 	// semantics derived from each entry's Usage (NORMAL -> TC_Normalmap + sRGB off,
 	// SPECULAR -> sRGB off, DIFFUSE -> sRGB on).
@@ -133,10 +145,33 @@ public:
 	static FString CreateFilebase(const FString& FilebaseRoot, const FString& GameRoot,
 	                              const FString& Options);
 
+	// Save every dirty CONTENT package (assets - never level/map packages, which stay the
+	// operator's call) without prompting. Exists so an agent-run import chain can persist its
+	// own work: unsaved imports die with the editor, and the texture-refresh law wants the save
+	// to happen AFTER texture compilation settles - ImportYtd already blocks until quiet, so a
+	// chain calling this LAST is law-abiding by construction.
+	// Returns JSON: {ok} (SaveDirtyPackages reports only overall success).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save every changed RUDE asset to disk. Does not touch your level - saving the map stays yours.", RudeAudience="agent"))
+	static FString SaveAssets();
+
+	// Batch ImportYtd: ListPath = a text file of absolute *.ytd.xml paths, one per line.
+	// Each entry's PixelFolder is DERIVED - QUARRY writes the decoded pixels to a sibling
+	// "<stem>/" folder beside the XML (and resolve carries that sidecar with the winning copy),
+	// so the pair is self-describing and no per-file pixel argument exists to get wrong.
+	// Assets land in <DestFolder>/<TxdName>/ via the same path as ImportYtd. A txd whose content
+	// folder already exists on disk is SKIPPED unless Mode is "FORCE" (re-import in place).
+	// Progress goes to the log every 100. Returns JSON:
+	// {ok, imported, texturesImported, skipped, failed, failedFiles:[...first 30]}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring in many GTA V texture sets at once from a list file. Skips sets already imported unless you force it."))
+	static FString ImportYtdBatch(const FString& ListPath, const FString& DestFolder,
+	                              const FString& Mode);
+
 	// THE THREAD-PULL: one call ingests a whole map area from the corpus.
 	// 1) builds an archetype index from every .ytyp XML under <CorpusRoot>/ytyp
 	// 2) parses <CorpusRoot>/ymap/<YmapPrefix>*.xml entities (import-lane transforms)
-	// 3) imports every referenced drawable found under <CorpusRoot>/ydr (skip-if-exists)
+	// 3) imports every referenced drawable (skip-if-exists): plain drawables from
+	//    <CorpusRoot>/ydr, fragments from yft, dictionary entries picked by name
+	//    out of their <CorpusRoot>/ydd file
 	// 4) writes the scene manifest and spawns it via ImportScene (ISM actors,
 	//    idempotent, proxy cubes for corpus holes).
 	// Filter: "HD" (default) or "ALL" lod levels. Textures remain a separate pass
@@ -158,6 +193,42 @@ public:
 	static FString ImportArea(const FString& AreaName, const FString& CatalogPath,
 	                          const FString& CorpusRoot, const FString& DestMeshFolder,
 	                          const FString& Filter);
+
+	// THE INTERIOR IMPORTER (v1) - the consumer for the MLO data QUARRY now emits
+	// (ENGINEERING_LOG "MLO EMISSION" / "EXTENSIONS DECODED"). Locates the named
+	// CMloArchetypeDef across <CorpusRoot>/ytyp/*.xml - name matching is hash-tolerant
+	// BOTH ways, the ImportYddEntry convention (MLO names are usually hash_XXXXXXXX in
+	// the corpus; joaat("ch3_01_trlr_int") == 0xCB21C865 recovers that one, e.g.) -
+	// imports every mesh its entities reference (the ydr/yft/ydd lanes shared with
+	// ImportMapArea), and spawns each room's entities at their MLO-LOCAL transforms
+	// under ONE root actor at the WORLD ORIGIN (outliner folder RUDE_MLO).
+	// V1 SCOPE, deliberate: spawn-into-current-level at origin. Placing the interior at
+	// a ymap CMloInstanceDef world transform and packing it as a Level Instance belong
+	// to Build Interior later - the BUILD_AREA_DESIGN section-5 swap contract is why every
+	// spawned actor is TAGGED: all carry "RUDE_MLO:<archetype>" (the CORPUS spelling -
+	// deterministic identity), room actors add "RUDE_MLO_Room:<roomName>", portal-attached
+	// entities (doors) group under "RUDE_MLO_Portal". Re-running REPLACES this archetype's
+	// actors by tag (clear-by-tag survives OFPA folder rewrites) and touches nothing else.
+	// CLightAttrDef instances become light components, fields mapped honestly:
+	// lightType 1 -> PointLight, 2 -> SpotLight (cone inner/outer, clamped to UE's 80-degree
+	// ceiling), 4 -> PointLight + SourceLength = extents.x (capsule); posn(+offsetPosition)/
+	// colour/intensity/falloff(->attenuation radius)/direction are consumed. NOT mapped, and
+	// why: flags/timeFlags (bit meanings undecoded - LOG), corona*/vol*/shadow*/cullingPlane/
+	// projectedTextureKey/falloffExponent (no proven UE equivalent), tangent (UE derives its
+	// own light frame), boneTag (bone frames don't exist on a static-mesh import, so light
+	// posn is applied ENTITY-local - a fragment whose light bone sits off-origin lands
+	// slightly off). Intensity scale is one named UNCALIBRATED constant (agent's call).
+	// Filter (agent's design, NOT the lod filter of the map tools - interior entities are
+	// near-uniformly ORPHANHD so a lod filter would be a no-op): empty or "ALL" = the whole
+	// interior; else a comma-separated ROOM-name list (case-insensitive) spawns only those
+	// rooms plus their portal doors. Portals and entity sets are SUMMARIZED in the verdict,
+	// not spawned (v1). Returns JSON: {ok, archetype, requested, ytyp, rooms, roomNames,
+	// portals, portalRooms, entitySets, entities, spawned, proxies, unresolvedArchetypes,
+	// lights, lightsSkipped[, lightProblem], otherExtensions, badAttachedRefs,
+	// unroomedEntities, meshesImported, meshesSkipped, meshesFailed, meshesMissingFromCorpus}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build a GTA V interior (MLO) in your open level - rooms, furniture and lights, standing at the world origin. Give the interior's archetype name; optionally list room names to spawn only those rooms."))
+	static FString ImportMlo(const FString& CorpusRoot, const FString& MloArchetypeName,
+	                         const FString& DestMeshFolder, const FString& Filter);
 
 	// Emit a CMapTypes .ytyp (XML, FiveM-Legacy-loadable) defining one
 	// CBaseArchetypeDef per drawable. YdrSpecs: comma-separated
