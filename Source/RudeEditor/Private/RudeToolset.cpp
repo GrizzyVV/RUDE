@@ -2072,7 +2072,10 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 		{
 			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportMapArea meshes %d/%d (ok %d, skip %d, fail %d)"),
 				Done, NeededDrawables.Num(), MeshOk, MeshSkip, MeshFail);
-			CollectGarbage(RF_NoFlags);
+			// KEEPFLAGS (= RF_Standalone in editor), NEVER RF_NoFlags: the meshes just imported are
+			// unsaved and unreferenced until the spawn phase, so a no-keep GC deletes them. RF_NoFlags
+			// here swept 1,600 of 1,667 downtown meshes; only imports after the last GC survived.
+			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
 		}
 	}
 	// ---- 4) spawn through the proven ImportScene path ----
@@ -2334,7 +2337,9 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		}
 		if ((i + 1) % 250 == 0)
 		{
-			CollectGarbage(RF_NoFlags);   // keep editor memory flat on long batches
+			// Keep editor memory flat on long batches - but with KEEPFLAGS (= RF_Standalone in
+			// editor), NEVER RF_NoFlags, which deletes the unsaved meshes this very batch imported.
+			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
 		}
 	}
 	return FString::Printf(
