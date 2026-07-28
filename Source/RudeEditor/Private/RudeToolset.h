@@ -66,7 +66,7 @@ public:
 	// manifest's UE-space values (already through the pinned GTA->UE convention).
 	// Returns JSON: {ok, ymaps, entities, instances, proxies, uniqueMeshes,
 	// missingMeshes, topMissing:[...first 20]}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Place a previously prepared scene into the level you have open."))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Re-place an area you already imported, into the level you have open. Reads the manifest that Build Map Area wrote, so it spawns the objects again WITHOUT re-importing any models."))
 	static FString ImportScene(const FString& ManifestPath, const FString& MeshFolder,
 	                           const FString& Filter);
 
@@ -115,7 +115,7 @@ public:
 	// pack name (e.g. "mpbiker"); leave EMPTY to use the dump folder's own name.
 	// FilebaseRoot: the filebase. Move: "MOVE" (default) or "COPY".
 	// Returns JSON: {ok, source, dest, filed, byType:{...}, skipped}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Sort a folder of exported game files into the right place in your project, by which game version they came from."))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Sort a folder of exported game files into your project. Files go to <slot>/<type>/ - the slot is which game version you say they came from (base, update, or a DLC pack name), the type is the file extension."))
 	static FString IngestExport(const FString& DumpFolder, const FString& SourceName,
 	                            const FString& FilebaseRoot, const FString& Move);
 
@@ -215,7 +215,7 @@ public:
 	// hasEmbeddedBound, shaderCount, models, geometries, vertices, triangles,
 	// indicesOutOfRange, declarations:[...], shaders:[{hash,params,textures}],
 	// detail:[{model, geoCount, countAt0x2e, geoBoundsPairs, geos:[...]}]}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Inspect a GTA V model file and report what is inside it, without importing."))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Inspect a GTA V model file and report its internals as raw JSON, without importing. A diagnostic dump, not a plain answer.", RudeAudience="agent"))
 	static FString ProbeYdrBinary(const FString& BinPath);
 
 	// Export a UStaticMesh's collision directly to a binary FiveM .ybn (RSC7 v43) -
