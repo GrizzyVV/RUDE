@@ -1667,8 +1667,10 @@ FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng)
 		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
 	};
 	TArray<FString> C;
-	CamSpec.ParseIntoArray(C, TEXT(","), true);
-	if (C.Num() != 5) { return Fail(TEXT("CamSpec must be \"x,y,z,pitch,yaw\"")); }
+	// Semicolons are accepted as separators because -ExecCmds splits its command list on
+	// commas - a comma CamSpec cannot survive the launch-argument path at all.
+	CamSpec.Replace(TEXT(";"), TEXT(",")).ParseIntoArray(C, TEXT(","), true);
+	if (C.Num() != 5) { return Fail(TEXT("CamSpec must be \"x,y,z,pitch,yaw\" (or ;-separated)")); }
 	const FVector Loc(FCString::Atod(*C[0]), FCString::Atod(*C[1]), FCString::Atod(*C[2]));
 	const FRotator Rot(FCString::Atod(*C[3]), FCString::Atod(*C[4]), 0.0);
 	for (FLevelEditorViewportClient* VC : GEditor->GetLevelViewportClients())
@@ -2012,8 +2014,29 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	}
 	// ---- 2) parse ymaps -> manifest scenes (IMPORT-lane transforms: pos Y-mirror*100,
 	// quat = (x,-y,z,w) - the boardwalk-anchored map, NOT the export involution) ----
+	// YmapPrefix accepts a COMMA-SEPARATED list of prefixes ("dt1_,dt_additions") so a named
+	// area spanning several families imports as ONE scene (ImportArea builds such lists from the
+	// catalog). An exact basename rides along as "<name>.ymap" - the glob "<name>.ymap*.xml"
+	// matches only that file. Duplicates are unioned.
+	TArray<FString> Prefixes;
+	YmapPrefix.ParseIntoArray(Prefixes, TEXT(","), true);
+	TSet<FString> SeenYmap;
 	TArray<FString> YmapFiles;
-	IFileManager::Get().FindFiles(YmapFiles, *(CorpusRoot / TEXT("ymap") / (YmapPrefix + TEXT("*.xml"))), true, false);
+	for (FString P : Prefixes)
+	{
+		P.TrimStartAndEndInline();
+		if (P.IsEmpty()) { continue; }
+		TArray<FString> Found;
+		IFileManager::Get().FindFiles(Found, *(CorpusRoot / TEXT("ymap") / (P + TEXT("*.xml"))), true, false);
+		for (const FString& F : Found)
+		{
+			// TSet::Add's out-param is bIsAlreadyInSet - true for DUPLICATES, not new adds
+			bool bAlready = false;
+			SeenYmap.Add(F, &bAlready);
+			if (!bAlready) { YmapFiles.Add(F); }
+		}
+	}
+	YmapFiles.Sort();
 	if (YmapFiles.Num() == 0) { return Fail(TEXT("no ymaps match the prefix")); }
 	int32 TotalEnts = 0, Resolved = 0;
 	TSet<FString> NeededDrawables;
@@ -2070,7 +2093,8 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 			ScenesJson.IsEmpty() ? TEXT("") : TEXT(","), *YmapName, *EntJson);
 	}
 	const FString ManifestPath = FPaths::ProjectSavedDir() / TEXT("RUDE") /
-		FString::Printf(TEXT("area_%s_manifest.json"), *YmapPrefix.Replace(TEXT("*"), TEXT("")));
+		FString::Printf(TEXT("area_%s_manifest.json"),
+			*YmapPrefix.Replace(TEXT("*"), TEXT("")).Replace(TEXT(","), TEXT("+")));
 	IFileManager::Get().MakeDirectory(*FPaths::GetPath(ManifestPath), true);
 	if (!FFileHelper::SaveStringToFile(TEXT("[") + ScenesJson + TEXT("]"), *ManifestPath,
 		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
@@ -2107,6 +2131,94 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 		"\"manifest\":\"%s\",\"spawn\":%s}"),
 		YmapFiles.Num(), TotalEnts, Resolved, MeshOk, MeshSkip, MeshFail, MeshMissing,
 		*ManifestPath, *Spawn);
+}
+
+FString URudeToolset::ImportArea(const FString& AreaName, const FString& CatalogPath,
+                                 const FString& CorpusRoot, const FString& DestMeshFolder,
+                                 const FString& Filter)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	FString Raw;
+	if (!FFileHelper::LoadFileToString(Raw, *CatalogPath))
+	{
+		return Fail(TEXT("cannot read the area catalog (CatalogPath)"));
+	}
+	TArray<TSharedPtr<FJsonValue>> Entries;
+	{
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Raw);
+		if (!FJsonSerializer::Deserialize(Reader, Entries))
+		{
+			return Fail(TEXT("area catalog is not a JSON array"));
+		}
+	}
+	// Underscores count as spaces so multi-word names survive console arg splitting
+	// (RUDE.Run ImportArea Downtown_Los_Santos ...), and a unique case-insensitive substring
+	// is accepted ("downtown") - a human should not have to type a catalog string exactly.
+	const FString Want = AreaName.TrimStartAndEnd().Replace(TEXT("_"), TEXT(" "));
+	FString Aliases;
+	const TSharedPtr<FJsonObject>* Match = nullptr;
+	FString MatchAlias;
+	int32 Substrings = 0;
+	for (const TSharedPtr<FJsonValue>& V : Entries)
+	{
+		const TSharedPtr<FJsonObject>* E;
+		if (!V.IsValid() || !V->TryGetObject(E)) { continue; }
+		const FString Alias = (*E)->GetStringField(TEXT("alias"));
+		if (Want.IsEmpty())
+		{
+			// No name given: answer with the menu instead of an error - the panel user's
+			// discovery path ("what can I type here?").
+			Aliases += FString::Printf(TEXT("%s\"%s\""), Aliases.IsEmpty() ? TEXT("") : TEXT(","), *Alias);
+			continue;
+		}
+		if (Alias.Equals(Want, ESearchCase::IgnoreCase))
+		{
+			Match = E;
+			MatchAlias = Alias;
+			Substrings = 1;
+			break;
+		}
+		if (Alias.Contains(Want, ESearchCase::IgnoreCase))
+		{
+			Match = E;
+			MatchAlias = Alias;
+			++Substrings;
+		}
+	}
+	if (Match && Substrings == 1)
+	{
+		const TSharedPtr<FJsonObject>* E = Match;
+		TArray<FString> Parts;
+		const TArray<TSharedPtr<FJsonValue>>* Arr;
+		if ((*E)->TryGetArrayField(TEXT("prefixes"), Arr))
+		{
+			for (const TSharedPtr<FJsonValue>& P : *Arr) { Parts.Add(P->AsString()); }
+		}
+		// exact basenames ride as "<name>.ymap" prefixes - "<name>.ymap*.xml" matches only
+		// that file (see ImportMapArea's comma-list note)
+		if ((*E)->TryGetArrayField(TEXT("exact"), Arr))
+		{
+			for (const TSharedPtr<FJsonValue>& P : *Arr) { Parts.Add(P->AsString() + TEXT(".ymap")); }
+		}
+		if (Parts.Num() == 0)
+		{
+			return Fail(TEXT("catalog entry has no prefixes"));
+		}
+		return ImportMapArea(CorpusRoot, FString::Join(Parts, TEXT(",")), DestMeshFolder, Filter);
+	}
+	if (Want.IsEmpty())
+	{
+		return FString::Printf(TEXT("{\"ok\":true,\"areas\":[%s]}"), *Aliases);
+	}
+	if (Substrings > 1)
+	{
+		return Fail(FString::Printf(TEXT("'%s' matches %d areas - be more specific (empty AreaName lists them)"),
+			*Want, Substrings));
+	}
+	return Fail(FString::Printf(TEXT("unknown area '%s' - run with an empty AreaName to list them"), *Want));
 }
 
 // Ported from the in-game-proven tools/emit_ytyp.py - the archetype flag +

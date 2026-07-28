@@ -146,6 +146,19 @@ public:
 	static FString ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
 	                             const FString& DestMeshFolder, const FString& Filter);
 
+	// Import a map area by its HUMAN name ("Downtown", "Vespucci Beach & Canals", ...) using the
+	// measured area catalog (reports/area_aliases.json: 132 entries whose prefixes partition all
+	// resolved ymaps - built and machine-verified 2026-07-28). Resolves the alias (case-insensitive,
+	// also accepts a raw prefix-family name), joins the entry's prefixes + exact basenames into
+	// ImportMapArea's comma-list form, and delegates - one code path, no drift.
+	// AreaName: catalog alias. CatalogPath: absolute path to area_aliases.json.
+	// CorpusRoot/DestMeshFolder/Filter: as ImportMapArea. Empty AreaName lists all aliases.
+	// Returns ImportMapArea's own JSON, or {ok:false,error} / an alias listing.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build a named district like 'Downtown' in your open level - no filename prefixes to know. Leave the area name empty to see every name you can pick."))
+	static FString ImportArea(const FString& AreaName, const FString& CatalogPath,
+	                          const FString& CorpusRoot, const FString& DestMeshFolder,
+	                          const FString& Filter);
+
 	// Emit a CMapTypes .ytyp (XML, FiveM-Legacy-loadable) defining one
 	// CBaseArchetypeDef per drawable. YdrSpecs: comma-separated
 	// "absPathTo.ydr.xml[;txd[;physDict]]". Encodes the in-game-proven collision
