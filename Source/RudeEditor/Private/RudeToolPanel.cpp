@@ -39,6 +39,33 @@ static FAutoConsoleCommand GRudeOpenPanel(
 		}
 	}));
 
+// `RUDE.Run <Tool> [arg]...` - the 4th surface over the same FRudeInvoke core (panel/CLI/MCP are
+// the other three). Exists so tools can be driven from `-ExecCmds` at editor launch: a scripted or
+// agent-run import needs no MCP session and no human at the panel. Result goes to the log, which is
+// what a headless driver reads anyway.
+static FAutoConsoleCommand GRudeRun(
+	TEXT("RUDE.Run"),
+	TEXT("Run a RUDE tool by name with positional args: RUDE.Run <Tool> [arg]..."),
+	FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+	{
+		if (Args.Num() == 0)
+		{
+			UE_LOG(LogRudePanel, Display, TEXT("[RUDE.Run] usage: RUDE.Run <Tool> [arg]..."));
+			return;
+		}
+		UFunction* Fn = FRudeInvoke::FindTool(Args[0]);
+		TArray<FString> Values(Args.GetData() + 1, Args.Num() - 1);
+		FString Result;
+		FString Error;
+		if (!Fn || !FRudeInvoke::Call(Fn, Values, Result, Error))
+		{
+			UE_LOG(LogRudePanel, Error, TEXT("[RUDE.Run] %s: %s"), *Args[0],
+				Fn ? *Error : TEXT("no such tool"));
+			return;
+		}
+		UE_LOG(LogRudePanel, Display, TEXT("[RUDE.Run] %s -> %s"), *Args[0], *Result);
+	}));
+
 void SRudeToolPanel::Construct(const FArguments& InArgs)
 {
 	// HUMAN list: agent-only tools are dropped by their own RudeAudience tag, never by a name list

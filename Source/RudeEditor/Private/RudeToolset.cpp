@@ -1163,25 +1163,38 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		return Fail(FString::Printf(TEXT("XML load failed: %s"), *Xml.GetLastError()));
 	}
 	const FXmlNode* Root = Xml.GetRootNode();
+	// A fragment's visual drawable imports through this same lane: QUARRY's yft2xml (v1) emits
+	// <Fragment> wrapping a <Drawable> child. The mesh must keep the FILE's stem - a fragment's
+	// inner drawable names itself "skel", which would otherwise become the asset name.
+	bool bFragment = false;
+	if (Root && Root->GetTag() == TEXT("Fragment"))
+	{
+		Root = Root->FindChildNode(TEXT("Drawable"));
+		bFragment = true;
+	}
 	if (!Root || Root->GetTag() != TEXT("Drawable"))
 	{
-		return Fail(TEXT("root is not <Drawable>"));
+		return Fail(TEXT("root is not <Drawable> (or <Fragment> wrapping one)"));
 	}
 
 	// Drawable name (strip ".#dr" style suffix)
 	FString Name = FPaths::GetBaseFilename(XmlPath);
 	Name.RemoveFromEnd(TEXT(".ydr"));
-	if (const FXmlNode* NameNode = Root->FindChildNode(TEXT("Name")))
+	Name.RemoveFromEnd(TEXT(".yft"));
+	if (!bFragment)
 	{
-		FString N = NameNode->GetContent().TrimStartAndEnd();
-		int32 Dot;
-		if (N.FindChar(TEXT('.'), Dot))
+		if (const FXmlNode* NameNode = Root->FindChildNode(TEXT("Name")))
 		{
-			N.LeftInline(Dot);
-		}
-		if (!N.IsEmpty())
-		{
-			Name = N;
+			FString N = NameNode->GetContent().TrimStartAndEnd();
+			int32 Dot;
+			if (N.FindChar(TEXT('.'), Dot))
+			{
+				N.LeftInline(Dot);
+			}
+			if (!N.IsEmpty())
+			{
+				Name = N;
+			}
 		}
 	}
 
@@ -1965,6 +1978,7 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	};
 	// ---- 1) archetype index from every ytyp XML (name -> drawable assetName) ----
 	TMap<FString, FString> ArchToAsset;
+	TSet<FString> FragmentAssets;   // assets that resolve under yft/ instead of ydr/
 	{
 		TArray<FString> YtypFiles;
 		IFileManager::Get().FindFiles(YtypFiles, *(CorpusRoot / TEXT("ytyp") / TEXT("*.xml")), true, false);
@@ -1981,12 +1995,17 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 				const FXmlNode* AssetN = Item->FindChildNode(TEXT("assetName"));
 				const FXmlNode* TypeN = Item->FindChildNode(TEXT("assetType"));
 				if (!NameN || !AssetN) { continue; }
-				// drawable-backed archetypes only; ydd-dictionary / fragment archetypes
-				// stay unresolved (proxy cubes) until those importers exist
+				// drawable + fragment archetypes resolve (fragments via QUARRY's yft.xml, visual
+				// drawable v1). ydd-dictionary archetypes stay proxy cubes until the
+				// entry-selection lane exists - a dictionary XML holds MANY drawables and the
+				// importer has no way to pick one yet.
 				const FString AType = TypeN ? TypeN->GetContent().TrimStartAndEnd() : FString();
-				if (!AType.IsEmpty() && AType != TEXT("ASSET_TYPE_DRAWABLE")) { continue; }
-				ArchToAsset.Add(NameN->GetContent().TrimStartAndEnd().ToLower(),
-				                AssetN->GetContent().TrimStartAndEnd().ToLower());
+				const bool bDrawableArch = AType.IsEmpty() || AType == TEXT("ASSET_TYPE_DRAWABLE");
+				const bool bFragmentArch = AType == TEXT("ASSET_TYPE_FRAGMENT");
+				if (!bDrawableArch && !bFragmentArch) { continue; }
+				const FString AssetLower = AssetN->GetContent().TrimStartAndEnd().ToLower();
+				ArchToAsset.Add(NameN->GetContent().TrimStartAndEnd().ToLower(), AssetLower);
+				if (bFragmentArch) { FragmentAssets.Add(AssetLower); }
 			}
 		}
 		if (ArchToAsset.Num() == 0) { return Fail(TEXT("no archetypes indexed - check CorpusRoot/ytyp")); }
@@ -2063,7 +2082,9 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	for (const FString& D : NeededDrawables)
 	{
 		++Done;
-		const FString YdrPath = CorpusRoot / TEXT("ydr") / (D + TEXT(".ydr.xml"));
+		const bool bFrag = FragmentAssets.Contains(D);
+		const FString YdrPath = CorpusRoot / (bFrag ? TEXT("yft") : TEXT("ydr"))
+			/ (D + (bFrag ? TEXT(".yft.xml") : TEXT(".ydr.xml")));
 		if (!FPaths::FileExists(YdrPath)) { ++MeshMissing; continue; }
 		if (FPackageName::DoesPackageExist(DestMeshFolder / D)) { ++MeshSkip; continue; }
 		const FString R = ImportYdr(YdrPath, DestMeshFolder);
