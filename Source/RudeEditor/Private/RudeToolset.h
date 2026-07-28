@@ -115,8 +115,13 @@ public:
 
 	// Position the level-editor perspective viewport and capture a screenshot -
 	// the agent-vision primitive (verify imports/materials without human eyes at
-	// the machine). CamSpec: "x,y,z,pitch,yaw" (UE cm/degrees). The PNG lands at
+	// the machine). CamSpec: "x,y,z,pitch,yaw" (UE cm/degrees; ";" also accepted, because
+	// -ExecCmds splits its own command list on commas). The PNG lands at
 	// OutPng on the NEXT viewport draw - poll the file. Returns {ok, requested}.
+	// ⛔ Blocks on FinishAllCompilation first: a still-compiling StaticMesh renders NOTHING, and
+	// compilation finishes smallest-first, so an unsynchronised shot shows the small props and
+	// drops the large meshes - a convincing but FALSE "big meshes are missing" defect
+	// (2026-07-28, LOG). Never remove that barrier.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Point the viewport somewhere and save a screenshot to disk.", RudeAudience="agent"))
 	static FString CaptureView(const FString& CamSpec, const FString& OutPng);
 

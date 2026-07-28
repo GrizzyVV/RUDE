@@ -1781,6 +1781,15 @@ FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng)
 	{
 		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
 	};
+	// ⛔⛔ BLOCK UNTIL EVERY ASSET HAS FINISHED COMPILING, or this tool lies. The shot lands on the
+	// NEXT DRAW, and a StaticMesh that is still compiling renders NOTHING - so a capture fired
+	// straight after an import photographs a HALF-BUILT scene. Compilation completes
+	// smallest-first, so the artifact is SIZE-CORRELATED: small props present, large meshes
+	// missing. That is indistinguishable by eye from a real "big meshes don't render" defect, and
+	// on 2026-07-28 it cost a whole false investigation (LOG: "CaptureView WITHOUT A COMPILE
+	// BARRIER"). An unsynchronised screenshot is not a measurement.
+	FAssetCompilingManager::Get().FinishAllCompilation();
+
 	TArray<FString> C;
 	// Semicolons are accepted as separators because -ExecCmds splits its command list on
 	// commas - a comma CamSpec cannot survive the launch-argument path at all.
