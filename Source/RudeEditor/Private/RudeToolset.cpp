@@ -1875,21 +1875,29 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 	{
 		BaseJson += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(", ") : TEXT(""), *BaseArchives[i]);
 	}
+	// ⭐ SAME SHAPE AS QUARRY'S _FILEBASE.json, deliberately (Matt's call, 2026-07-27): QUARRY OWNS
+	// the project tree, and this is the no-QUARRY fallback. Two tools writing the same contract in
+	// two shapes is how a contract drifts - which already cost us once when QUARRY emitted binary
+	// and the importer read XML with nothing to announce the mismatch. Keys mirror `quarry.py`'s
+	// `write_manifest`; `createdBy` is the only addition, so a consumer can tell which tool cut it.
 	const FString Manifest = FString::Printf(TEXT(
 		"{\n"
-		" \"filebaseVersion\": 1,\n"
+		" \"quarryVersion\": 1,\n"
 		" \"createdBy\": \"RUDE CreateFilebase\",\n"
+		" \"title\": \"%s\",\n"
 		" \"gameRoot\": \"%s\",\n"
 		" \"build\": { \"exe\": \"%s\", \"bytes\": %lld, \"modified\": \"%s\" },\n"
 		" \"precedence\": [\"00_base\", \"10_update\", \"20_dlc/<order>_<name>\"],\n"
-		" \"precedenceNote\": \"Later wins. A name present in several sources resolves to the "
-		"highest-ordered copy - that is what makes the filebase build-version-accurate.\",\n"
+		" \"precedenceNote\": \"Later wins. A name in several sources resolves to the "
+		"highest-ordered copy - that is what keeps a project build-accurate.\",\n"
 		" \"dlcOrderAuthoritative\": false,\n"
-		" \"dlcOrderNote\": \"Order below is a heuristic (year-bearing names last, else "
-		"alphabetical). The authoritative list is dlclist.xml inside update.rpf; drop it into "
-		"_manifest/ and the order can be corrected.\",\n"
+		" \"dlcOrderNote\": \"HEURISTIC (year-bearing names last, else alphabetical). RUDE cannot "
+		"open update.rpf to read the real dlclist.xml - it ships no archive or crypto code by "
+		"design. Run QUARRY's init/extract for an authoritative order; do not author a DLC "
+		"override against this one.\",\n"
 		" \"baseArchives\": [%s],\n"
 		" \"dlcPacks\": [%s\n ]\n}\n"),
+		ExeName.Equals(TEXT("GTA5_Enhanced.exe")) ? TEXT("gtav-enhanced") : TEXT("gtav-legacy"),
 		*GameRoot.ReplaceCharWithEscapedChar(), *ExeName, ExeSize, *ExeStamp.ToString(),
 		*BaseJson, *DlcJson);
 	FFileHelper::SaveStringToFile(Manifest, *(FilebaseRoot / TEXT("_FILEBASE.json")),
@@ -1897,17 +1905,26 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 
 	const FString Readme = FString::Printf(TEXT(
 		"# RUDE Filebase\n\n"
-		"## How to use this (the whole procedure)\n\n"
-		"**1.** In CodeWalker, open ONE source (e.g. `x64a.rpf`, or `update.rpf`, or a DLC's\n"
-		"`dlc.rpf`) and export what you want as XML. Dump it anywhere - a flat folder is fine,\n"
-		"do NOT sort it.\n\n"
-		"**2.** Tell RUDE to file it:\n\n"
+		"This is an EMPTY folder tree, shaped to your own game install. Nothing here was read out\n"
+		"of your game - RUDE only listed directory names. Filling it is a separate step.\n\n"
+		"## The easy path: QUARRY\n\n"
+		"QUARRY reads your own archives and fills this tree for you, in the right order:\n\n"
+		"    quarry.py extract --game \"<your install>\" --out \"<this folder>\" --xml \\\n"
+		"                      --types ydr,ytd,ytyp,ymap\n"
+		"    quarry.py meta    --out \"<this folder>\"\n"
+		"    quarry.py resolve --out \"<this folder>\"\n\n"
+		"It also reads the real DLC load order out of your update.rpf, which RUDE cannot - RUDE\n"
+		"ships no archive or crypto code by design, so the order below is only a guess.\n\n"
+		"## The other path: an extractor you already have\n\n"
+		"Export ONE source at a time (e.g. `x64a.rpf`, or `update.rpf`, or a single DLC) with\n"
+		"whatever extraction tool you already use. Dump it anywhere - a flat folder is fine, do\n"
+		"NOT sort it. Then tell RUDE to file it:\n\n"
 		"    IngestExport(DumpFolder, SourceName, FilebaseRoot)\n"
 		"      SourceName = \"base\", \"update\", or the DLC pack name (e.g. \"mpbiker\")\n\n"
 		"RUDE sorts every file by type into the correct precedence slot. You never create a\n"
 		"folder, never type a number, never sort anything by hand.\n\n"
-		"**3.** Repeat per source. Start with `base` and `update` - that is the city; DLC packs\n"
-		"only matter when you want their content.\n\n"
+		"Repeat per source. Start with `base` and `update` - that is the city; DLC packs only\n"
+		"matter when you want their content.\n\n"
 		"## What the numbers mean (you can ignore them)\n"
 		"The same asset name exists in the base game, in update.rpf, and in several DLC packs;\n"
 		"the game uses the LAST one in load order. The folders encode that order so RUDE always\n"
@@ -1918,8 +1935,12 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 		"Type folders (`ydr/ ytd/ ybn/ ...`) are created for you as files arrive.\n"
 		"Keep sources in their own slots - not merging them is what makes this work.\n\n"
 		"## Slots\n"
-		"    _manifest/    drop dlclist.xml here if you can export it (pins the exact DLC order)\n"
-		"    _incoming/    scratch space if you want somewhere to dump before ingesting\n\n"
+		"    _manifest/    scratch space for anything that pins this build\n"
+		"    _incoming/    somewhere to dump before ingesting, if you want it\n\n"
+		"WARNING: the DLC order below is a GUESS (year-bearing names last, else alphabetical).\n"
+		"The real order lives in dlclist.xml inside the encrypted update.rpf. If you intend to\n"
+		"author an override that must land above a particular DLC, use QUARRY - guessing wrong\n"
+		"means your override loses silently.\n\n"
 		"## This filebase was cut for\n"
 		"    %s  (%s, %lld bytes, modified %s)\n"
 		"    %d base archives, %d DLC packs\n\n"
@@ -2482,7 +2503,7 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 }
 
 // ======================= RudeYdrBin - READING binary .ydr (RSC7 v165) =======================
-// The import side's keystone: RUDE could WRITE binary but only READ CodeWalker XML, so QUARRY's
+// The import side's keystone: RUDE could WRITE binary but only READ the XML form, so QUARRY's
 // output (real game binaries) could not reach the importer at all. This parses the container and
 // the drawable graph into the SAME RudeYdr::FGeo intermediate the XML lane produces, so the proven
 // mesh builder is reused rather than duplicated (today's crash #6 was a duplication bug - do not

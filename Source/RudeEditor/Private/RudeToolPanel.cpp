@@ -2,8 +2,11 @@
 #include "RudeToolPanel.h"
 
 #include "RudeInvoke.h"
+#include "RudeToolset.h"
+#include "ToolsetRegistry/UToolsetRegistry.h"
 
 #include "Framework/Application/SlateApplication.h"
+#include "Widgets/Layout/SExpandableArea.h"
 #include "Framework/Docking/TabManager.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SComboBox.h"
@@ -38,11 +41,17 @@ static FAutoConsoleCommand GRudeOpenPanel(
 
 void SRudeToolPanel::Construct(const FArguments& InArgs)
 {
-	Tools = FRudeInvoke::CollectTools();
+	// HUMAN list: agent-only tools are dropped by their own RudeAudience tag, never by a name list
+	// here - see FRudeInvoke::CollectTools.
+	Tools = FRudeInvoke::CollectTools(/*bHumanOnly*/ true);
 	StatusColour = FSlateColor::UseSubduedForeground();
-	StatusText = FText::Format(
-		LOCTEXT("Ready", "{0} tools, listed by reflection - this panel cannot go stale."),
-		FText::AsNumber(Tools.Num()));
+	StatusText = LOCTEXT("Ready", "Pick a tool to begin.");
+
+	// Log the split. It tells a maintainer at a glance that the audience filter is doing something,
+	// and it is the only way to confirm the panel built when no UI automation is available.
+	const int32 NumAll = FRudeInvoke::CollectTools(false).Num();
+	UE_LOG(LogRudePanel, Display, TEXT("panel built: %d tools shown to humans, %d hidden as "
+		"agent-only, %d total"), Tools.Num(), NumAll - Tools.Num(), NumAll);
 
 	ChildSlot
 	[
@@ -88,16 +97,36 @@ void SRudeToolPanel::Construct(const FArguments& InArgs)
 			]
 		]
 
-		// ---- the tool's own documentation, straight from its UFUNCTION comment ----
-		+ SVerticalBox::Slot().AutoHeight().Padding(8, 0, 8, 4)
+		// ---- PLAIN-LANGUAGE help: what this does, for a person ----
+		+ SVerticalBox::Slot().AutoHeight().Padding(8, 0, 8, 2)
 		[
 			SNew(STextBlock)
 			.AutoWrapText(true)
-			.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 			.Text_Lambda([this]()
 			{
-				return Selected ? FText::FromString(FRudeInvoke::ToolTip(Selected)) : FText::GetEmpty();
+				return Selected ? FText::FromString(FRudeInvoke::PlainHelp(Selected))
+				                : FText::GetEmpty();
 			})
+		]
+
+		// ---- the technical detail, DEMOTED but not deleted: page plans and struct offsets are
+		// load-bearing for agents and for whoever maintains this next, so it stays available.
+		+ SVerticalBox::Slot().AutoHeight().Padding(8, 0, 8, 4)
+		[
+			SNew(SExpandableArea)
+			.InitiallyCollapsed(true)
+			.AreaTitle(LOCTEXT("TechDetail", "Technical detail"))
+			.BodyContent()
+			[
+				SNew(STextBlock)
+				.AutoWrapText(true)
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				.Text_Lambda([this]()
+				{
+					return Selected ? FText::FromString(FRudeInvoke::ToolTip(Selected))
+					                : FText::GetEmpty();
+				})
+			]
 		]
 
 		+ SVerticalBox::Slot().AutoHeight().Padding(8, 2) [ SNew(SSeparator) ]
@@ -121,12 +150,31 @@ void SRudeToolPanel::Construct(const FArguments& InArgs)
 		]
 
 		// ---- the tool's raw JSON, unedited: the same string agents and the CLI see ----
-		+ SVerticalBox::Slot().FillHeight(0.55f).Padding(8, 4, 8, 8)
+		+ SVerticalBox::Slot().FillHeight(0.55f).Padding(8, 4, 8, 4)
 		[
 			SAssignNew(ResultBox, SMultiLineEditableTextBox)
 			.IsReadOnly(true)
 			.AllowMultiLine(true)
 			.Text(FText::GetEmpty())
+		]
+
+		// ---- FOOTER: version + whether the agent surface came up. This replaces Ping as a menu
+		// row - a person wants to SEE that the plugin is alive, not run a tool to ask.
+		+ SVerticalBox::Slot().AutoHeight().Padding(8, 2, 8, 8)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(STextBlock)
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				.Text(FText::Format(
+					LOCTEXT("Footer", "RUDE {0}  -  {1} tools  -  agent surface: {2}"),
+					FText::FromString(GetDefault<URudeToolset>()->GetToolsetVersion()),
+					FText::AsNumber(Tools.Num()),
+					UToolsetRegistry::IsAvailable()
+						&& UToolsetRegistry::IsToolsetClassRegistered(URudeToolset::StaticClass())
+						? LOCTEXT("Reg", "registered") : LOCTEXT("Unreg", "NOT registered")))
+			]
 		]
 	];
 }

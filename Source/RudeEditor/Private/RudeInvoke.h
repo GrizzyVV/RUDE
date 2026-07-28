@@ -15,7 +15,18 @@ class UFunction;
 struct FRudeInvoke
 {
 	// Agent-callable tools, sorted by name. Reflection over URudeToolset, nothing hard-coded.
-	static TArray<UFunction*> CollectTools();
+	// bHumanOnly drops tools marked RudeAudience="agent" - real capability that a person does not
+	// want on a menu (they have better screenshot tools; version belongs in a status strip).
+	// ⭐ THE TOOL DECLARES ITS OWN AUDIENCE. Do NOT filter by a name list in the UI instead: a
+	// hand-maintained list is precisely the thing reflection removed, and the next agent-only tool
+	// someone adds would silently appear on a human's menu.
+	static TArray<UFunction*> CollectTools(bool bHumanOnly = false);
+
+	// Plain-language, task-first help for a person. Falls back to the technical tooltip when a tool
+	// has no RudeHelp yet, so a newly added tool is under-explained rather than blank.
+	// ⚠ These are DELIBERATELY two different texts: the UFUNCTION comment carries page plans and
+	// struct offsets that agents and maintainers need, and simplifying it would cost them.
+	static FString PlainHelp(const UFunction* Fn);
 
 	// Case-insensitive lookup among CollectTools(); nullptr when absent.
 	static UFunction* FindTool(const FString& Name);

@@ -8,7 +8,7 @@
 #include "RudeToolset.generated.h"
 
 // RUDE toolset - RAGE (GTA V) format import/export tools.
-// Import CodeWalker-XML drawables as StaticMesh assets, with the RUDE
+// Import RAGE XML drawables (.ydr.xml) as StaticMesh assets, with the RUDE
 // GTA<->UE transform convention applied: cm scale, Y mirror, and triangle
 // winding PASSED THROUGH AS-IS. (Under the Y-mirror, RAGE winding already faces
 // outward in UE - reversing it renders inside-out. Only the OBJ lane reverses,
@@ -22,18 +22,18 @@ public:
 	virtual FString GetToolsetVersion() const override { return TEXT("0.1.0"); }
 
 	// Smoke test: returns the RUDE plugin version and status.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Check that RUDE is loaded and see its version.", RudeAudience="agent"))
 	static FString Ping();
 
-	// Import a CodeWalker ydr XML file as a UStaticMesh asset.
+	// Import a ydr XML file (.ydr.xml) as a UStaticMesh asset.
 	// XmlPath: absolute path to a *.ydr.xml file on disk.
 	// DestFolder: content folder for the new asset (e.g. "/Game/RUDE/Meshes/Props").
 	// Returns a JSON string: {ok, assetPath, geometries, vertices, triangles, slots}
 	// or {ok:false, error} on failure.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring one GTA V model into Unreal as a Static Mesh you can edit."))
 	static FString ImportYdr(const FString& XmlPath, const FString& DestFolder);
 
-	// Import a CodeWalker ytd XML manifest as UTexture2D assets with correct
+	// Import a ytd XML manifest (.ytd.xml) as UTexture2D assets with correct
 	// semantics derived from each entry's Usage (NORMAL -> TC_Normalmap + sRGB off,
 	// SPECULAR -> sRGB off, DIFFUSE -> sRGB on).
 	// XmlPath: absolute path to a *.ytd.xml file.
@@ -41,7 +41,7 @@ public:
 	// happens offline until native decode lands).
 	// DestFolder: content folder root; assets land in <DestFolder>/<TxdName>/.
 	// Returns JSON: {ok, txd, imported, missingPixels:[...]}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V texture set into Unreal, with normal and specular maps set up correctly."))
 	static FString ImportYtd(const FString& XmlPath, const FString& PixelFolder,
 	                         const FString& DestFolder);
 
@@ -52,7 +52,7 @@ public:
 	// file reimports in place (rebinds MaterialInstances against currently-imported
 	// textures; the texture-pass re-bind flow). Progress goes to the log.
 	// Returns JSON: {ok, imported, skipped, failed, failedFiles:[...first 30]}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring in many GTA V models at once from a list file. Skips anything already imported."))
 	static FString ImportYdrBatch(const FString& ListPath, const FString& DestFolder,
 	                              const FString& Mode);
 
@@ -66,29 +66,29 @@ public:
 	// manifest's UE-space values (already through the pinned GTA->UE convention).
 	// Returns JSON: {ok, ymaps, entities, instances, proxies, uniqueMeshes,
 	// missingMeshes, topMissing:[...first 20]}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Place a previously prepared scene into the level you have open."))
 	static FString ImportScene(const FString& ManifestPath, const FString& MeshFolder,
 	                           const FString& Filter);
 
-	// Export a UStaticMesh as a CodeWalker-compatible ydr XML file (the reverse
+	// Export a UStaticMesh as a ydr XML file (.ydr.xml) (the reverse
 	// lane). Positions/normals/UVs inverse-transformed per the RUDE convention;
 	// shader presets recovered from material slot names; texture names recovered
 	// from bound RUDE MaterialInstances where present.
 	// AssetPath: content path of the StaticMesh (e.g. "/Game/RUDE/Meshes/Props/prop_x").
 	// OutXmlPath: absolute file path for the emitted *.ydr.xml.
 	// Returns JSON: {ok, xmlPath, geometries, vertices, triangles} or {ok:false, error}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save a Static Mesh back out as a GTA V model, in the editable text form."))
 	static FString ExportYdr(const FString& AssetPath, const FString& OutXmlPath);
 
-	// Export a UStaticMesh's collision as a standalone CodeWalker .ybn XML (physics
-	// bounds) - a valid, CW-previewable BoundsFile. NOTE (corrected 2026-07-24):
+	// Export a UStaticMesh's collision as a standalone .ybn XML (physics
+	// bounds) - a valid BoundsFile. NOTE (corrected 2026-07-24):
 	// PROP collision actually comes from the ydr's EMBEDDED <Bounds> + archetype flag
 	// bit 0x20000, NOT a standalone .ybn (props share NAMED-bound dictionaries; a
 	// standalone unnamed bound never matches). ExportYdr embeds the real collider;
 	// this tool remains for shared/world collision-dictionary work later. Verts
 	// inverse-transformed per the RUDE convention.
 	// Returns JSON: {ok, xmlPath, vertices, triangles} or {ok:false, error}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save a mesh's collision on its own. Most props do not need this - their collision travels inside the model itself."))
 	static FString ExportYbn(const FString& AssetPath, const FString& OutXmlPath);
 
 	// Spawn (or move) the sea-level reference plane - GTA's ocean sits at world z=0,
@@ -98,24 +98,24 @@ public:
 	// ZMetres: sea height in GTA metres (default 0). Lands in the RUDE_ENV folder so
 	// ImportScene's respawn (which clears RUDE_LS) leaves it alone.
 	// Returns JSON: {ok, actor, sizeM, zM}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Add a flat ocean surface at sea level so you can see where the water sits. A visual guide only, not game data."))
 	static FString SpawnSeaLevel(const FString& SizeMetres, const FString& ZMetres);
 
 	// Position the level-editor perspective viewport and capture a screenshot -
 	// the agent-vision primitive (verify imports/materials without human eyes at
 	// the machine). CamSpec: "x,y,z,pitch,yaw" (UE cm/degrees). The PNG lands at
 	// OutPng on the NEXT viewport draw - poll the file. Returns {ok, requested}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Point the viewport somewhere and save a screenshot to disk.", RudeAudience="agent"))
 	static FString CaptureView(const FString& CamSpec, const FString& OutPng);
 
-	// File a FLAT export dump into the filebase. You export from CodeWalker into any
-	// folder (it dumps files flat); this sorts them by type into the right precedence
-	// slot, so nobody hand-sorts anything.
+	// File a FLAT export dump into the filebase. You export from whatever extractor you
+	// already use into any folder (they dump files flat); this sorts them by type into
+	// the right precedence slot, so nobody hand-sorts anything.
 	// DumpFolder: the folder you exported into. SourceName: "base", "update", or a DLC
 	// pack name (e.g. "mpbiker"); leave EMPTY to use the dump folder's own name.
 	// FilebaseRoot: the filebase. Move: "MOVE" (default) or "COPY".
 	// Returns JSON: {ok, source, dest, filed, byType:{...}, skipped}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Sort a folder of exported game files into the right place in your project, by which game version they came from."))
 	static FString IngestExport(const FString& DumpFolder, const FString& SourceName,
 	                            const FString& FilebaseRoot, const FString& Move);
 
@@ -129,7 +129,7 @@ public:
 	// "ALL" (every type folder everywhere).
 	// Writes _FILEBASE.json (sources + order + build fingerprint) and README.md.
 	// Returns JSON: {ok, root, dlcPacks, baseArchives, foldersCreated}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Create the empty project folder tree your game files go into, shaped to your own install. Does not read or unpack any game archive."))
 	static FString CreateFilebase(const FString& FilebaseRoot, const FString& GameRoot,
 	                              const FString& Options);
 
@@ -142,7 +142,7 @@ public:
 	// Filter: "HD" (default) or "ALL" lod levels. Textures remain a separate pass
 	// until native BC decode lands. Returns JSON: {ok, ymaps, entities, resolved,
 	// meshesImported, meshesSkipped, meshesFailed, spawn:{...ImportScene stats}}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build a whole area of the map in your open level - brings in the models it needs and places them. WARNING: this REPLACES any area you loaded before."))
 	static FString ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
 	                             const FString& DestMeshFolder, const FString& Filter);
 
@@ -153,7 +153,7 @@ public:
 	// <physicsDictionary> (the switch; no .ybn file is shipped or needed); embedded
 	// ShaderGroup TextureDictionary -> empty archetype textureDictionary, else the
 	// asset's own name. Returns JSON: {ok, ytypPath, archetypes}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Create the definition file that tells the game what your models are and how they behave, including whether they have collision."))
 	static FString ExportYtyp(const FString& YdrSpecs, const FString& YtypName,
 	                          const FString& OutYtypPath);
 
@@ -162,7 +162,7 @@ public:
 	// array of {archetype, ue:{x,y,z}, ue_quat:{x,y,z,w}?} in UE space; transforms
 	// use the pinned EXPORT-lane conventions (cm->m Y-mirror; gta_quat =
 	// (-x, y, -z, w), bench-proven). Returns JSON: {ok, ymapPath, entities}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Create a ready-to-use FiveM map resource from a list of placed objects."))
 	static FString ExportYmap(const FString& EntitiesJsonPath, const FString& MapName,
 	                          const FString& OutDir);
 
@@ -170,7 +170,7 @@ public:
 	// ytd pipeline). Reads the texture Source (BGRA8), writes PNG via ImageWrapper.
 	// TexturePath: content path of the Texture2D. OutPngPath: absolute *.png path.
 	// Returns JSON: {ok, pngPath, width, height} or {ok:false, error}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save a texture out of Unreal as a PNG image file."))
 	static FString ExportTexture(const FString& TexturePath, const FString& OutPngPath);
 
 	// Export UTexture2D(s) directly to a binary FiveM .ytd (RSC7 v13) - CLEAN-ROOM,
@@ -189,7 +189,7 @@ public:
 	// uncompressed A8R8G8B8 and heavy (a 4096^2 = 64MB, and FiveM can fault the GPU on
 	// oversized assets). Texture names may be any length - the name region is sized to fit.
 	// Returns JSON: {ok, ytdPath, textures, bytes, sysFlags, gfxFlags} or {ok:false, error}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save textures as a finished GTA V texture file the game loads directly."))
 	static FString ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath,
 	                               const FString& MaxDim);
 
@@ -202,12 +202,12 @@ public:
 	// (gfx=0), page-aware layout. Struct map: docs/ENGINEERING_LOG "ydr binary format".
 	// AssetPath: content path of the StaticMesh. OutYdrPath: absolute *.ydr path.
 	// Returns JSON: {ok, ydrPath, geometries, vertices, triangles, bytes, sysFlags}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save a Static Mesh as a finished GTA V model the game loads directly, with its collision included."))
 	static FString ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath);
 
 	// Parse a BINARY FiveM/GTA V .ydr (RSC7 v165) and report its whole drawable graph as JSON.
 	// This is the READ side's foundation: RUDE can write binary but until now could only READ
-	// CodeWalker XML, so real game binaries (e.g. from a QUARRY-extracted filebase) could not
+	// the XML interchange form, so real game binaries (e.g. from a QUARRY-extracted filebase) could not
 	// reach the importer. Verifies the parse before it is wired to the mesh builder.
 	// Reads untrusted files: every access is bounds-checked, malformed input returns {ok:false}.
 	// A v159 drawable is reported as GTA V ENHANCED rather than silently misread.
@@ -215,7 +215,7 @@ public:
 	// hasEmbeddedBound, shaderCount, models, geometries, vertices, triangles,
 	// indicesOutOfRange, declarations:[...], shaders:[{hash,params,textures}],
 	// detail:[{model, geoCount, countAt0x2e, geoBoundsPairs, geos:[...]}]}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Inspect a GTA V model file and report what is inside it, without importing."))
 	static FString ProbeYdrBinary(const FString& BinPath);
 
 	// Export a UStaticMesh's collision directly to a binary FiveM .ybn (RSC7 v43) -
@@ -233,7 +233,7 @@ public:
 	// vertices. Static world collision (map tiles) stores geometry in ABSOLUTE world
 	// coordinates, so this places the bound where it belongs on the map; empty = none.
 	// Returns JSON: {ok, ybnPath, vertices, triangles, bvhNodes, bytes, sysFlags}.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save collision as a finished GTA V collision file, for world or shared collision."))
 	static FString ExportYbnBinary(const FString& AssetPath, const FString& OutYbnPath,
 	                               const FString& WorldOffset);
 };

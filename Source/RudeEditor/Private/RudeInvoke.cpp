@@ -17,19 +17,39 @@ namespace
 	}
 }
 
-TArray<UFunction*> FRudeInvoke::CollectTools()
+TArray<UFunction*> FRudeInvoke::CollectTools(bool bHumanOnly)
 {
 	TArray<UFunction*> Tools;
 	for (TFieldIterator<UFunction> It(URudeToolset::StaticClass(),
 		EFieldIteratorFlags::ExcludeSuper); It; ++It)
 	{
-		if (IsAgentCallable(*It))
+		if (!IsAgentCallable(*It))
 		{
-			Tools.Add(*It);
+			continue;
 		}
+#if WITH_EDITORONLY_DATA
+		if (bHumanOnly && It->GetMetaData(TEXT("RudeAudience")).Equals(
+			TEXT("agent"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+#endif
+		Tools.Add(*It);
 	}
 	Tools.Sort([](const UFunction& A, const UFunction& B) { return A.GetName() < B.GetName(); });
 	return Tools;
+}
+
+FString FRudeInvoke::PlainHelp(const UFunction* Fn)
+{
+#if WITH_EDITORONLY_DATA
+	const FString Help = Fn->GetMetaData(TEXT("RudeHelp"));
+	// Falling back to the technical tooltip means a tool added without RudeHelp reads badly rather
+	// than reading as having no documentation at all.
+	return Help.IsEmpty() ? Fn->GetToolTipText().ToString() : Help;
+#else
+	return FString();
+#endif
 }
 
 UFunction* FRudeInvoke::FindTool(const FString& Name)
