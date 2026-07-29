@@ -307,6 +307,29 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Inspect a GTA V model file and report its internals as raw JSON, without importing. A diagnostic dump, not a plain answer.", RudeAudience="agent"))
 	static FString ProbeYdrBinary(const FString& BinPath);
 
+	// ---- lanes implemented in their own translation units (RudeScenario/BuildArea/Vehicle.cpp) --
+	// They live on URudeToolset so every surface (panel/CLI/MCP/RUDE.Run) reaches them through the
+	// one reflective core; the split is only to keep RudeToolset.cpp from growing without bound.
+	// ⚠ Declarations added by the main session from the implementations' real signatures; the
+	// authoring agents' own doc blocks supersede these when their review lands.
+
+	// Import one scenario region (GTA's ambient life) as editable actors: every scenario POINT
+	// becomes its own actor, and the chaining graph's routes are drawn so they can be seen.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring one area's ambient-life points into your level so you can see and move them."))
+	static FString ImportScenarioRegion(const FString& CorpusRoot, const FString& RegionName,
+	                                    const FString& Filter);
+
+	// Pack an already-spawned area into a Level Instance at /Game/RUDE/Areas/<slug>.
+	// ⛔ PivotType MUST be WorldOrigin: the default re-bases contained actors, and RAGE placements
+	// are ABSOLUTE, so a re-based level mis-places the whole area silently on export.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Pack the area you just built into its own level asset, so areas stay separate and editable.", RudeAudience="agent"))
+	static FString PackAreaLevelInstance(const FString& AreaName, const FString& ActorTag);
+
+	// Import a vehicle: the body drawable plus its wheel drawable placed at each wheel bone.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V vehicle into Unreal with its wheels in place."))
+	static FString ImportVehicle(const FString& CorpusRoot, const FString& VehicleName,
+	                             const FString& DestFolder);
+
 	// Export a UStaticMesh's collision directly to a binary FiveM .ybn (RSC7 v43) -
 	// CLEAN-ROOM, no CodeWalker. P5 step 2. Emits a phBoundComposite wrapping one
 	// phBoundGeometryBVH: quantized vertices, 16-byte triangles, u8 material indices,

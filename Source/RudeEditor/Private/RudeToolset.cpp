@@ -162,6 +162,76 @@ static UMaterialInterface* EnsureFoliageMaster()
 	return M;
 }
 
+// ⛔⛔ THE CUTOUT MASTER, BUILT IN CODE - and it must be REBUILT if an older, poorer version is
+// already on disk. Why this exists (2026-07-28): render buckets used to be hardcoded 0 by the
+// converter, so almost everything routed to M_RUDE_Opaque. With REAL buckets, buckets 1 and 3
+// route here - measured at ~11.8% of downtown, up from 0.9% - and the M_RUDE_Cutout asset that
+// shipped has only Diffuse and Roughness. Binding Normal/Specular onto it SUCCEEDS SILENTLY
+// (UMaterialInstance does not validate against the parent) and renders nothing, so ~900 downtown
+// instances would have quietly LOST normal-mapping they had the day before, while the
+// "boundTextures" counter went up. The upgrade check below is therefore not optional: an existing
+// asset without a Normal parameter is a defect to repair, not a master to reuse.
+static UMaterialInterface* EnsureCutoutMaster()
+{
+	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_Cutout.M_RUDE_Cutout");
+	UMaterial* M = LoadObject<UMaterial>(nullptr, FullPath);
+	if (M)
+	{
+		TArray<FMaterialParameterInfo> Infos;
+		TArray<FGuid> Ids;
+		M->GetAllTextureParameterInfo(Infos, Ids);
+		for (const FMaterialParameterInfo& I : Infos)
+		{
+			if (I.Name == FName(TEXT("Normal"))) { return M; }   // already the good version
+		}
+		// Poorer legacy asset: wipe its graph and rebuild, rather than bolting expressions onto
+		// an unknown one. This is OUR asset and fully regenerable.
+		M->GetExpressionCollection().Empty();
+	}
+	else
+	{
+		UPackage* Pkg = CreatePackage(TEXT("/RUDE/Masters/M_RUDE_Cutout"));
+		if (!Pkg) { return nullptr; }
+		M = NewObject<UMaterial>(Pkg, TEXT("M_RUDE_Cutout"), RF_Public | RF_Standalone);
+	}
+
+	M->BlendMode = BLEND_Masked;
+	M->TwoSided = true;    // RAGE cutout geometry (fences, foliage cards, grilles) is single-sided
+	UTexture* DefWhite = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+	UTexture* DefNormal = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineMaterials/FlatNormal.FlatNormal"));
+
+	auto* Diff = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Diff->ParameterName = TEXT("Diffuse"); Diff->SamplerType = SAMPLERTYPE_Color; Diff->Texture = DefWhite;
+	Diff->MaterialExpressionEditorX = -600;
+	M->GetExpressionCollection().AddExpression(Diff);
+
+	auto* Nrm = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Nrm->ParameterName = TEXT("Normal"); Nrm->SamplerType = SAMPLERTYPE_Normal; Nrm->Texture = DefNormal;
+	Nrm->MaterialExpressionEditorX = -600; Nrm->MaterialExpressionEditorY = 300;
+	M->GetExpressionCollection().AddExpression(Nrm);
+
+	auto* Spec = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Spec->ParameterName = TEXT("Specular"); Spec->SamplerType = SAMPLERTYPE_Color; Spec->Texture = DefWhite;
+	Spec->MaterialExpressionEditorX = -600; Spec->MaterialExpressionEditorY = 600;
+	M->GetExpressionCollection().AddExpression(Spec);
+
+	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
+	EO->BaseColor.Expression = Diff;
+	EO->Normal.Expression = Nrm;
+	// RAGE spec maps are colour maps; take one channel for UE's scalar Specular input.
+	EO->Specular.Expression = Spec;
+	EO->Specular.MaskR = 1; EO->Specular.Mask = 1;
+	EO->Specular.MaskG = 0; EO->Specular.MaskB = 0; EO->Specular.MaskA = 0;
+	// The cutout IS the diffuse alpha - the same wiring EnsureFoliageMaster uses.
+	EO->OpacityMask.Expression = Diff;
+	EO->OpacityMask.MaskA = 1; EO->OpacityMask.Mask = 1;
+	EO->OpacityMask.MaskR = 0; EO->OpacityMask.MaskG = 0; EO->OpacityMask.MaskB = 0;
+	M->PostEditChange();
+	M->MarkPackageDirty();
+	FAssetRegistryModule::AssetCreated(M);
+	return M;
+}
+
 static UMaterialInterface* EnsureTerrainMaster()
 {
 	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_Terrain.M_RUDE_Terrain");
@@ -1442,10 +1512,14 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		{
 			return EnsureFoliageMaster();    // two-sided foliage shading (leaf cards)
 		}
-		else if (Bucket == 1 || Bucket == 3 ||
-		         P.Contains(TEXT("cutout")) || P.Contains(TEXT("alpha")))
+		else if (Bucket == 3 || P.Contains(TEXT("cutout")))
 		{
-			Path = TEXT("/RUDE/Masters/M_RUDE_Cutout.M_RUDE_Cutout");
+			// ⛔ Bucket 3 is RAGE's CUTOUT (alpha-TESTED). Bucket 1 is alpha-BLENDED - glass -
+			// and routing it here would alpha-TEST glass, punching holes in it. Until a proper
+			// translucent master exists, bucket 1 stays on Opaque: rendering glass opaque is
+			// today's behaviour and is strictly less wrong than perforating it. (2026-07-28;
+			// bucket 1 measured at 2.0% of downtown, bucket 3 at 14.6%.)
+			return EnsureCutoutMaster();
 		}
 		return LoadObject<UMaterialInterface>(nullptr, Path);
 	};
@@ -1464,6 +1538,34 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	};
 
 	int32 BoundTextures = 0;
+	// ⛔ THE COUNTER THAT CANNOT LIE. UMaterialInstance::SetTextureParameterValueInternal does NO
+	// validation against the parent's parameter set (Engine/Private/Materials/MaterialInstance.cpp
+	// ~4309): binding "Normal" onto a master that HAS no Normal succeeds, persists in the uasset,
+	// shows in the MI editor - and renders nothing. So a rising "boundTextures" proves nothing.
+	// UnsupportedByMaster counts exactly those silent no-ops; a non-zero value is a real defect.
+	int32 UnsupportedByMaster = 0;   // sampler mapped, but the MASTER has no such parameter
+	int32 MissingTextures = 0;       // XML named a texture that is not imported in this project
+	int32 UnmappedSamplers = 0;      // a sampler name with no entry in GSamplerBinds (see below)
+
+	// Sampler name -> master parameter. Keyed by NAME; FString== and TMap<FString,> hashing are
+	// both case-INSENSITIVE, so no normalisation is needed. The converter's older 3-name emission
+	// is a strict SUBSET of this table, so pre-regeneration XML still binds exactly as before.
+	// ⛔ NO unknown-sampler fallback to Diffuse: that is the one rule that could shove a fur-shell
+	// or a runtime-bound hash texture into an albedo slot. UnmappedSamplers makes the residual
+	// visible instead of guessing.
+	// DELIBERATELY UNMAPPED (RAGE concepts UE replaces or cannot express): EnvironmentSampler
+	// (UE uses reflection captures), StippleSampler (dither LOD fade), ComboHeightSamplerFur*
+	// (fur shells), hash_* (runtime-bound, carry no texture).
+	static const TPair<const TCHAR*, const TCHAR*> GSamplerBinds[] = {
+		{ TEXT("DiffuseSampler"),     TEXT("Diffuse")     },
+		{ TEXT("BumpSampler"),        TEXT("Normal")      },
+		{ TEXT("SpecSampler"),        TEXT("Specular")    },
+		{ TEXT("TextureSamp"),        TEXT("Diffuse")     },  // cable's albedo: 152/152 resolve
+		{ TEXT("distanceMapSampler"), TEXT("Diffuse")     },  // distance_map's only colour source
+		{ TEXT("DetailSampler"),      TEXT("Detail")      },  // inert until the masters gain Detail
+		{ TEXT("TintPaletteSampler"), TEXT("TintPalette") },  // inert until the palettes import
+		{ TEXT("DirtSampler"),        TEXT("Dirt")        },  // inert until those textures import
+	};
 	TMap<FString, UMaterialInstanceConstant*> MIByConfig;   // dedupe: same shader config -> shared MI
 	for (int32 GeoIdx = 0; GeoIdx < Geos.Num(); ++GeoIdx)
 	{
@@ -1513,57 +1615,81 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 						MIPackage, FName(*MIName), RF_Public | RF_Standalone);
 				}
 				MIC->SetParentEditorOnly(Master);
-				if (UTexture2D* T = FindTexture(Def->Diffuse))
+
+				// What parameters does this MASTER actually expose? Asking is the whole point -
+				// see the UnsupportedByMaster comment where it is declared.
+				TSet<FName> MasterParams;
 				{
-					MIC->SetTextureParameterValueEditorOnly(
-						FMaterialParameterInfo(TEXT("Diffuse")), T);
-					++BoundTextures;
+					TArray<FMaterialParameterInfo> Infos;
+					TArray<FGuid> Ids;
+					Master->GetAllTextureParameterInfo(Infos, Ids);
+					for (const FMaterialParameterInfo& I : Infos) { MasterParams.Add(I.Name); }
 				}
-				if (UTexture2D* T = FindTexture(Def->Normal))
+				bool bBoundDiffuse = false;
+				auto BindTex = [&](const TCHAR* Param, const FString& TexName) -> bool
 				{
-					MIC->SetTextureParameterValueEditorOnly(
-						FMaterialParameterInfo(TEXT("Normal")), T);
+					if (TexName.IsEmpty()) { return false; }
+					UTexture2D* T = FindTexture(TexName);
+					if (!T) { ++MissingTextures; return false; }
+					const FName PName(Param);
+					if (!MasterParams.Contains(PName)) { ++UnsupportedByMaster; return false; }
+					MIC->SetTextureParameterValueEditorOnly(FMaterialParameterInfo(PName), T);
 					++BoundTextures;
-				}
-				if (UTexture2D* T = FindTexture(Def->Specular))
+					if (PName == FName(TEXT("Diffuse"))) { bBoundDiffuse = true; }
+					return true;
+				};
+
+				// Walk EVERY texture parameter the shader actually declared, through the table.
+				// (Def->Diffuse/Normal/Specular are the legacy three and are already inside
+				// AllTex - binding from AllTex alone therefore loses nothing and gains the rest.)
+				for (const TPair<FString, FString>& Tex : Def->AllTex)
 				{
-					MIC->SetTextureParameterValueEditorOnly(
-						FMaterialParameterInfo(TEXT("Specular")), T);
-					++BoundTextures;
+					// Terrain's 4 blend layers are indexed, so they are matched by PREFIX rather
+					// than by table entry: TextureSampler_layerN -> DiffuseN, BumpSampler_layerN
+					// -> NormalN. Every preset carrying them is terrain_cb_w_4lyr*, which is also
+					// what selects the 4-layer master, so the pairing cannot drift.
+					FString Idx;
+					if (Tex.Key.StartsWith(TEXT("TextureSampler_layer"), ESearchCase::IgnoreCase))
+					{
+						Idx = Tex.Key.RightChop(20);
+						BindTex(*FString::Printf(TEXT("Diffuse%s"), *Idx), Tex.Value);
+						continue;
+					}
+					if (Tex.Key.StartsWith(TEXT("BumpSampler_layer"), ESearchCase::IgnoreCase))
+					{
+						Idx = Tex.Key.RightChop(17);
+						BindTex(*FString::Printf(TEXT("Normal%s"), *Idx), Tex.Value);
+						continue;
+					}
+					const TCHAR* Param = nullptr;
+					for (const TPair<const TCHAR*, const TCHAR*>& B : GSamplerBinds)
+					{
+						if (Tex.Key.Equals(B.Key, ESearchCase::IgnoreCase)) { Param = B.Value; break; }
+					}
+					if (!Param)
+					{
+						++UnmappedSamplers;
+						continue;
+					}
+					BindTex(Param, Tex.Value);
 				}
+
 				// A decal whose texture isn't in the corpus must render as NOTHING, not as
-				// an opaque white slab (the master's default texture is white).
+				// an opaque white slab (the master's default texture is white - Matt spotted the
+				// white slabs across the beach, 2026-07-25).
+				// ⚠ The predicate tracks whether a Diffuse bind SUCCEEDED, not whether the legacy
+				// DiffuseSampler name happened to resolve: with real render buckets this gate now
+				// fires on all of bucket 2, and presets whose colour arrives under another sampler
+				// name (distance_map carries only distanceMapSampler) would otherwise flip from
+				// "white slab" to "invisible".
 				if (Def->RenderBucket == 2 || Def->Preset.Contains(TEXT("decal")))
 				{
-					const bool bHasDiffuse = FindTexture(Def->Diffuse) != nullptr;
 					MIC->SetScalarParameterValueEditorOnly(
-						FMaterialParameterInfo(TEXT("Visible")), bHasDiffuse ? 1.f : 0.f);
+						FMaterialParameterInfo(TEXT("Visible")), bBoundDiffuse ? 1.f : 0.f);
 				}
-				if (bTerrain)
-				{
-					// terrain_cb_* layer samplers -> the 4-layer master's Diffuse0..3/Normal0..3
-					for (int32 li = 0; li < 4; ++li)
-					{
-						if (const FString* TN = Def->AllTex.Find(FString::Printf(TEXT("TextureSampler_layer%d"), li)))
-						{
-							if (UTexture2D* T = FindTexture(*TN))
-							{
-								MIC->SetTextureParameterValueEditorOnly(
-									FMaterialParameterInfo(*FString::Printf(TEXT("Diffuse%d"), li)), T);
-								++BoundTextures;
-							}
-						}
-						if (const FString* TN = Def->AllTex.Find(FString::Printf(TEXT("BumpSampler_layer%d"), li)))
-						{
-							if (UTexture2D* T = FindTexture(*TN))
-							{
-								MIC->SetTextureParameterValueEditorOnly(
-									FMaterialParameterInfo(*FString::Printf(TEXT("Normal%d"), li)), T);
-								++BoundTextures;
-							}
-						}
-					}
-				}
+				// (The terrain_cb_* layer samplers used to be bound by a separate block here. They
+				// now go through the SAME guarded walk above - matched by prefix - so no bind can
+				// bypass the parent-parameter check. bTerrain still selects the 4-layer master.)
 				MIC->PostEditChange();
 				MIPackage->MarkPackageDirty();
 				FAssetRegistryModule::AssetCreated(MIC);
@@ -1597,8 +1723,11 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		SlotsJson += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(",") : TEXT(""), *SlotNames[i]);
 	}
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"boundTextures\":%d,\"slots\":[%s]}"),
-		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures, *SlotsJson);
+		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,")
+		TEXT("\"boundTextures\":%d,\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
+		TEXT("\"unmappedSamplers\":%d,\"slots\":[%s]}"),
+		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures,
+		UnsupportedByMaster, MissingTextures, UnmappedSamplers, *SlotsJson);
 }
 
 // Jenkins one-at-a-time over the LOWERCASED name - RAGE's name hash, pinned to QUARRY's
