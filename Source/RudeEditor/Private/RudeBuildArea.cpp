@@ -79,10 +79,14 @@
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Editor.h"
 #include "EditorDirectories.h"
+#include "Editor/UnrealEd/Public/EditorLevelUtils.h"
+#include "FileHelpers.h"
 #include "Engine/Level.h"
+#include "Engine/LevelStreamingDynamic.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
+#include "LevelInstance/LevelInstanceActor.h"
 #include "LevelInstance/LevelInstanceInterface.h"
 #include "LevelInstance/LevelInstanceSubsystem.h"
 #include "LevelInstance/LevelInstanceTypes.h"
@@ -186,8 +190,148 @@ namespace RudeBuildArea
 // ============================================================================================
 // PackAreaLevelInstance - stage 1's whole deliverable.
 // ============================================================================================
-FString URudeToolset::PackAreaLevelInstance(const FString& AreaName, const FString& ActorTag)
+namespace RudeBuildArea
 {
+	// ⭐ THE HEADLESS PATH - build what CreateLevelInstanceFrom builds, without its modal.
+	// WHY THIS EXISTS: UE 5.8 hardcodes bUseSaveAs=true inside the subsystem
+	// (LevelInstanceSubsystem.cpp:1439), and ULevelInstanceSubsystem exposes no other creation
+	// entry point, so "Build Full Map runs headless via an agent" (UX section 10) is impossible
+	// until we assemble it ourselves. Every call below was read in the engine headers first:
+	//   EditorLevelUtils.h:172-219  FCreateNewStreamingLevelForWorldParams (bUseSaveAs, ActorsToMove,
+	//                               bUseExternalActors, DefaultFilename)
+	//   EditorLevelUtils.h:337      RemoveLevelFromWorld
+	//   LevelInstanceActor.h:74     ALevelInstance::SetWorldAsset
+	// ⚠ THE ORDER IS LOAD-BEARING: the streaming level must be detached AFTER the actors are moved
+	// and saved into it, and BEFORE the Level Instance is spawned - otherwise the same actors exist
+	// twice (once as a sublevel, once through the LI) and every instance count double-reports.
+	static ILevelInstanceInterface* CreateLevelInstanceHeadless(UWorld* World,
+		const TArray<AActor*>& ActorsToMove, const FString& PackageName,
+		TSubclassOf<AActor> LevelInstanceClass)
+	{
+		// ⛔ DefaultFilename is a FILESYSTEM PATH, not a package name. EditorLevelUtils.cpp:787
+		// hands it straight to FEditorFileUtils::SaveLevel and then runs FilenameToLongPackageName
+		// on the RESULT - so passing "/Game/..." makes the save quietly write nothing, and the
+		// engine later refuses SetWorldAsset with "package ... does not exist". (Measured
+		// 2026-07-28: that exact refusal.)
+		const FString LevelFilename = FPackageName::LongPackageNameToFilename(
+			PackageName, FPackageName::GetMapPackageExtension());
+		UEditorLevelUtils::FCreateNewStreamingLevelForWorldParams P(
+			ULevelStreamingDynamic::StaticClass(), LevelFilename);
+		P.bUseSaveAs = false;              // ⛔ the whole point: no modal
+		P.ActorsToMove = &ActorsToMove;
+		P.bUseExternalActors = true;       // OFPA, same as the dialog path (5c)
+		P.bCreateWorldPartition = false;   // an AREA is a plain level; the LI is what the WP world sees
+
+		ULevelStreaming* Streaming = UEditorLevelUtils::CreateNewStreamingLevelForWorld(*World, P);
+		if (!Streaming)
+		{
+			UE_LOG(LogTemp, Error, TEXT("[RUDE] headless: CreateNewStreamingLevelForWorld returned "
+				"null for '%s' - the level asset was not created"), *PackageName);
+			return nullptr;
+		}
+		ULevel* Created = Streaming->GetLoadedLevel();
+		const FString CreatedPackage = Streaming->GetWorldAssetPackageName();
+		if (!Created)
+		{
+			UE_LOG(LogTemp, Error, TEXT("[RUDE] headless: the streaming level for '%s' has no loaded "
+				"ULevel - refusing to spawn a Level Instance that would point at nothing"),
+				*CreatedPackage);
+			return nullptr;
+		}
+		// ⛔ MATCH THE ENGINE: CLEAR OUTLINER FOLDERS ON THE PACKED ACTORS.
+		// LevelInstanceSubsystem.cpp:1463-1468 calls SetFolderPath_Recursively(NAME_None) on every
+		// actor it packs, and this path must not diverge: CollectAreaActors matches by FOLDER as
+		// well as by tag, so an actor that keeps "RUDE_LS" inside a packed level would be
+		// re-collected by the next pack and counted twice. (Measured 2026-07-28: the headless run
+		// reported foldersSurviving 111 against the engine path's 0 - the verdict caught it.)
+		for (AActor* Moved : TActorRange<AActor>(Created->GetWorld()))
+		{
+			if (Moved && Moved->GetLevel() == Created)
+			{
+				Moved->SetFolderPath_Recursively(NAME_None);
+			}
+		}
+
+		// ⛔⛔ SAVE AGAIN - THE ENGINE SAVED IT EMPTY. EditorLevelUtils.cpp:783-828 does the work in
+		// this order: SaveLevel (the level is still EMPTY) -> AddLevelToWorld -> MoveActorsToLevel.
+		// So the asset on disk contains NO actors; the move exists only in memory. Detaching at
+		// that point throws the actors away, which is exactly what the first run measured:
+		// actorsPacked 0, instancesAfter 0, 111 unpaired. Saving maps AND content here also
+		// captures the OFPA external-actor packages the move created.
+		if (!FEditorFileUtils::SaveDirtyPackages(/*bPromptUserToSave*/ false,
+			/*bSaveMapPackages*/ true, /*bSaveContentPackages*/ true, /*bFastSave*/ false,
+			/*bNotifyNoPackagesSaved*/ false, /*bCanBeDeclined*/ false))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[RUDE] headless: SaveDirtyPackages reported failure "
+				"after moving actors into '%s' - continuing to the on-disk check, which is the "
+				"gate that actually matters"), *CreatedPackage);
+		}
+
+		// ⛔ PROVE THE ASSET IS ON DISK BEFORE DETACHING. SetWorldAsset validates existence
+		// (ULevelInstanceSubsystem::CanUseWorldAsset), so an unsaved level fails there - but by
+		// then the sublevel is already removed and the actors are gone with it. Check first, and
+		// refuse while the level is still attached and recoverable.
+		if (!FPackageName::DoesPackageExist(CreatedPackage))
+		{
+			UE_LOG(LogTemp, Error, TEXT("[RUDE] headless: '%s' was not written to disk - refusing "
+				"to detach the sublevel (the actors are still in it and recoverable)"), *CreatedPackage);
+			return nullptr;
+		}
+		// Detach the sublevel: World Partition does not stream sublevels (5c), and leaving it
+		// attached would duplicate every actor we just moved.
+		if (!UEditorLevelUtils::RemoveLevelFromWorld(Created))
+		{
+			UE_LOG(LogTemp, Error, TEXT("[RUDE] headless: RemoveLevelFromWorld failed for '%s' - "
+				"refusing to continue, because the actors would exist BOTH as a sublevel and "
+				"through the Level Instance"), *CreatedPackage);
+			return nullptr;
+		}
+
+		// The LI actor sits at the ORIGIN: with WorldOrigin semantics the contained actors keep
+		// their absolute RAGE coordinates, so any non-zero transform here would offset the area.
+		FActorSpawnParameters Spawn;
+		Spawn.ObjectFlags |= RF_Transactional;
+		UClass* Cls = LevelInstanceClass ? LevelInstanceClass.Get() : ALevelInstance::StaticClass();
+		AActor* Actor = World->SpawnActor<AActor>(Cls, FTransform::Identity, Spawn);
+		ILevelInstanceInterface* LI = Cast<ILevelInstanceInterface>(Actor);
+		if (!LI)
+		{
+			UE_LOG(LogTemp, Error, TEXT("[RUDE] headless: spawned %s is not a Level Instance"),
+				Cls ? *Cls->GetName() : TEXT("null"));
+			if (Actor) { World->DestroyActor(Actor); }
+			return nullptr;
+		}
+		if (!LI->SetWorldAsset(TSoftObjectPtr<UWorld>(FSoftObjectPath(
+			CreatedPackage + TEXT(".") + FPackageName::GetShortName(CreatedPackage)))))
+		{
+			UE_LOG(LogTemp, Error, TEXT("[RUDE] headless: SetWorldAsset('%s') refused"), *CreatedPackage);
+			World->DestroyActor(Actor);
+			return nullptr;
+		}
+		LI->UpdateLevelInstanceFromWorldAsset();
+		// ⛔ FORCE THE LOAD, SYNCHRONOUSLY. A Level Instance loads its world ASYNCHRONOUSLY, so
+		// everything downstream - the R1 instance count, the R2 transform sampling, anything a
+		// caller does next - would measure an EMPTY level and report a perfect-looking zero.
+		// (Measured 2026-07-28: actorsInLevel 114 in the asset, instancesAfter 0 in the verdict,
+		// 111 unmatched. The asset was right; the measurement was early.) BlockLoad makes the
+		// verdict describe the same moment the level exists in.
+		if (ULevelInstanceSubsystem* Sub = World->GetSubsystem<ULevelInstanceSubsystem>())
+		{
+			Sub->BlockLoadLevelInstance(LI);
+		}
+		UE_LOG(LogTemp, Display, TEXT("[RUDE] headless: created '%s' and attached a Level Instance "
+			"at the origin, no dialog"), *CreatedPackage);
+		return LI;
+	}
+}
+
+FString URudeToolset::PackAreaLevelInstance(const FString& AreaName, const FString& ActorTag,
+                                            const FString& Mode)
+{
+	// Mode is EXPLICIT: "HEADLESS" builds the level without the engine's modal Save-As;
+	// anything else uses the proven dialog path. Never inferred, never fallen back to -
+	// the two paths land the level in DIFFERENT places and that must not be a surprise.
+	const bool bHeadless = Mode.TrimStartAndEnd().Equals(TEXT("HEADLESS"), ESearchCase::IgnoreCase);
 	using namespace RudeBuildArea;
 
 	const FString Area = AreaName.TrimStartAndEnd();
@@ -379,17 +523,39 @@ FString URudeToolset::PackAreaLevelInstance(const FString& AreaName, const FStri
 	// ALevelInstance for this Type. Deterministic, and it ignores the per-project user setting the
 	// editor menu applies - a scripted pack must not depend on a user preference.
 
-	ILevelInstanceInterface* NewLI = Subsystem->CreateLevelInstanceFrom(ToPack, Params);
-
-	// ⛔ From here on every pointer in ToPack is DEAD (note 4). Do not dereference them.
-	ToPack.Empty();
-
-	if (!NewLI)
+	// ⭐ TWO PATHS, chosen EXPLICITLY - never a silent fallback (a fallback here would quietly
+	// change WHERE the level lands, which is the one thing this tool must report truthfully).
+	//   DIALOG   (default) - the engine's own CreateLevelInstanceFrom. Proven in-engine
+	//                        2026-07-28: 13,152 instances survived exactly, pivot at origin.
+	//                        Costs a modal Save-As, so it cannot run headless.
+	//   HEADLESS           - build the level ourselves. Required by Matt's "Build Full Map runs
+	//                        headless via an agent" (UX section 10), because the subsystem
+	//                        exposes NO scripted entry point (only CreateLevelInstanceFrom).
+	ILevelInstanceInterface* NewLI = nullptr;
+	if (bHeadless)
 	{
-		return Fail(TEXT("CreateLevelInstanceFrom returned null - the level was not created. Most "
-		                 "likely the 'Save Level As' dialog was cancelled (or was auto-cancelled "
-		                 "because the editor runs -unattended). Check the log for "
-		                 "LogLevelInstance/LogSlate lines"));
+		NewLI = CreateLevelInstanceHeadless(World, ToPack, Requested, nullptr);
+		ToPack.Empty();
+		if (!NewLI)
+		{
+			return Fail(TEXT("headless level creation failed - see the log for "
+			                 "LogEditorLevelUtils/LogLevelInstance. Nothing was packed"));
+		}
+	}
+	else
+	{
+		NewLI = Subsystem->CreateLevelInstanceFrom(ToPack, Params);
+
+		// ⛔ From here on every pointer in ToPack is DEAD (note 4). Do not dereference them.
+		ToPack.Empty();
+
+		if (!NewLI)
+		{
+			return Fail(TEXT("CreateLevelInstanceFrom returned null - the level was not created. "
+			                 "Most likely the 'Save Level As' dialog was cancelled (UE 5.8 always "
+			                 "uses Save-As here). Pass Mode=HEADLESS to build the level without a "
+			                 "dialog. Check the log for LogLevelInstance/LogSlate lines"));
+		}
 	}
 	AActor* LIActor = Cast<AActor>(NewLI);
 	if (!LIActor)

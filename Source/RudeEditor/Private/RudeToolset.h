@@ -322,8 +322,12 @@ public:
 	// Pack an already-spawned area into a Level Instance at /Game/RUDE/Areas/<slug>.
 	// ⛔ PivotType MUST be WorldOrigin: the default re-bases contained actors, and RAGE placements
 	// are ABSOLUTE, so a re-based level mis-places the whole area silently on export.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Pack the area you just built into its own level asset, so areas stay separate and editable.", RudeAudience="agent"))
-	static FString PackAreaLevelInstance(const FString& AreaName, const FString& ActorTag);
+	// Mode: "HEADLESS" builds the level with no dialog (required for a scripted/agent Build Full
+	// Map - UE 5.8's own CreateLevelInstanceFrom ALWAYS opens a modal Save-As); anything else uses
+	// that proven engine path. Explicit, never inferred: the two land the level in different places.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Pack the area you just built into its own level asset, so areas stay separate and editable. Mode HEADLESS avoids the save dialog.", RudeAudience="agent"))
+	static FString PackAreaLevelInstance(const FString& AreaName, const FString& ActorTag,
+	                                     const FString& Mode);
 
 	// Import a vehicle: the body drawable plus its wheel drawable placed at each wheel bone.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V vehicle into Unreal with its wheels in place."))
