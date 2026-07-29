@@ -44,6 +44,11 @@
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialExpressionVertexNormalWS.h"
+#include "ContentStreaming.h"
+#include "LevelInstance/LevelInstanceActor.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Engine/LevelStreaming.h"
+#include "ShaderCompiler.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
@@ -1922,7 +1927,8 @@ FString URudeToolset::SpawnSeaLevel(const FString& SizeMetres, const FString& ZM
 	return FString::Printf(TEXT("{\"ok\":true,\"actor\":\"RUDE_SeaLevel\",\"sizeM\":%.0f,\"zM\":%.2f}"), SizeM, ZM);
 }
 
-FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng)
+FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng,
+                                  const FString& ViewMode)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -1935,7 +1941,29 @@ FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng)
 	// missing. That is indistinguishable by eye from a real "big meshes don't render" defect, and
 	// on 2026-07-28 it cost a whole false investigation (LOG: "CaptureView WITHOUT A COMPILE
 	// BARRIER"). An unsynchronised screenshot is not a measurement.
+	//
+	// ⛔⛔ AND ASSET COMPILATION IS ONLY ONE OF FOUR THINGS TO WAIT ON (2026-07-29, Matt: "your
+	// screenshots aren't accurate, they're being taken too early while everything is mounting").
+	// The 07-28 fix blocked on FinishAllCompilation and stopped there, so the shot still fired
+	// while the scene was mid-mount. Each remaining gate fails as a DIFFERENT convincing lie:
+	//   · shaders still compiling  -> default material, i.e. flat grey
+	//   · levels still streaming   -> actors simply absent
+	//   · TEXTURE MIPS not resident-> surfaces draw untextured. ⭐ THIS is the one that makes a
+	//     correctly-bound city photograph as an untextured one, which is exactly the "most of it
+	//     isn't textured" reading this tool produced.
+	// All four must be closed before the camera moves, or the picture is not evidence.
 	FAssetCompilingManager::Get().FinishAllCompilation();
+	if (GShaderCompilingManager)
+	{
+		GShaderCompilingManager->FinishAllCompilation();
+	}
+	if (UWorld* CapWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+	{
+		CapWorld->FlushLevelStreaming(EFlushLevelStreamingType::Full);
+	}
+	// Blocking: pull every streamable texture to full residency rather than letting the streamer
+	// decide from a camera position it has not seen yet.
+	IStreamingManager::Get().StreamAllResources(0.0f);
 
 	TArray<FString> C;
 	// Semicolons are accepted as separators because -ExecCmds splits its command list on
@@ -1948,11 +1976,67 @@ FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng)
 	{
 		if (VC && VC->IsPerspective())
 		{
+			// ⛔ WHY UNLIT EXISTS (2026-07-29): "did the textures bind?" is a question about
+			// ALBEDO, and a Lit shot answers a different question - it multiplies albedo by the
+			// level's lighting, so an untextured scene and a correctly-textured scene under a dark
+			// sky look nearly identical grey. That confound cost a full re-litigation of the
+			// texture lane. UNLIT shows base colour and nothing else, which is the property under
+			// test. Lit remains the default: it is what the operator actually ships.
+			const FString VM = ViewMode.TrimStartAndEnd();
+			if (VM.Equals(TEXT("UNLIT"), ESearchCase::IgnoreCase))
+			{
+				VC->SetViewMode(VMI_Unlit);
+			}
+			else if (VM.Equals(TEXT("WIREFRAME"), ESearchCase::IgnoreCase))
+			{
+				VC->SetViewMode(VMI_Wireframe);
+			}
+			else if (!VM.IsEmpty() && !VM.Equals(TEXT("LIT"), ESearchCase::IgnoreCase))
+			{
+				return Fail(TEXT("ViewMode must be LIT, UNLIT or WIREFRAME"));
+			}
+			else
+			{
+				VC->SetViewMode(VMI_Lit);
+			}
 			VC->SetViewLocation(Loc);
 			VC->SetViewRotation(Rot);
 			VC->Invalidate();
+
+			// ⛔ THE SECOND HALF OF THE SAME LAW. Everything above settled the scene for the
+			// camera's OLD position - the streamer has never seen this viewpoint. Draw once so it
+			// does, pull residency again for what is now on screen, then draw again. Only then is
+			// the next frame worth photographing.
+			GEditor->RedrawLevelEditingViewports(/*bInvalidateHitProxies*/ true);
+			IStreamingManager::Get().StreamAllResources(0.0f);
+			FAssetCompilingManager::Get().FinishAllCompilation();
+			GEditor->RedrawLevelEditingViewports(true);
+
 			FScreenshotRequest::RequestScreenshot(OutPng, /*bShowUI*/ false, /*bAddFilenameSuffix*/ false);
-			return FString::Printf(TEXT("{\"ok\":true,\"requested\":\"%s\"}"), *OutPng);
+			// ⛔ THERE IS ONLY ONE PENDING-SCREENSHOT SLOT (2026-07-29). -ExecCmds runs its whole
+			// command list inside a single tick, so two CaptureView calls in one chain both queue
+			// a request before any frame is presented and the second SILENTLY OVERWRITES the
+			// first - the earlier file is simply never written, with ok:true reported for both.
+			// Pumping a full Slate frame here serves this request before the next command can
+			// replace it, which is what makes a LIT+UNLIT pair in one chain actually produce two
+			// files. RedrawLevelEditingViewports alone does NOT do it: the shot is taken on
+			// present, not on redraw.
+			// ⛔⛔ ONE CAPTURE PER -ExecCmds CHAIN. MEASURED, not assumed (2026-07-29):
+			//   · There is a single pending-screenshot slot. Two CaptureViews in one chain both
+			//     queue before any frame is presented, so the second REPLACES the first and only
+			//     the last file is ever written - with ok:true returned for both.
+			//   · The shot is served on a later REAL frame, after the chain finishes. It cannot be
+			//     forced from inside a command: redrawing the viewport and ticking Slate here does
+			//     not present it. A blocking wait was tried and produced the mirror defect -
+			//     ok:false for a capture that landed 140s later. A false failure is no better than
+			//     a false success.
+			// So the honest contract is: this REQUESTS a shot, the file appears after the chain
+			// ends, and the caller polls for it. To take LIT and UNLIT of the same view, run the
+			// editor twice. Do not "fix" this by adding a wait here - that has been tried.
+			return FString::Printf(
+				TEXT("{\"ok\":true,\"requested\":\"%s\",\"note\":\"lands after this ExecCmds chain")
+				TEXT(" ends - poll for the file; only the LAST CaptureView in a chain writes\"}"),
+				*OutPng);
 		}
 	}
 	return Fail(TEXT("no perspective level viewport"));
@@ -3390,6 +3474,19 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	}
 	const bool bForce = Mode.TrimStartAndEnd().Equals(TEXT("FORCE"), ESearchCase::IgnoreCase);
 	int32 Imported = 0, Skipped = 0, Failed = 0;
+	// ⛔ THE BATCH USED TO THROW THESE AWAY, and that is why "did the rebind work?" was
+	// unanswerable after 4,956 files ran with ok:true (2026-07-29). Every file reported its own
+	// texture verdict; the batch summed only ok/skip/fail, so a run that bound ZERO textures and a
+	// run that bound all of them printed the identical line. A batch must aggregate the counters
+	// its unit reports - a silent contributor has to be as loud as a failing one.
+	int32 Bound = 0, Unsupported = 0, MissingTex = 0, UnmappedSamp = 0;
+	auto SumField = [](const FString& Json, const TCHAR* Key) -> int32
+	{
+		const FString Needle = FString::Printf(TEXT("\"%s\":"), Key);
+		const int32 At = Json.Find(Needle);
+		if (At == INDEX_NONE) { return 0; }
+		return FCString::Atoi(*Json.Mid(At + Needle.Len()));
+	};
 	FString FailedFiles;
 	for (int32 i = 0; i < Lines.Num(); ++i)
 	{
@@ -3406,7 +3503,14 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 			continue;
 		}
 		const FString R = ImportYdr(Path, DestFolder);
-		if (R.Contains(TEXT("\"ok\":true"))) { ++Imported; }
+		if (R.Contains(TEXT("\"ok\":true")))
+		{
+			++Imported;
+			Bound        += SumField(R, TEXT("boundTextures"));
+			Unsupported  += SumField(R, TEXT("unsupportedByMaster"));
+			MissingTex   += SumField(R, TEXT("missingTextures"));
+			UnmappedSamp += SumField(R, TEXT("unmappedSamplers"));
+		}
 		else
 		{
 			++Failed;
@@ -3417,8 +3521,11 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		}
 		if ((i + 1) % 50 == 0)
 		{
-			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportYdrBatch %d/%d (ok %d, skip %d, fail %d)"),
-				i + 1, Lines.Num(), Imported, Skipped, Failed);
+			UE_LOG(LogTemp, Display,
+				TEXT("[RUDE] ImportYdrBatch %d/%d (ok %d, skip %d, fail %d | tex bound %d, "
+				     "unsupported %d, missing %d, unmapped %d)"),
+				i + 1, Lines.Num(), Imported, Skipped, Failed,
+				Bound, Unsupported, MissingTex, UnmappedSamp);
 		}
 		if ((i + 1) % 250 == 0)
 		{
@@ -3427,9 +3534,15 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
 		}
 	}
+	UE_LOG(LogTemp, Display,
+		TEXT("[RUDE] ImportYdrBatch DONE: %d imported, %d skipped, %d failed | textures bound %d, "
+		     "unsupportedByMaster %d, missing %d, unmappedSamplers %d"),
+		Imported, Skipped, Failed, Bound, Unsupported, MissingTex, UnmappedSamp);
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"imported\":%d,\"skipped\":%d,\"failed\":%d,\"failedFiles\":[%s]}"),
-		Imported, Skipped, Failed, *FailedFiles);
+		TEXT("{\"ok\":true,\"imported\":%d,\"skipped\":%d,\"failed\":%d,\"boundTextures\":%d,")
+		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,\"unmappedSamplers\":%d,")
+		TEXT("\"failedFiles\":[%s]}"),
+		Imported, Skipped, Failed, Bound, Unsupported, MissingTex, UnmappedSamp, *FailedFiles);
 }
 
 FString URudeToolset::SaveAssets()
@@ -3446,6 +3559,149 @@ FString URudeToolset::SaveAssets()
 		/*bSaveContentPackages*/ true, /*bFastSave*/ false,
 		/*bNotifyNoPackagesSaved*/ false, /*bCanBeDeclined*/ false);
 	return FString::Printf(TEXT("{\"ok\":%s}"), bOk ? TEXT("true") : TEXT("false"));
+}
+
+FString URudeToolset::FixLevelRefs(const FString& Mode)
+{
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World)
+	{
+		return TEXT("{\"ok\":false,\"error\":\"no editor world\"}");
+	}
+	const bool bApply = Mode.TrimStartAndEnd().Equals(TEXT("APPLY"), ESearchCase::IgnoreCase);
+
+	// Collect first, mutate second - RemoveStreamingLevel edits the array we would be walking.
+	TArray<ULevelStreaming*> Dangling;
+	FString Names;
+	const TArray<ULevelStreaming*>& Streaming = World->GetStreamingLevels();
+	const int32 Checked = Streaming.Num();
+	for (ULevelStreaming* Level : Streaming)
+	{
+		if (!Level)
+		{
+			continue;
+		}
+		const FString PackageName = Level->GetWorldAssetPackageName();
+		// DoesPackageExist is the authority here, not the asset registry: a package deleted while
+		// the editor was open can still sit in the registry's cache, which is exactly the state
+		// that produces the load error.
+		if (PackageName.IsEmpty() || !FPackageName::DoesPackageExist(PackageName))
+		{
+			Dangling.Add(Level);
+			Names += FString::Printf(TEXT("%s\"%s\""), Names.IsEmpty() ? TEXT("") : TEXT(","),
+			                         *PackageName);
+		}
+	}
+
+	// ⭐ AND THE OTHER KIND, which is the one that actually bit (2026-07-29): a Level Instance is
+	// an ACTOR holding a soft world-asset pointer, not an entry in the streaming array. Delete the
+	// level package and the persistent map still spawns an ALevelInstance pointing nowhere - it
+	// reports the same "Failed to find streamed level ..." text, so the message alone does not
+	// tell you which of the two you have. Checking only the streaming array reported
+	// "checked:0, dangling:0" on a map that was visibly broken. Check both, always.
+	TArray<ALevelInstance*> DanglingLI;
+	for (TActorIterator<ALevelInstance> It(World); It; ++It)
+	{
+		ALevelInstance* LI = *It;
+		if (!LI) { continue; }
+		const FString Pkg = LI->GetWorldAssetPackage();
+		if (Pkg.IsEmpty() || !FPackageName::DoesPackageExist(Pkg))
+		{
+			DanglingLI.Add(LI);
+			Names += FString::Printf(TEXT("%s\"%s (LevelInstance)\""),
+			                         Names.IsEmpty() ? TEXT("") : TEXT(","), *Pkg);
+		}
+	}
+
+	// ⭐⭐ AND THE THIRD KIND, which is the one that was ACTUALLY broken (2026-07-29). On a WORLD
+	// PARTITION map every actor is its own external package and is NOT LOADED at startup, so
+	// TActorIterator sees none of them: both checks above returned a confident "0 dangling" for a
+	// map that threw "Failed to find streamed level" on every open. A check that cannot see the
+	// broken thing is worse than no check - it reports healthy.
+	// The asset registry knows the dependency graph WITHOUT loading anything, so ask it: does any
+	// external actor package of this world depend on a /Game package that no longer exists? That
+	// is the dangling reference, found headlessly and by name.
+	// ⛔ Do NOT try to answer this by grepping the .umap - an object path is not stored as plain
+	// text there, and that assumption is what produced this broken state to begin with.
+	TArray<FString> DanglingActorPkgs;
+	{
+		FAssetRegistryModule& ARM =
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		IAssetRegistry& AR = ARM.Get();
+		const FString ExtPath = ULevel::GetExternalActorsPath(World->GetPackage()->GetName());
+		if (!ExtPath.IsEmpty())
+		{
+			AR.ScanPathsSynchronous({ ExtPath }, /*bForceRescan*/ true);
+			if (AR.IsLoadingAssets()) { AR.WaitForCompletion(); }
+			TArray<FAssetData> ActorAssets;
+			AR.GetAssetsByPath(FName(*ExtPath), ActorAssets, /*bRecursive*/ true);
+			for (const FAssetData& AD : ActorAssets)
+			{
+				TArray<FName> Deps;
+				AR.GetDependencies(AD.PackageName, Deps,
+				                   UE::AssetRegistry::EDependencyCategory::Package);
+				for (const FName& Dep : Deps)
+				{
+					const FString DepStr = Dep.ToString();
+					if (!DepStr.StartsWith(TEXT("/Game/"))) { continue; }
+					if (FPackageName::DoesPackageExist(DepStr)) { continue; }
+					DanglingActorPkgs.AddUnique(AD.PackageName.ToString());
+					Names += FString::Printf(TEXT("%s\"%s -> MISSING %s\""),
+					                         Names.IsEmpty() ? TEXT("") : TEXT(","),
+					                         *AD.PackageName.ToString(), *DepStr);
+				}
+			}
+		}
+	}
+
+	int32 Removed = 0;
+	bool bSaved = false;
+	if (bApply && DanglingActorPkgs.Num() > 0)
+	{
+		// The external actor package IS the actor. Its target is gone and cannot be restored, so
+		// deleting the package is the repair - and it works while the actor is UNLOADED, which is
+		// the whole reason this goes through the registry instead of the actor iterator.
+		for (const FString& Pkg : DanglingActorPkgs)
+		{
+			FString Filename;
+			if (FPackageName::DoesPackageExist(Pkg, &Filename)
+				&& IFileManager::Get().Delete(*Filename))
+			{
+				++Removed;
+			}
+		}
+	}
+	if (bApply && (Dangling.Num() > 0 || DanglingLI.Num() > 0))
+	{
+		for (ULevelStreaming* Level : Dangling)
+		{
+			World->RemoveStreamingLevel(Level);
+			++Removed;
+		}
+		for (ALevelInstance* LI : DanglingLI)
+		{
+			// The actor is the only thing holding the broken pointer - with its target gone there
+			// is nothing to repair it to, so removing it IS the repair.
+			World->EditorDestroyActor(LI, /*bShouldModifyLevel*/ true);
+			++Removed;
+		}
+		World->MarkPackageDirty();
+		// Maps ONLY here - repairing the map package is this tool's entire purpose, and it is the
+		// one thing SaveAssets deliberately refuses to touch.
+		bSaved = FEditorFileUtils::SaveDirtyPackages(
+			/*bPromptUserToSave*/ false, /*bSaveMapPackages*/ true,
+			/*bSaveContentPackages*/ false, /*bFastSave*/ false,
+			/*bNotifyNoPackagesSaved*/ false, /*bCanBeDeclined*/ false);
+	}
+	UE_LOG(LogTemp, Display,
+	       TEXT("[RUDE] FixLevelRefs: %d streaming levels (%d dangling), %d dangling level "
+	            "instances, %d removed"),
+	       Checked, Dangling.Num(), DanglingLI.Num(), Removed);
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"checked\":%d,\"dangling\":%d,\"danglingLevelInstances\":%d,")
+		TEXT("\"removed\":%d,\"saved\":%s,\"names\":[%s]}"),
+		Checked, Dangling.Num(), DanglingLI.Num(), Removed,
+		bSaved ? TEXT("true") : TEXT("false"), *Names);
 }
 
 FString URudeToolset::ImportYtdBatch(const FString& ListPath, const FString& DestFolder,

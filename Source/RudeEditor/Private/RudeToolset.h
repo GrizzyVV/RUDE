@@ -122,8 +122,12 @@ public:
 	// compilation finishes smallest-first, so an unsynchronised shot shows the small props and
 	// drops the large meshes - a convincing but FALSE "big meshes are missing" defect
 	// (2026-07-28, LOG). Never remove that barrier.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Point the viewport somewhere and save a screenshot to disk.", RudeAudience="agent"))
-	static FString CaptureView(const FString& CamSpec, const FString& OutPng);
+	// ViewMode: "" / "LIT" (default) · "UNLIT" · "WIREFRAME". ⭐ Use UNLIT to answer "did the
+	// textures bind?" - a Lit shot multiplies albedo by scene lighting, so under a dark sky an
+	// untextured city and a fully textured one photograph as the same grey (2026-07-29).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Point the viewport somewhere and save a screenshot to disk. Use UNLIT to see texture colours without lighting.", RudeAudience="agent"))
+	static FString CaptureView(const FString& CamSpec, const FString& OutPng,
+	                           const FString& ViewMode);
 
 	// File a FLAT export dump into the filebase. You export from whatever extractor you
 	// already use into any folder (they dump files flat); this sorts them by type into
@@ -158,6 +162,18 @@ public:
 	// Returns JSON: {ok} (SaveDirtyPackages reports only overall success).
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save every changed RUDE asset to disk. Does not touch your level - saving the map stays yours.", RudeAudience="agent"))
 	static FString SaveAssets();
+
+	// Drop streaming-level entries whose package no longer exists on disk, then save the map.
+	// ⛔ WHY THIS EXISTS (2026-07-29, Matt hit it twice): deleting a sublevel from the Content
+	// Browser removes the PACKAGE but leaves the persistent level's streaming-level array pointing
+	// at it, so every subsequent open throws "Failed to find streamed level ..., please fix the
+	// reference to it in the Level Browser". The reference is real and dangling - it is NOT fixed
+	// by rescanning, and it cannot be found by grepping the .umap (a soft object path is not plain
+	// text in a uasset - that assumption is what created this mess in the first place).
+	// Mode="APPLY" writes; anything else reports what it WOULD remove and changes nothing.
+	// Returns JSON: {ok, checked, dangling, removed, saved, names:[...]}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Repair a level that complains about missing sublevels, by forgetting the ones that are gone.", RudeAudience="agent"))
+	static FString FixLevelRefs(const FString& Mode);
 
 	// Batch ImportYtd: ListPath = a text file of absolute *.ytd.xml paths, one per line.
 	// Each entry's PixelFolder is DERIVED - QUARRY writes the decoded pixels to a sibling
