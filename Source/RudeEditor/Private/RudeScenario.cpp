@@ -691,9 +691,19 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 	{
 		const FScenLoadSave& L = LoadSaves[i];
 		if (!TypeFilter.Passes(L.SpawnType.ToLower())) { continue; }
-		AActor* A = SpawnMarker(World, ConeMesh,
+		// ⛔ NON-DIRECTIONAL ON PURPOSE (fixed 2026-07-29 after review). These used to spawn a
+		// CONE oriented by the raw mirrored quaternion, which put the facing ~170 deg out: the
+		// cone points along +X, while a scenario point's heading is derived through
+		// HeadingToUeYawDegrees from a RAGE +Y reference. The two paths disagreed.
+		// The heading convention for a LoadSavePoint's offsetRotation has NOT been measured the
+		// way vPositionAndDirection.w was (58,082 chain edges), and there are only two of these
+		// in the entire shipped game - far too few to derive one. So show the POSITION, which is
+		// measured and correct, and show NO facing rather than an invented one. A sphere cannot
+		// imply a direction it does not know. Restore a directional marker only after the
+		// convention is measured.
+		AActor* A = SpawnMarker(World, SphereMesh,
 			FString::Printf(TEXT("LSP_%s_%d"), *L.SpawnType, i),
-			L.UeLoc, L.Rot, PointMarkerScale, true, RootActor);
+			L.UeLoc, FQuat::Identity, PointMarkerScale, false, RootActor);
 		if (!A) { continue; }
 		A->Tags.Add(IdTag);
 		A->Tags.Add(FName(*FString::Printf(TEXT("RUDE_SCEN_LoadSave:%d"), i)));
