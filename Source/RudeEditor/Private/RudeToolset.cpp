@@ -1484,16 +1484,34 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	{
 		FAssetRegistryModule& ARM =
 			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		IAssetRegistry& AR = ARM.Get();
+		// ⛔⛔ WAIT FOR THE REGISTRY, OR THIS QUERY LIES. GetAssets answers from whatever has been
+		// scanned SO FAR - it does not block. Driven from -ExecCmds at editor startup (which is how
+		// every agent/CI run drives RUDE) the initial scan is still in flight, so this returns few
+		// or NO textures, TextureByName comes back empty, and every FindTexture misses. The import
+		// then "succeeds" with boundTextures 0 and writes MaterialInstances with nothing bound.
+		// MEASURED 2026-07-29: a FORCE rebind of 4,956 downtown meshes bound essentially nothing
+		// this way - the city rendered untextured with default-checker patches - while 13 of the 17
+		// textures a single building wanted were sitting in the project the whole time.
+		AR.ScanPathsSynchronous({ TEXT("/Game/RUDE/Textures") }, /*bForceRescan*/ false);
+		if (AR.IsLoadingAssets())
+		{
+			AR.WaitForCompletion();
+		}
 		FARFilter Filter;
 		Filter.PackagePaths.Add(TEXT("/Game/RUDE/Textures"));
 		Filter.bRecursivePaths = true;
 		Filter.ClassPaths.Add(UTexture2D::StaticClass()->GetClassPathName());
 		TArray<FAssetData> Found;
-		ARM.Get().GetAssets(Filter, Found);
+		AR.GetAssets(Filter, Found);
 		for (const FAssetData& AD : Found)
 		{
 			TextureByName.Add(AD.AssetName.ToString().ToLower(), AD);
 		}
+		// An empty texture library is never normal for a project that has imported any ytd. Say so
+		// once, loudly, rather than letting thousands of silent misses look like missing source data.
+		UE_LOG(LogTemp, Display, TEXT("[RUDE] texture library: %d textures visible under "
+			"/Game/RUDE/Textures"), TextureByName.Num());
 	}
 
 	auto MasterForPreset = [](const FString& Preset, int32 Bucket) -> UMaterialInterface*
