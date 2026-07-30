@@ -79,7 +79,15 @@ Two argument-passing traps, both measured:
 
 ---
 
-## 3. The tool surface — 24 tools
+## 3. The tool surface
+
+> ⛔ **`Source/RudeEditor/Private/RudeToolset.h` IS the tool surface — this table is a summary and
+> WILL lag.** It said "24 tools" while the header declared 30, and omitted `SetWorldHour`,
+> `FixLevelRefs` and `ExportYdrBinaryBatch` entirely. A count in prose drifts every time a tool
+> lands; the header cannot. **Read the header, and treat any disagreement as this file being stale.**
+> Recently added and missing below: `SetWorldHour` (time-of-day visibility from the game's
+> `timeFlags` masks) · `FixLevelRefs` (repairs dangling sublevel references) ·
+> `ExportYdrBinaryBatch` (batch export — a district is a batch size, not a different workflow).
 
 Sorted alphabetically, which is exactly the order `FRudeInvoke::CollectTools` produces, so this
 table **diffs line-for-line against `-list`**. That is the intended way to check it.
