@@ -2711,23 +2711,30 @@ static void ImportIndexedDrawable(const FString& CorpusRoot, const FRudeArchetyp
 }
 
 FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
-                                    const FString& DestMeshFolder, const FString& Filter)
+                                    const FString& DestMeshFolder, const FString& Filter,
+                                    const FString& Mode)
 {
 	auto Fail = [](const FString& Why)
 	{
 		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
 	};
-	// ⭐ "+FORCE" on the Filter re-imports meshes that already exist, which is the ONLY refresh
-	// path the yft (fragment) and ydd (dictionary) lanes have - they are reachable solely through
-	// this tool, with no per-lane batch equivalent to ImportYdrBatch. Without it, a corpus that
-	// gains data (value params, embedded textures) can only refresh its ydr meshes, leaving the
-	// project a MIX of two vintages that no counter can tell apart (2026-07-30).
-	// ⚠ Carried on Filter rather than as a new parameter ON PURPOSE: FRudeInvoke passes arguments
-	// POSITIONALLY, so adding one would break every existing RUDE.Run call and saved script. If the
-	// signature is ever revised deliberately, a separate Mode arg (as ImportYdrBatch has) is cleaner.
-	// Accepts: "HD" · "ALL" · "HD+FORCE" · "ALL+FORCE" · "FORCE" (implies HD).
+	// ⭐ Mode="FORCE" re-imports meshes that already exist. This is the ONLY refresh path the yft
+	// (fragment) and ydd (dictionary) lanes have - they are reachable solely through this tool, with
+	// no per-lane batch equivalent to ImportYdrBatch. Without it, a corpus that gains data (value
+	// params, embedded textures) can refresh only its ydr meshes, leaving the project a MIX of two
+	// vintages that no counter can tell apart (2026-07-30).
+	//
+	// ⚠ THIS WAS FIRST BUILT AS A "+FORCE" TOKEN ON Filter, on the stated grounds that adding a
+	// parameter would break existing RUDE.Run calls. Matt challenged that and it was WRONG:
+	// FRudeInvoke::Call binds arguments with `if (Values.IsValidIndex(ValueIdx))` and performs NO
+	// arity check, so a missing trailing argument simply stays an empty FString. Old 5-argument calls
+	// therefore keep working with Mode empty, which means "not FORCE" - the previous behaviour.
+	// A separate Mode is the right shape anyway: it matches ImportYdrBatch, and `Filter` means LOD
+	// LEVELS - a mode flag riding in it makes the parameter mean two things.
+	// The "+FORCE" spelling is still ACCEPTED, because silently reinterpreting it as an unknown lod
+	// filter would turn a deliberate FORCE into a no-op, and a silent no-op is worse than an alias.
 	FString LodFilter = Filter;
-	bool bForceMeshes = false;
+	bool bForceMeshes = Mode.TrimStartAndEnd().Equals(TEXT("FORCE"), ESearchCase::IgnoreCase);
 	{
 		TArray<FString> Parts;
 		Filter.ParseIntoArray(Parts, TEXT("+"), true);
@@ -2874,7 +2881,7 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 
 FString URudeToolset::ImportArea(const FString& AreaName, const FString& CatalogPath,
                                  const FString& CorpusRoot, const FString& DestMeshFolder,
-                                 const FString& Filter)
+                                 const FString& Filter, const FString& Mode)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -2946,7 +2953,7 @@ FString URudeToolset::ImportArea(const FString& AreaName, const FString& Catalog
 		{
 			return Fail(TEXT("catalog entry has no prefixes"));
 		}
-		return ImportMapArea(CorpusRoot, FString::Join(Parts, TEXT(",")), DestMeshFolder, Filter);
+		return ImportMapArea(CorpusRoot, FString::Join(Parts, TEXT(",")), DestMeshFolder, Filter, Mode);
 	}
 	if (Want.IsEmpty())
 	{

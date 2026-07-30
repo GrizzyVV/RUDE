@@ -200,16 +200,19 @@ public:
 	//    out of their <CorpusRoot>/ydd file
 	// 4) writes the scene manifest and spawns it via ImportScene (ISM actors,
 	//    idempotent, proxy cubes for corpus holes).
-	// Filter: "HD" (default) or "ALL" lod levels, optionally + "+FORCE" to RE-IMPORT meshes that
-	// already exist ("HD+FORCE", "ALL+FORCE", or bare "FORCE" meaning HD). ⭐ FORCE is the only
-	// refresh path the yft/ydd lanes have - they are reachable only through this tool, so without it
-	// a corpus that gains data can refresh only its ydr meshes and the project silently becomes a
-	// MIX of two vintages (2026-07-30). Textures remain a separate pass
+	// Filter: "HD" (default) or "ALL" lod levels.
+	// Mode: "FORCE" RE-IMPORTS meshes that already exist. ⭐ The only refresh path the yft/ydd lanes
+	// have - they are reachable only through this tool, so without it a corpus that gains data can
+	// refresh only its ydr meshes and the project silently becomes a MIX of two vintages (07-30).
+	// Empty Mode = previous behaviour (skip existing); old 5-argument calls keep working because
+	// FRudeInvoke does no arity check. "+FORCE" on Filter is still accepted as an alias, so a
+	// deliberate FORCE can never degrade into a silent no-op. Textures remain a separate pass
 	// until native BC decode lands. Returns JSON: {ok, ymaps, entities, resolved,
 	// meshesImported, meshesSkipped, meshesFailed, spawn:{...ImportScene stats}}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build a whole area of the map in your open level - brings in the models it needs and places them. WARNING: this REPLACES any area you loaded before."))
 	static FString ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
-	                             const FString& DestMeshFolder, const FString& Filter);
+	                             const FString& DestMeshFolder, const FString& Filter,
+	                             const FString& Mode);
 
 	// Import a map area by its HUMAN name ("Downtown", "Vespucci Beach & Canals", ...) using the
 	// measured area catalog (reports/area_aliases.json: 132 entries whose prefixes partition all
@@ -222,7 +225,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build a named district like 'Downtown' in your open level - no filename prefixes to know. Leave the area name empty to see every name you can pick."))
 	static FString ImportArea(const FString& AreaName, const FString& CatalogPath,
 	                          const FString& CorpusRoot, const FString& DestMeshFolder,
-	                          const FString& Filter);
+	                          const FString& Filter, const FString& Mode);
 
 	// THE INTERIOR IMPORTER (v1) - the consumer for the MLO data QUARRY now emits
 	// (ENGINEERING_LOG "MLO EMISSION" / "EXTENSIONS DECODED"). Locates the named
