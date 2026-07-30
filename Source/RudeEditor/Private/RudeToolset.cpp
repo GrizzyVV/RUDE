@@ -2683,7 +2683,8 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 // mesh name for all three lanes.
 static void ImportIndexedDrawable(const FString& CorpusRoot, const FRudeArchetypeIndex& Index,
                                   const FString& Drawable, const FString& DestMeshFolder,
-                                  int32& MeshOk, int32& MeshSkip, int32& MeshFail, int32& MeshMissing)
+                                  int32& MeshOk, int32& MeshSkip, int32& MeshFail, int32& MeshMissing,
+                                  bool bForce = false)
 {
 	const FString* Dict = Index.DictEntries.Find(Drawable);
 	const bool bFrag = !Dict && Index.FragmentAssets.Contains(Drawable);
@@ -2692,7 +2693,18 @@ static void ImportIndexedDrawable(const FString& CorpusRoot, const FRudeArchetyp
 		: CorpusRoot / (bFrag ? TEXT("yft") : TEXT("ydr"))
 			/ (Drawable + (bFrag ? TEXT(".yft.xml") : TEXT(".ydr.xml")));
 	if (!FPaths::FileExists(XmlPath)) { ++MeshMissing; return; }
-	if (FPackageName::DoesPackageExist(DestMeshFolder / Drawable)) { ++MeshSkip; return; }
+	// ⛔ WHY bForce EXISTS (2026-07-30). This skip is the ONLY gate on the fragment and dictionary
+	// lanes, and those lanes are reachable ONLY through ImportArea/ImportMapArea - there is no
+	// per-lane batch tool for them the way ImportYdrBatch serves ydr. So after the corpus gained
+	// value params and embedded textures, `ImportYdrBatch ... FORCE` refreshed the ydr meshes while
+	// every yft and ydd mesh stayed at its pre-fix vintage, and the project became a MIX of two
+	// generations that no counter could distinguish. A refresh path is not optional once the corpus
+	// can change underneath the project.
+	if (!bForce && FPackageName::DoesPackageExist(DestMeshFolder / Drawable))
+	{
+		++MeshSkip;
+		return;
+	}
 	const FString R = Dict ? URudeToolset::ImportYddEntry(XmlPath, Drawable, DestMeshFolder)
 	                       : URudeToolset::ImportYdr(XmlPath, DestMeshFolder);
 	if (R.Contains(TEXT("\"ok\":true"))) { ++MeshOk; } else { ++MeshFail; }
@@ -2705,6 +2717,29 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	{
 		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
 	};
+	// ⭐ "+FORCE" on the Filter re-imports meshes that already exist, which is the ONLY refresh
+	// path the yft (fragment) and ydd (dictionary) lanes have - they are reachable solely through
+	// this tool, with no per-lane batch equivalent to ImportYdrBatch. Without it, a corpus that
+	// gains data (value params, embedded textures) can only refresh its ydr meshes, leaving the
+	// project a MIX of two vintages that no counter can tell apart (2026-07-30).
+	// ⚠ Carried on Filter rather than as a new parameter ON PURPOSE: FRudeInvoke passes arguments
+	// POSITIONALLY, so adding one would break every existing RUDE.Run call and saved script. If the
+	// signature is ever revised deliberately, a separate Mode arg (as ImportYdrBatch has) is cleaner.
+	// Accepts: "HD" · "ALL" · "HD+FORCE" · "ALL+FORCE" · "FORCE" (implies HD).
+	FString LodFilter = Filter;
+	bool bForceMeshes = false;
+	{
+		TArray<FString> Parts;
+		Filter.ParseIntoArray(Parts, TEXT("+"), true);
+		LodFilter.Empty();
+		for (const FString& Part : Parts)
+		{
+			const FString T = Part.TrimStartAndEnd();
+			if (T.Equals(TEXT("FORCE"), ESearchCase::IgnoreCase)) { bForceMeshes = true; }
+			else if (!T.IsEmpty()) { LodFilter = T; }
+		}
+		if (LodFilter.IsEmpty()) { LodFilter = TEXT("HD"); }
+	}
 	// ---- 1) archetype index from every ytyp XML (name -> drawable assetName) ----
 	// (factored to BuildCorpusArchetypeIndex, shared with ImportMlo - behavior unchanged)
 	FRudeArchetypeIndex Index;
@@ -2811,7 +2846,8 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	{
 		++Done;
 		if (Index.DictEntries.Contains(D)) { ++DictNeeded; }
-		ImportIndexedDrawable(CorpusRoot, Index, D, DestMeshFolder, MeshOk, MeshSkip, MeshFail, MeshMissing);
+		ImportIndexedDrawable(CorpusRoot, Index, D, DestMeshFolder, MeshOk, MeshSkip, MeshFail,
+		                      MeshMissing, bForceMeshes);
 		if (Done % 100 == 0)
 		{
 			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportMapArea meshes %d/%d (ok %d, skip %d, fail %d)"),
@@ -2826,7 +2862,8 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 		TEXT("[RUDE] ImportMapArea dictionary-entry drawables: %d of %d needed (ok %d, skip %d, fail %d, missing %d overall)"),
 		DictNeeded, NeededDrawables.Num(), MeshOk, MeshSkip, MeshFail, MeshMissing);
 	// ---- 4) spawn through the proven ImportScene path ----
-	const FString Spawn = ImportScene(ManifestPath, DestMeshFolder, Filter);
+	// The spawn only understands lod levels - never hand it the FORCE token.
+	const FString Spawn = ImportScene(ManifestPath, DestMeshFolder, LodFilter);
 	return FString::Printf(TEXT(
 		"{\"ok\":true,\"ymaps\":%d,\"entities\":%d,\"resolved\":%d,\"meshesImported\":%d,"
 		"\"meshesSkipped\":%d,\"meshesFailed\":%d,\"meshesMissingFromCorpus\":%d,"

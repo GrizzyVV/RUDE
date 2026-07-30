@@ -200,7 +200,11 @@ public:
 	//    out of their <CorpusRoot>/ydd file
 	// 4) writes the scene manifest and spawns it via ImportScene (ISM actors,
 	//    idempotent, proxy cubes for corpus holes).
-	// Filter: "HD" (default) or "ALL" lod levels. Textures remain a separate pass
+	// Filter: "HD" (default) or "ALL" lod levels, optionally + "+FORCE" to RE-IMPORT meshes that
+	// already exist ("HD+FORCE", "ALL+FORCE", or bare "FORCE" meaning HD). ⭐ FORCE is the only
+	// refresh path the yft/ydd lanes have - they are reachable only through this tool, so without it
+	// a corpus that gains data can refresh only its ydr meshes and the project silently becomes a
+	// MIX of two vintages (2026-07-30). Textures remain a separate pass
 	// until native BC decode lands. Returns JSON: {ok, ymaps, entities, resolved,
 	// meshesImported, meshesSkipped, meshesFailed, spawn:{...ImportScene stats}}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build a whole area of the map in your open level - brings in the models it needs and places them. WARNING: this REPLACES any area you loaded before."))
