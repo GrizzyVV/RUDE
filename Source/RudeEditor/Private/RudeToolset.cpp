@@ -41,6 +41,7 @@
 #include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionSubtract.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
+#include "Materials/MaterialExpressionTextureCoordinate.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialExpressionVertexNormalWS.h"
@@ -232,6 +233,125 @@ static UMaterialInterface* EnsureCutoutMaster()
 	EO->OpacityMask.Expression = Diff;
 	EO->OpacityMask.MaskA = 1; EO->OpacityMask.Mask = 1;
 	EO->OpacityMask.MaskR = 0; EO->OpacityMask.MaskG = 0; EO->OpacityMask.MaskB = 0;
+	M->PostEditChange();
+	M->MarkPackageDirty();
+	FAssetRegistryModule::AssetCreated(M);
+	return M;
+}
+
+// The detail-map master. RAGE's *_detail presets bind a high-frequency DetailSampler that tiles
+// over the albedo, and until 2026-07-29 we could not use it: the tiling lives in `detailSettings`,
+// which QUARRY was dropping along with every other non-texture shader parameter.
+//
+// MEASURED (1,994 samples, whole base set) - `detailSettings` component semantics:
+//   .x  strength      0.0-8.0, typically 0.8-1.5
+//   .y  secondary     0.0-6.0, but 64.9% are ZERO -> not load-bearing, left unused here
+//   .z  tile U        0.0-32.0, typically 4-8
+//   .w  tile V        0.0-48.0, typically 3-8
+//
+// \u26d4 NEUTRAL BY DEFAULT, deliberately. `DetailAmount` defaults to 0, so this master renders
+// EXACTLY like the opaque one until ImportYdr proves a detail texture actually bound and sets it to
+// 1. That property is the whole reason it is safe to ship without Matt having seen it yet: the
+// failure mode of a wrong strength guess is "looks like today", not "looks worse than today".
+// \u26a0 The exact RAGE blend is NOT measured - this is the standard signed overlay around mid-grey
+// (\U0001f9e0 INFERRED, not \u2705). It is the conventional detail-map formula and is neutral when the detail
+// texture is flat grey, which is why a wrong guess degrades gracefully.
+static UMaterialInterface* EnsureDetailMaster()
+{
+	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_Detail.M_RUDE_Detail");
+	UMaterial* M = LoadObject<UMaterial>(nullptr, FullPath);
+	if (M)
+	{
+		TArray<FMaterialParameterInfo> Infos;
+		TArray<FGuid> Ids;
+		M->GetAllScalarParameterInfo(Infos, Ids);
+		for (const FMaterialParameterInfo& I : Infos)
+		{
+			if (I.Name == FName(TEXT("DetailAmount"))) { return M; }
+		}
+		M->GetExpressionCollection().Empty();   // ours, regenerable
+	}
+	else
+	{
+		UPackage* Pkg = CreatePackage(TEXT("/RUDE/Masters/M_RUDE_Detail"));
+		if (!Pkg) { return nullptr; }
+		M = NewObject<UMaterial>(Pkg, TEXT("M_RUDE_Detail"), RF_Public | RF_Standalone);
+	}
+
+	UTexture* DefWhite = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+	UTexture* DefNormal = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineMaterials/FlatNormal.FlatNormal"));
+
+	auto Add = [M](UMaterialExpression* E, int32 X, int32 Y)
+	{
+		E->MaterialExpressionEditorX = X; E->MaterialExpressionEditorY = Y;
+		M->GetExpressionCollection().AddExpression(E);
+	};
+
+	auto* Diff = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Diff->ParameterName = TEXT("Diffuse"); Diff->SamplerType = SAMPLERTYPE_Color; Diff->Texture = DefWhite;
+	Add(Diff, -1000, 0);
+	auto* Nrm = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Nrm->ParameterName = TEXT("Normal"); Nrm->SamplerType = SAMPLERTYPE_Normal; Nrm->Texture = DefNormal;
+	Add(Nrm, -1000, 700);
+	auto* Spec = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Spec->ParameterName = TEXT("Specular"); Spec->SamplerType = SAMPLERTYPE_Color; Spec->Texture = DefWhite;
+	Add(Spec, -1000, 1000);
+
+	// detailSettings: the name MATCHES the RAGE parameter, so ImportYdr's generic value-param
+	// binding sets it with no special case anywhere.
+	auto* Settings = NewObject<UMaterialExpressionVectorParameter>(M);
+	Settings->ParameterName = TEXT("detailSettings");
+	Settings->DefaultValue = FLinearColor(1.f, 0.f, 1.f, 1.f);
+	Add(Settings, -1600, -400);
+
+	auto* Amount = NewObject<UMaterialExpressionScalarParameter>(M);
+	Amount->ParameterName = TEXT("DetailAmount");
+	Amount->DefaultValue = 0.f;          // \u26d4 neutral until a detail texture really bound
+	Add(Amount, -1600, -250);
+
+	// Detail UV = TexCoord * detailSettings.zw
+	auto* UV = NewObject<UMaterialExpressionTextureCoordinate>(M);
+	Add(UV, -1600, -100);
+	auto* TileZW = NewObject<UMaterialExpressionComponentMask>(M);
+	TileZW->Input.Expression = Settings;
+	TileZW->R = false; TileZW->G = false; TileZW->B = true; TileZW->A = true;
+	Add(TileZW, -1400, -400);
+	auto* UVMul = NewObject<UMaterialExpressionMultiply>(M);
+	UVMul->A.Expression = UV; UVMul->B.Expression = TileZW;
+	Add(UVMul, -1250, -150);
+
+	auto* Det = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+	Det->ParameterName = TEXT("Detail"); Det->SamplerType = SAMPLERTYPE_Color; Det->Texture = DefWhite;
+	Det->Coordinates.Expression = UVMul;
+	Add(Det, -1000, -300);
+
+	// signed overlay: 1 + (Detail - 0.5) * 2 * strength(.x) * DetailAmount
+	auto* Half = NewObject<UMaterialExpressionConstant>(M); Half->R = 0.5f; Add(Half, -900, -520);
+	auto* Sub = NewObject<UMaterialExpressionSubtract>(M);
+	Sub->A.Expression = Det; Sub->B.Expression = Half; Add(Sub, -760, -400);
+	auto* Two = NewObject<UMaterialExpressionConstant>(M); Two->R = 2.f; Add(Two, -900, -300);
+	auto* Signed = NewObject<UMaterialExpressionMultiply>(M);
+	Signed->A.Expression = Sub; Signed->B.Expression = Two; Add(Signed, -620, -400);
+	auto* StrX = NewObject<UMaterialExpressionComponentMask>(M);
+	StrX->Input.Expression = Settings;
+	StrX->R = true; StrX->G = false; StrX->B = false; StrX->A = false;
+	Add(StrX, -760, -250);
+	auto* ByStr = NewObject<UMaterialExpressionMultiply>(M);
+	ByStr->A.Expression = Signed; ByStr->B.Expression = StrX; Add(ByStr, -480, -400);
+	auto* ByAmt = NewObject<UMaterialExpressionMultiply>(M);
+	ByAmt->A.Expression = ByStr; ByAmt->B.Expression = Amount; Add(ByAmt, -350, -400);
+	auto* One = NewObject<UMaterialExpressionConstant>(M); One->R = 1.f; Add(One, -480, -160);
+	auto* Gain = NewObject<UMaterialExpressionAdd>(M);
+	Gain->A.Expression = One; Gain->B.Expression = ByAmt; Add(Gain, -220, -300);
+	auto* Final = NewObject<UMaterialExpressionMultiply>(M);
+	Final->A.Expression = Diff; Final->B.Expression = Gain; Add(Final, -80, 0);
+
+	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
+	EO->BaseColor.Expression = Final;
+	EO->Normal.Expression = Nrm;
+	EO->Specular.Expression = Spec;
+	EO->Specular.MaskR = 1; EO->Specular.Mask = 1;
+	EO->Specular.MaskG = 0; EO->Specular.MaskB = 0; EO->Specular.MaskA = 0;
 	M->PostEditChange();
 	M->MarkPackageDirty();
 	FAssetRegistryModule::AssetCreated(M);
@@ -1556,6 +1676,15 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		{
 			return EnsureFoliageMaster();    // two-sided foliage shading (leaf cards)
 		}
+		else if (P.Contains(TEXT("detail")) && Bucket != 1)
+		{
+			// ⭐ *_detail presets (normal_spec_detail, normal_detail, default_detail,
+			// normal_spec_detail_tnt, normal_spec_decal_detail) - 6,264 DetailSampler bindings in
+			// the corpus. Routed here ONLY for opaque/cutout-ish buckets: bucket 1 is alpha-blended
+			// and keeps its existing treatment, and decal/foliage above still win because those are
+			// about BLEND MODE, which matters more than a detail overlay.
+			return EnsureDetailMaster();
+		}
 		else if (Bucket == 3 || P.Contains(TEXT("cutout")))
 		{
 			// ⛔ Bucket 3 is RAGE's CUTOUT (alpha-TESTED). Bucket 1 is alpha-BLENDED - glass -
@@ -1587,6 +1716,8 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	// ~4309): binding "Normal" onto a master that HAS no Normal succeeds, persists in the uasset,
 	// shows in the MI editor - and renders nothing. So a rising "boundTextures" proves nothing.
 	// UnsupportedByMaster counts exactly those silent no-ops; a non-zero value is a real defect.
+	int32 ValueParamsBound = 0;      // value param the master DOES expose, so it took effect
+	int32 ValueParamsUnsupported = 0;// value param arrived but no master parameter accepts it
 	int32 UnsupportedByMaster = 0;   // sampler mapped, but the MASTER has no such parameter
 	int32 MissingTextures = 0;       // XML named a texture that is not imported in this project
 	int32 UnmappedSamplers = 0;      // a sampler name with no entry in GSamplerBinds (see below)
@@ -1734,6 +1865,54 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 				// (The terrain_cb_* layer samplers used to be bound by a separate block here. They
 				// now go through the SAME guarded walk above - matched by prefix - so no bind can
 				// bypass the parent-parameter check. bTerrain still selects the 4-layer master.)
+
+				// ⛔ PROVE IT BEFORE ENABLING IT. DetailAmount defaults to 0 in the master, so the
+				// detail overlay is inert until a Detail texture genuinely bound. Same shape as the
+				// decal 'Visible' gate: never switch an effect on because a parameter EXISTS - only
+				// because the data it needs arrived.
+				if (MasterParams.Contains(FName(TEXT("Detail"))))
+				{
+					const FString* DetailTex = Def->AllTex.Find(TEXT("DetailSampler"));
+					const bool bDetail = DetailTex && FindTexture(*DetailTex) != nullptr;
+					MIC->SetScalarParameterValueEditorOnly(
+						FMaterialParameterInfo(TEXT("DetailAmount")), bDetail ? 1.f : 0.f);
+				}
+
+				// ---- VALUE params -> the MI, guarded exactly like textures ----
+				// ⭐ These only became available on 2026-07-29, when QUARRY stopped dropping every
+				// non-texture shader parameter. Same discipline as BindTex: ask the master what it
+				// exposes and count the misses, so an unbindable value is LOUD rather than silent.
+				TSet<FName> MasterVectors, MasterScalars;
+				{
+					TArray<FMaterialParameterInfo> Infos; TArray<FGuid> Ids;
+					Master->GetAllVectorParameterInfo(Infos, Ids);
+					for (const FMaterialParameterInfo& I : Infos) { MasterVectors.Add(I.Name); }
+					Infos.Reset(); Ids.Reset();
+					Master->GetAllScalarParameterInfo(Infos, Ids);
+					for (const FMaterialParameterInfo& I : Infos) { MasterScalars.Add(I.Name); }
+				}
+				for (const TPair<FString, FVector4>& V : Def->Values)
+				{
+					const FName VName(*V.Key);
+					if (MasterVectors.Contains(VName))
+					{
+						MIC->SetVectorParameterValueEditorOnly(
+							FMaterialParameterInfo(VName),
+							FLinearColor(V.Value.X, V.Value.Y, V.Value.Z, V.Value.W));
+						++ValueParamsBound;
+					}
+					else if (MasterScalars.Contains(VName))
+					{
+						// A single-float RAGE param still arrives as a vec4 with the value in .x.
+						MIC->SetScalarParameterValueEditorOnly(
+							FMaterialParameterInfo(VName), V.Value.X);
+						++ValueParamsBound;
+					}
+					else
+					{
+						++ValueParamsUnsupported;
+					}
+				}
 				MIC->PostEditChange();
 				MIPackage->MarkPackageDirty();
 				FAssetRegistryModule::AssetCreated(MIC);
@@ -1776,9 +1955,11 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,")
 		TEXT("\"boundTextures\":%d,\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
-		TEXT("\"unmappedSamplers\":%d,\"valueParamsSeen\":%d,\"valueParamsBound\":0,\"slots\":[%s]}"),
+		TEXT("\"unmappedSamplers\":%d,\"valueParamsSeen\":%d,\"valueParamsBound\":%d,")
+		TEXT("\"valueParamsUnsupported\":%d,\"slots\":[%s]}"),
 		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures,
-		UnsupportedByMaster, MissingTextures, UnmappedSamplers, ValueParams, *SlotsJson);
+		UnsupportedByMaster, MissingTextures, UnmappedSamplers, ValueParams,
+		ValueParamsBound, ValueParamsUnsupported, *SlotsJson);
 }
 
 // Jenkins one-at-a-time over the LOWERCASED name - RAGE's name hash, pinned to QUARRY's
@@ -3525,6 +3706,7 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	// run that bound all of them printed the identical line. A batch must aggregate the counters
 	// its unit reports - a silent contributor has to be as loud as a failing one.
 	int32 Bound = 0, Unsupported = 0, MissingTex = 0, UnmappedSamp = 0;
+	int32 ValSeen = 0, ValBound = 0, ValUnsupported = 0;
 	auto SumField = [](const FString& Json, const TCHAR* Key) -> int32
 	{
 		const FString Needle = FString::Printf(TEXT("\"%s\":"), Key);
@@ -3555,6 +3737,9 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 			Unsupported  += SumField(R, TEXT("unsupportedByMaster"));
 			MissingTex   += SumField(R, TEXT("missingTextures"));
 			UnmappedSamp += SumField(R, TEXT("unmappedSamplers"));
+			ValSeen        += SumField(R, TEXT("valueParamsSeen"));
+			ValBound       += SumField(R, TEXT("valueParamsBound"));
+			ValUnsupported += SumField(R, TEXT("valueParamsUnsupported"));
 		}
 		else
 		{
@@ -3581,13 +3766,17 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	}
 	UE_LOG(LogTemp, Display,
 		TEXT("[RUDE] ImportYdrBatch DONE: %d imported, %d skipped, %d failed | textures bound %d, "
-		     "unsupportedByMaster %d, missing %d, unmappedSamplers %d"),
-		Imported, Skipped, Failed, Bound, Unsupported, MissingTex, UnmappedSamp);
+		     "unsupportedByMaster %d, missing %d, unmappedSamplers %d | value params seen %d, "
+		     "bound %d, unsupported %d"),
+		Imported, Skipped, Failed, Bound, Unsupported, MissingTex, UnmappedSamp,
+		ValSeen, ValBound, ValUnsupported);
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"imported\":%d,\"skipped\":%d,\"failed\":%d,\"boundTextures\":%d,")
 		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,\"unmappedSamplers\":%d,")
+		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,\"valueParamsUnsupported\":%d,")
 		TEXT("\"failedFiles\":[%s]}"),
-		Imported, Skipped, Failed, Bound, Unsupported, MissingTex, UnmappedSamp, *FailedFiles);
+		Imported, Skipped, Failed, Bound, Unsupported, MissingTex, UnmappedSamp,
+		ValSeen, ValBound, ValUnsupported, *FailedFiles);
 }
 
 FString URudeToolset::SaveAssets()
@@ -3699,8 +3888,65 @@ FString URudeToolset::FixLevelRefs(const FString& Mode)
 		}
 	}
 
+	// ⭐⭐ AND THE PLACE I NEVER LOOKED - which is where it actually was (2026-07-30, reproduced by
+	// Matt on Lvl_ThirdPerson while all three checks above reported clean).
+	// The MAP PACKAGE ITSELF depends on the missing levels. Asking the registry
+	// GetDependencies(<world package>) listed /Game/RUDE/Areas/DowntownHL3, HL4 and HL5 directly -
+	// not via any external actor. So the reference lives in the world's own saved package, which is
+	// why the streaming array was empty, no LevelInstance actor was loaded, and the external-actor
+	// sweep found nothing. Three checks, all looking past the obvious one.
+	// ⚠ A stale import like this is dropped by RE-SAVING the map, because nothing live holds it.
+	// That is the repair, and APPLY verifies it afterwards rather than assuming.
+	TArray<FString> DanglingMapDeps;
+	{
+		FAssetRegistryModule& ARM =
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		IAssetRegistry& AR = ARM.Get();
+		const FName WorldPkg(*World->GetPackage()->GetName());
+		TArray<FName> Deps;
+		AR.GetDependencies(WorldPkg, Deps, UE::AssetRegistry::EDependencyCategory::Package);
+		for (const FName& Dep : Deps)
+		{
+			const FString D = Dep.ToString();
+			if (!D.StartsWith(TEXT("/Game/"))) { continue; }
+			if (FPackageName::DoesPackageExist(D)) { continue; }
+			DanglingMapDeps.Add(D);
+			Names += FString::Printf(TEXT("%s\"MAP DEPENDS ON MISSING %s\""),
+			                         Names.IsEmpty() ? TEXT("") : TEXT(","), *D);
+		}
+	}
+
 	int32 Removed = 0;
 	bool bSaved = false;
+	bool bMapDepsCleared = false;
+	if (bApply && DanglingMapDeps.Num() > 0)
+	{
+		// Re-save the map so the stale imports are rewritten away, then RE-ASK the registry. The
+		// verification is the point: if the dependency survives, something live still holds it and
+		// this repair does not apply - say so instead of reporting success.
+		World->MarkPackageDirty();
+		FEditorFileUtils::SaveDirtyPackages(false, /*maps*/true, /*content*/false, false, false, false);
+		FAssetRegistryModule& ARM =
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		IAssetRegistry& AR = ARM.Get();
+		const FString PkgName = World->GetPackage()->GetName();
+		AR.ScanModifiedAssetFiles({ PkgName });
+		TArray<FName> After;
+		AR.GetDependencies(FName(*PkgName), After, UE::AssetRegistry::EDependencyCategory::Package);
+		bMapDepsCleared = true;
+		for (const FName& Dep : After)
+		{
+			const FString D = Dep.ToString();
+			if (D.StartsWith(TEXT("/Game/")) && !FPackageName::DoesPackageExist(D))
+			{
+				bMapDepsCleared = false;
+				break;
+			}
+		}
+		UE_LOG(LogTemp, Display, TEXT("[RUDE] FixLevelRefs: map had %d dangling dependencies; "
+			"after re-save cleared=%s"), DanglingMapDeps.Num(),
+			bMapDepsCleared ? TEXT("true") : TEXT("false"));
+	}
 	if (bApply && DanglingActorPkgs.Num() > 0)
 	{
 		// The external actor package IS the actor. Its target is gone and cannot be restored, so
@@ -3744,8 +3990,10 @@ FString URudeToolset::FixLevelRefs(const FString& Mode)
 	       Checked, Dangling.Num(), DanglingLI.Num(), Removed);
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"checked\":%d,\"dangling\":%d,\"danglingLevelInstances\":%d,")
+		TEXT("\"danglingMapDependencies\":%d,\"mapDepsCleared\":%s,")
 		TEXT("\"removed\":%d,\"saved\":%s,\"names\":[%s]}"),
-		Checked, Dangling.Num(), DanglingLI.Num(), Removed,
+		Checked, Dangling.Num(), DanglingLI.Num(), DanglingMapDeps.Num(),
+		bMapDepsCleared ? TEXT("true") : TEXT("false"), Removed,
 		bSaved ? TEXT("true") : TEXT("false"), *Names);
 }
 
