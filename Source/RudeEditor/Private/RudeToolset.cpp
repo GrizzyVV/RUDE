@@ -706,6 +706,35 @@ static UMaterialInterface* EnsureTerrainMaster()
 	EO->BaseColor.Expression = Chain(D, -200);
 	EO->Normal.Expression = Chain(N, 400);
 	EO->Roughness.Expression = Rough;
+
+	// ⭐ The terrain presets DO bind spec, and this master used to expose none of it, so every
+	// specularIntensityMult / specularFalloffMult on a terrain shader counted as
+	// unsupportedByMaster and did nothing (measured 2026-07-30 from reports/preset_inventory.json:
+	// all 5 terrain_cb_w_4lyr* presets bind both, plus bumpiness / bumpSelfShadowAmount /
+	// materialWetnessMultiplier). Exposing them costs nothing and lets the corpus values land.
+	auto Scalar = [&](const TCHAR* Name, float Def, int32 Y)
+	{
+		auto* E = NewObject<UMaterialExpressionScalarParameter>(M);
+		E->ParameterName = Name; E->DefaultValue = Def;
+		E->MaterialExpressionEditorX = -1400; E->MaterialExpressionEditorY = Y;
+		M->GetExpressionCollection().AddExpression(E);
+		return E;
+	};
+	auto* SpecInt = Scalar(TEXT("specularIntensityMult"), 0.42f, 800);
+	Scalar(TEXT("specularFalloffMult"), 100.f, 860);
+	Scalar(TEXT("bumpiness"), 1.f, 920);
+	Scalar(TEXT("materialWetnessMultiplier"), 0.f, 980);
+	Scalar(TEXT("bumpSelfShadowAmount"), 0.f, 1040);
+	// Matt's calibration: ground surfaces sit around 0.35-0.5 specular. Terrain IS ground, so the
+	// default matches the flat value the generated masters use for spec-less presets.
+	EO->Specular.Expression = SpecInt;
+
+	// ⛔ NOT IMPLEMENTED, AND DELIBERATELY NOT FAKED: heightMapSamplerLayer0-3 with their
+	// heightScale0-3 / heightBias0-3 / parallaxSelfShadowAmount. The measured scales are ~0.015-0.03
+	// — those are PARALLAX DEPTHS in UV units, not blend weights. Multiplying blend weights by them
+	// (the obvious-looking shortcut) would crush every layer to near zero and look worse than the
+	// plain blend. A faithful version is per-layer parallax offset ×4, which is a real graph and a
+	// real cost. Recorded in the LOG as the next terrain step rather than approximated here.
 	M->PostEditChange();
 	Pkg->MarkPackageDirty();
 	FAssetRegistryModule::AssetCreated(M);
