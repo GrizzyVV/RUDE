@@ -5146,6 +5146,107 @@ namespace RudeYbn
 // phBound code below is intentionally duplicated from the in-game-proven ybn writer with
 // only the root-at-zero difference; shared-helper refactor is queued with a byte-identity
 // regression gate - do NOT let the two drift).
+FString URudeToolset::ExportYdrBinaryBatch(const FString& AssetFolder, const FString& OutDir,
+                                           const FString& Filter)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	// \u2b50 THE CONTINUITY PRINCIPLE, made real (Matt, BENCHMARK_ADDON_CITY \u00a75): "everything we're
+	// working on should facilitate something at this scale down to importing a simple trash can".
+	// Export was per-asset only, so a district could be IMPORTED in one call and then had to be
+	// exported one mesh at a time - the difference between one prop and a district was a different
+	// workflow, not a batch size. This closes that: same code path, same conventions, N assets.
+	//
+	// AssetFolder: a content folder ("/Game/RUDE/World/Meshes") walked recursively, OR a text file
+	// of content paths, one per line - whichever the caller already has.
+	// Filter: optional case-insensitive substring the asset NAME must contain (e.g. "dt1_").
+	FAssetRegistryModule& ARM =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+	IAssetRegistry& AR = ARM.Get();
+
+	TArray<FString> AssetPaths;
+	if (FPaths::FileExists(AssetFolder))
+	{
+		TArray<FString> Lines;
+		FFileHelper::LoadFileToStringArray(Lines, *AssetFolder);
+		for (const FString& L : Lines)
+		{
+			const FString T = L.TrimStartAndEnd();
+			if (!T.IsEmpty()) { AssetPaths.Add(T); }
+		}
+	}
+	else
+	{
+		// \u26d4 Same registry law as the texture library: GetAssets answers from what has been
+		// scanned SO FAR and does NOT block, so a batch driven at editor startup silently exports
+		// nothing. Scan and wait first (2026-07-29 defect).
+		AR.ScanPathsSynchronous({ AssetFolder }, /*bForceRescan*/ false);
+		if (AR.IsLoadingAssets()) { AR.WaitForCompletion(); }
+		FARFilter F;
+		F.PackagePaths.Add(FName(*AssetFolder));
+		F.bRecursivePaths = true;
+		F.ClassPaths.Add(UStaticMesh::StaticClass()->GetClassPathName());
+		TArray<FAssetData> Found;
+		AR.GetAssets(F, Found);
+		for (const FAssetData& AD : Found)
+		{
+			AssetPaths.Add(AD.GetSoftObjectPath().ToString());
+		}
+	}
+	const FString Needle = Filter.TrimStartAndEnd();
+	if (!Needle.IsEmpty())
+	{
+		AssetPaths.RemoveAll([&Needle](const FString& P)
+		{
+			return !FPaths::GetBaseFilename(P).Contains(Needle, ESearchCase::IgnoreCase);
+		});
+	}
+	if (AssetPaths.Num() == 0)
+	{
+		return Fail(TEXT("no StaticMesh assets matched - check the folder path and filter"));
+	}
+	IFileManager::Get().MakeDirectory(*OutDir, true);
+
+	int32 Exported = 0, Failed = 0;
+	int64 Bytes = 0;
+	FString FailedList;
+	for (int32 i = 0; i < AssetPaths.Num(); ++i)
+	{
+		const FString& A = AssetPaths[i];
+		const FString Name = FPaths::GetBaseFilename(A);
+		const FString Out = OutDir / (Name + TEXT(".ydr"));
+		const FString R = ExportYdrBinary(A, Out);
+		if (R.Contains(TEXT("\"ok\":true")))
+		{
+			++Exported;
+			Bytes += IFileManager::Get().FileSize(*Out);
+		}
+		else
+		{
+			++Failed;
+			if (Failed <= 30)
+			{
+				FailedList += FString::Printf(TEXT("%s\"%s\""),
+					FailedList.IsEmpty() ? TEXT("") : TEXT(","), *Name);
+			}
+		}
+		if ((i + 1) % 50 == 0)
+		{
+			UE_LOG(LogTemp, Display, TEXT("[RUDE] ExportYdrBinaryBatch %d/%d (ok %d, fail %d)"),
+				i + 1, AssetPaths.Num(), Exported, Failed);
+		}
+	}
+	UE_LOG(LogTemp, Display,
+		TEXT("[RUDE] ExportYdrBinaryBatch DONE: %d exported, %d failed, %.1f MB"),
+		Exported, Failed, Bytes / 1048576.0);
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"considered\":%d,\"exported\":%d,\"failed\":%d,\"bytes\":%lld,")
+		TEXT("\"outDir\":\"%s\",\"failedAssets\":[%s]}"),
+		AssetPaths.Num(), Exported, Failed, Bytes, *OutDir, *FailedList);
+}
+
 FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath)
 {
 	auto Fail = [](const FString& Why)

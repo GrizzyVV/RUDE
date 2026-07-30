@@ -315,6 +315,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save a Static Mesh as a finished GTA V model the game loads directly, with its collision included."))
 	static FString ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath);
 
+	// Batch ExportYdrBinary. AssetFolder = a content folder walked recursively, OR a text file of
+	// content paths one per line. Filter = optional case-insensitive substring the asset NAME must
+	// contain. Each mesh lands at <OutDir>/<AssetName>.ydr through the SAME path as the single-asset
+	// tool, so conventions cannot drift between one prop and a district.
+	// ⭐ Exists because export was per-asset while import was per-AREA: the continuity principle
+	// (BENCHMARK_ADDON_CITY §5) says the difference between a trash can and a district must be batch
+	// size, not a different workflow.
+	// Returns JSON: {ok, considered, exported, failed, bytes, outDir, failedAssets:[...first 30]}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save many Static Meshes out as GTA V models at once, into one folder.", RudeAudience="agent"))
+	static FString ExportYdrBinaryBatch(const FString& AssetFolder, const FString& OutDir,
+	                                    const FString& Filter);
+
 	// Parse a BINARY FiveM/GTA V .ydr (RSC7 v165) and report its whole drawable graph as JSON.
 	// This is the READ side's foundation: RUDE can write binary but until now could only READ
 	// the XML interchange form, so real game binaries (e.g. from a QUARRY-extracted filebase) could not
