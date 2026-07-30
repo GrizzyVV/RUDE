@@ -1304,6 +1304,10 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		int32 RenderBucket = 0;              // RAGE draw bucket: 0 opaque, 1 alpha, 2 decal, 3 cutout
 		FString Diffuse, Normal, Specular;   // texture NAMES from the ydr
 		TMap<FString, FString> AllTex;       // every Texture param: samplerName -> texName (terrain layers)
+		// ⭐ VALUE params (2026-07-29). QUARRY used to drop every non-texture shader parameter, so
+		// detail tiling, specular intensity/falloff, bump scale and wetness never reached the
+		// engine at all. They are emitted now as <Item type="Vector">, so carry them through.
+		TMap<FString, FVector4> Values;
 	};
 	TArray<FShaderDef> Shaders;
 	if (const FXmlNode* SG = DrawableRoot->FindChildNode(TEXT("ShaderGroup")))
@@ -1325,6 +1329,22 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 				{
 					for (const FXmlNode* P : Params->GetChildrenNodes())
 					{
+						if (P->GetAttribute(TEXT("type")) == TEXT("Vector"))
+						{
+							// Only the FIRST float4 is taken here: every parameter RUDE currently
+							// understands is a single vec4, and silently averaging an array would
+							// invent a value. Multi-vec4 params stay in the XML for later.
+							if (const FXmlNode* V = P->FindChildNode(TEXT("Value")))
+							{
+								const FVector4 Val(
+									FCString::Atof(*V->GetAttribute(TEXT("x"))),
+									FCString::Atof(*V->GetAttribute(TEXT("y"))),
+									FCString::Atof(*V->GetAttribute(TEXT("z"))),
+									FCString::Atof(*V->GetAttribute(TEXT("w"))));
+								Def.Values.Add(P->GetAttribute(TEXT("name")), Val);
+							}
+							continue;
+						}
 						if (P->GetAttribute(TEXT("type")) != TEXT("Texture"))
 						{
 							continue;
@@ -1746,12 +1766,19 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	{
 		SlotsJson += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(",") : TEXT(""), *SlotNames[i]);
 	}
+	// ⭐ Report the VALUE params that arrived. They are parsed but not yet bound to anything - no
+	// master exposes Detail and the spec/bump scalars have no home either - so reporting the count
+	// is what keeps that honest: the number says "the data reached the engine", and a reader can see
+	// it is non-zero while nothing consumes it yet. Silence here would look identical to QUARRY
+	// still dropping them, which is exactly the confusion that cost a day.
+	int32 ValueParams = 0;
+	for (const FShaderDef& D : Shaders) { ValueParams += D.Values.Num(); }
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,")
 		TEXT("\"boundTextures\":%d,\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
-		TEXT("\"unmappedSamplers\":%d,\"slots\":[%s]}"),
+		TEXT("\"unmappedSamplers\":%d,\"valueParamsSeen\":%d,\"valueParamsBound\":0,\"slots\":[%s]}"),
 		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures,
-		UnsupportedByMaster, MissingTextures, UnmappedSamplers, *SlotsJson);
+		UnsupportedByMaster, MissingTextures, UnmappedSamplers, ValueParams, *SlotsJson);
 }
 
 // Jenkins one-at-a-time over the LOWERCASED name - RAGE's name hash, pinned to QUARRY's
