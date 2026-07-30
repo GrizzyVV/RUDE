@@ -180,6 +180,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Repair a level that complains about missing sublevels, by forgetting the ones that are gone.", RudeAudience="agent"))
 	static FString FixLevelRefs(const FString& Mode);
 
+	// Show only what GTA shows at this hour. Hour = "0".."23".
+	// ⭐ The game gates time-of-day at the ARCHETYPE level: 3,936 CTimeArchetypeDef carry a 24-bit
+	// `timeFlags` hour mask (bit N = visible during hour N; the common masks are night windows,
+	// hours 0-5 + 20-23). ImportScene groups each gated archetype into its own ISM component tagged
+	// RUDE_TIME:<mask>, so this is a visibility sweep over exactly those components.
+	// ⛔ Do NOT reimplement this as a shader/emissive gate - that was tried, and it is a UE-only
+	// invention that cannot round-trip to GTA (LOG 2026-07-30).
+	// Returns JSON: {ok, hour, gatedComponents, shown, hidden}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Set the time of day, so night-only signs and lit windows show or hide the way they do in game.", RudeAudience="agent"))
+	static FString SetWorldHour(const FString& Hour);
+
 	// Batch ImportYtd: ListPath = a text file of absolute *.ytd.xml paths, one per line.
 	// Each entry's PixelFolder is DERIVED - QUARRY writes the decoded pixels to a sibling
 	// "<stem>/" folder beside the XML (and resolve carries that sidecar with the winning copy),

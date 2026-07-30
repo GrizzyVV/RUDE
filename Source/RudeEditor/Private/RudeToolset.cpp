@@ -3105,14 +3105,21 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 			const FString* Asset = Index.ArchToAsset.Find(Arch);
 			++TotalEnts; ++SceneEnts;
 			if (Asset) { ++Resolved; NeededDrawables.Add(*Asset); }
+			// ⭐ timeFlags travels WITH the entity. It belongs to the archetype, but the spawn works
+			// per entity, and carrying it here means the hour mask survives into the manifest that
+			// ImportScene re-spawns from - so a respawn keeps the day/night behaviour without
+			// re-reading every ytyp. 0 = no mask = always visible.
+			const uint32* TFlags = Index.ArchTimeFlags.Find(Arch);
 			EntJson += FString::Printf(TEXT(
 				"%s{\"archetype\":\"%s\",\"drawable\":%s,\"lodLevel\":\"%s\","
-				"\"ue_location\":[%f,%f,%f],\"ue_quat\":[%f,%f,%f,%f],\"scaleXY\":%f,\"scaleZ\":%f}"),
+				"\"ue_location\":[%f,%f,%f],\"ue_quat\":[%f,%f,%f,%f],\"scaleXY\":%f,"
+				"\"scaleZ\":%f,\"timeFlags\":%u}"),
 				SceneEnts > 1 ? TEXT(",") : TEXT(""), *Arch,
 				Asset ? *FString::Printf(TEXT("\"%s\""), **Asset) : TEXT("null"), *Lod,
 				Px * 100.0, -Py * 100.0, Pz * 100.0,
 				Qx, -Qy, Qz, Qw,
-				Val(TEXT("scaleXY"), 1.0), Val(TEXT("scaleZ"), 1.0));
+				Val(TEXT("scaleXY"), 1.0), Val(TEXT("scaleZ"), 1.0),
+				TFlags ? *TFlags : 0u);
 		}
 		if (SceneEnts == 0) { continue; }
 		FString YmapName = FPaths::GetBaseFilename(F);
@@ -4137,6 +4144,63 @@ FString URudeToolset::SaveAssets()
 	return FString::Printf(TEXT("{\"ok\":%s}"), bOk ? TEXT("true") : TEXT("false"));
 }
 
+FString URudeToolset::SetWorldHour(const FString& Hour)
+{
+	// ⭐ THE DAY/NIGHT DATASET, DRIVEN (2026-07-30, Matt corrected the model that produced this).
+	// GTA does not fade lit windows in a shader - it ships 3,936 CTimeArchetypeDef whose `timeFlags`
+	// is a 24-bit mask, bit N meaning "visible during hour N". The common masks are night windows
+	// (hours 0-5 + 20-23). ImportScene groups every gated archetype into its own ISM component
+	// tagged RUDE_TIME:<mask>, so setting the hour is a visibility sweep over exactly those
+	// components and nothing else.
+	//
+	// ⛔ WHY NOT A SHADER GATE: I first multiplied emissive by a global NightFactor. It looked
+	// right and was wrong - a UE-only invention that cannot round-trip to GTA, and round-trip is
+	// one of the only two places fidelity actually matters here. The mask is the game's own data;
+	// driving it keeps import and export talking about the same thing.
+	const FString H = Hour.TrimStartAndEnd();
+	if (H.IsEmpty() || !H.IsNumeric())
+	{
+		return TEXT("{\"ok\":false,\"error\":\"Hour must be 0-23\"}");
+	}
+	const int32 Hr = FCString::Atoi(*H);
+	if (Hr < 0 || Hr > 23)
+	{
+		return TEXT("{\"ok\":false,\"error\":\"Hour must be 0-23\"}");
+	}
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return TEXT("{\"ok\":false,\"error\":\"no editor world\"}"); }
+
+	const uint32 Bit = 1u << Hr;
+	int32 Gated = 0, Shown = 0, Hidden = 0;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		TArray<UInstancedStaticMeshComponent*> Comps;
+		It->GetComponents<UInstancedStaticMeshComponent>(Comps);
+		for (UInstancedStaticMeshComponent* C : Comps)
+		{
+			for (const FName& Tag : C->ComponentTags)
+			{
+				FString T = Tag.ToString();
+				if (!T.StartsWith(TEXT("RUDE_TIME:"))) { continue; }
+				T.RightChopInline(10);
+				const uint32 Mask = (uint32)FCString::Strtoui64(*T, nullptr, 10);
+				const bool bVisible = (Mask & Bit) != 0;
+				C->SetVisibility(bVisible, /*bPropagateToChildren*/ true);
+				C->SetHiddenInGame(!bVisible);
+				++Gated;
+				bVisible ? ++Shown : ++Hidden;
+				break;
+			}
+		}
+	}
+	UE_LOG(LogTemp, Display,
+		TEXT("[RUDE] SetWorldHour %02d:00 - %d gated components, %d shown, %d hidden"),
+		Hr, Gated, Shown, Hidden);
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"hour\":%d,\"gatedComponents\":%d,\"shown\":%d,\"hidden\":%d}"),
+		Hr, Gated, Shown, Hidden);
+}
+
 FString URudeToolset::FixLevelRefs(const FString& Mode)
 {
 	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
@@ -4462,7 +4526,13 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		USceneComponent* Root = nullptr;
 		TMap<FString, UInstancedStaticMeshComponent*> IsmByMesh;   // key: mesh name or "proxy:<name>"
 
-		auto GetIsm = [&](const FString& Key, UStaticMesh* Mesh) -> UInstancedStaticMeshComponent*
+		// ⭐ The key carries the HOUR MASK as well as the mesh, so entities that appear only at
+		// certain hours land in their OWN component. Visibility is a per-component switch in UE,
+		// so grouping by mask is what makes the game's dataset drivable at all - mixing a
+		// night-only archetype into a shared component would force per-instance work for something
+		// the data expresses per archetype.
+		auto GetIsm = [&](const FString& Key, UStaticMesh* Mesh, uint32 TimeMask = 0)
+			-> UInstancedStaticMeshComponent*
 		{
 			if (UInstancedStaticMeshComponent** Found = IsmByMesh.Find(Key)) { return *Found; }
 			if (!Actor)
@@ -4484,6 +4554,12 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 			Ism->SetMobility(EComponentMobility::Static);
 			Ism->SetupAttachment(Root);
 			Ism->RegisterComponent();
+			// ALWAYS_VISIBLE (0xFFFFFF) and "no mask" need no tag - tagging only what is genuinely
+			// gated keeps SetWorldHour's sweep proportional to the gated set, not the whole city.
+			if (TimeMask != 0 && TimeMask != 0xFFFFFFu)
+			{
+				Ism->ComponentTags.Add(FName(*FString::Printf(TEXT("RUDE_TIME:%u"), TimeMask)));
+			}
 			Actor->AddInstanceComponent(Ism);
 			IsmByMesh.Add(Key, Ism);
 			return Ism;
@@ -4533,7 +4609,17 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 			}
 			if (Mesh)
 			{
-				if (UInstancedStaticMeshComponent* Ism = GetIsm(Drawable, Mesh))
+				uint32 TimeMask = 0;
+				{
+					int32 TF = 0;
+					if ((*Ent)->TryGetNumberField(TEXT("timeFlags"), TF) && TF > 0)
+					{
+						TimeMask = (uint32)TF;
+					}
+				}
+				const FString IsmKey = TimeMask ? FString::Printf(TEXT("%s#t%u"), *Drawable, TimeMask)
+				                                : Drawable;
+				if (UInstancedStaticMeshComponent* Ism = GetIsm(IsmKey, Mesh, TimeMask))
 				{
 					Ism->AddInstance(Xf, /*bWorldSpace*/ true);
 					++NumInstances;
