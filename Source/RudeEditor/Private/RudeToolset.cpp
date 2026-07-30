@@ -42,6 +42,8 @@
 #include "Materials/MaterialExpressionSubtract.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionTextureCoordinate.h"
+#include "Materials/MaterialExpressionCollectionParameter.h"
+#include "Materials/MaterialParameterCollection.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialExpressionVertexNormalWS.h"
@@ -256,6 +258,240 @@ static UMaterialInterface* EnsureCutoutMaster()
 // \u26a0 The exact RAGE blend is NOT measured - this is the standard signed overlay around mid-grey
 // (\U0001f9e0 INFERRED, not \u2705). It is the conventional detail-map formula and is neutral when the detail
 // texture is flat grey, which is why a wrong guess degrades gracefully.
+// ---------------------------------------------------------------------------------------------
+// GENERATED MASTERS - one per CAPABILITY SIGNATURE, derived from what presets actually bind.
+//
+// ⭐ WHY GENERATED, NOT AUTHORED (2026-07-30, Matt: "I'm not going to be able to design that at all
+// by myself... we need to figure something out about how to generate the materials needed"):
+// the corpus measures 90 shader presets but only **32 distinct sampler signatures**
+// (reports/preset_inventory.json). A master is fully determined by which textures a preset binds
+// and which scalars shape them - both MEASURED from real drawables - so the material set can be
+// emitted rather than designed. Nobody hand-authors 90 materials, and nobody guesses a parameter
+// list.
+//
+// ⭐ THE BAR IS A REPRESENTATION, NOT RAGE'S SHADER MATH (Matt's steer, same day): fidelity matters
+// for the ROUND TRIP - does an exported asset look the same going back into GTA - and later for UE
+// sequences. Everywhere else "reads right" is the target, so these aim for plausible rather than
+// pixel-equivalent, while every parameter still round-trips because ExportYdr reads the MI back.
+struct FRudeMasterSpec
+{
+	bool bNormal = false, bSpec = false, bDetail = false, bTint = false;
+	bool bEmissive = false;
+	int32 Bucket = 0;                       // 0 opaque - 1 alpha - 2 decal - 3 cutout
+
+	FString Key() const                     // stable, readable asset name
+	{
+		FString K = TEXT("D");
+		if (bNormal) { K += TEXT("N"); }
+		if (bSpec)   { K += TEXT("S"); }
+		if (bDetail) { K += TEXT("Dt"); }
+		if (bTint)   { K += TEXT("T"); }
+		if (bEmissive) { K += TEXT("E"); }
+		return FString::Printf(TEXT("M_RUDE_%s_b%d"), *K, Bucket);
+	}
+};
+
+// The night-gate knob. ONE global scalar every night-emissive master multiplies by, so a level
+// blueprint, a sequence, or the operator drives dusk/dawn in one place instead of per material.
+// Matt: night emissives "are only shown at night... either a data set or the material is
+// intelligent enough to know when dusk starts and dawn ends". The data set is the PRESET NAME
+// (emissivenight); this is the knob it feeds.
+static UMaterialParameterCollection* EnsureNightCollection()
+{
+	const TCHAR* FullPath = TEXT("/RUDE/Masters/MPC_RUDE_TimeOfDay.MPC_RUDE_TimeOfDay");
+	if (UMaterialParameterCollection* C =
+			LoadObject<UMaterialParameterCollection>(nullptr, FullPath))
+	{
+		return C;
+	}
+	UPackage* Pkg = CreatePackage(TEXT("/RUDE/Masters/MPC_RUDE_TimeOfDay"));
+	if (!Pkg) { return nullptr; }
+	UMaterialParameterCollection* C = NewObject<UMaterialParameterCollection>(
+		Pkg, TEXT("MPC_RUDE_TimeOfDay"), RF_Public | RF_Standalone);
+	FCollectionScalarParameter Night;
+	Night.ParameterName = TEXT("NightFactor");
+	Night.DefaultValue = 0.f;               // DAY by default: never light windows at noon
+	C->ScalarParameters.Add(Night);
+	C->PostEditChange();
+	C->MarkPackageDirty();
+	FAssetRegistryModule::AssetCreated(C);
+	return C;
+}
+
+static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
+{
+	const FString Name = Spec.Key();
+	const FString PkgName = FString::Printf(TEXT("/RUDE/Masters/Gen/%s"), *Name);
+	const FString Full = FString::Printf(TEXT("%s.%s"), *PkgName, *Name);
+	if (UMaterialInterface* Existing = LoadObject<UMaterialInterface>(nullptr, *Full))
+	{
+		return Existing;
+	}
+	UPackage* P = CreatePackage(*PkgName);
+	if (!P) { return nullptr; }
+	UMaterial* M = NewObject<UMaterial>(P, *Name, RF_Public | RF_Standalone);
+
+	UTexture* DefWhite  = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+	UTexture* DefNormal = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineMaterials/FlatNormal.FlatNormal"));
+	auto Add = [M](UMaterialExpression* E, int32 X, int32 Y)
+	{
+		E->MaterialExpressionEditorX = X; E->MaterialExpressionEditorY = Y;
+		M->GetExpressionCollection().AddExpression(E);
+		return E;
+	};
+	auto MakeTex = [&](const TCHAR* Param, UTexture* Def, EMaterialSamplerType T, int32 Y)
+	{
+		UMaterialExpressionTextureSampleParameter2D* S =
+			NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		S->ParameterName = Param; S->SamplerType = T; S->Texture = Def;
+		Add(S, -1100, Y);
+		return S;
+	};
+	auto MakeScalar = [&](const TCHAR* Param, float Def, int32 Y)
+	{
+		UMaterialExpressionScalarParameter* S = NewObject<UMaterialExpressionScalarParameter>(M);
+		S->ParameterName = Param; S->DefaultValue = Def;
+		Add(S, -1500, Y);
+		return S;
+	};
+
+	// RAGE draw bucket -> UE blend mode. Bucket 1 is alpha-BLENDED and must never be alpha-TESTED
+	// (that perforates glass); bucket 3 is the cutout. Same law as MasterForPreset.
+	switch (Spec.Bucket)
+	{
+		case 1:  M->BlendMode = BLEND_Translucent; break;
+		case 2:  M->BlendMode = BLEND_Masked; break;
+		case 3:  M->BlendMode = BLEND_Masked; M->TwoSided = true; break;
+		default: M->BlendMode = BLEND_Opaque; break;
+	}
+
+	UMaterialExpressionTextureSampleParameter2D* DiffuseTex =
+		MakeTex(TEXT("Diffuse"), DefWhite, SAMPLERTYPE_Color, 0);
+	UMaterialExpression* BaseColor = DiffuseTex;
+
+	if (Spec.bDetail)
+	{
+		// Detail overlay with MEASURED tiling: detailSettings.zw is tile U/V (4-8 typical), .x is
+		// strength. Neutral until a detail texture actually binds (DetailAmount default 0), so a
+		// wrong strength guess degrades to "looks like today" rather than "looks worse".
+		UMaterialExpressionVectorParameter* Set = NewObject<UMaterialExpressionVectorParameter>(M);
+		Set->ParameterName = TEXT("detailSettings");
+		Set->DefaultValue = FLinearColor(1.f, 0.f, 1.f, 1.f);
+		Add(Set, -1500, -500);
+		UMaterialExpressionScalarParameter* Amt = MakeScalar(TEXT("DetailAmount"), 0.f, -380);
+		UMaterialExpressionTextureCoordinate* UV = NewObject<UMaterialExpressionTextureCoordinate>(M);
+		Add(UV, -1500, -260);
+		UMaterialExpressionComponentMask* ZW = NewObject<UMaterialExpressionComponentMask>(M);
+		ZW->Input.Expression = Set; ZW->R = false; ZW->G = false; ZW->B = true; ZW->A = true;
+		Add(ZW, -1350, -500);
+		UMaterialExpressionMultiply* UVm = NewObject<UMaterialExpressionMultiply>(M);
+		UVm->A.Expression = UV; UVm->B.Expression = ZW; Add(UVm, -1220, -320);
+		UMaterialExpressionTextureSampleParameter2D* Det =
+			MakeTex(TEXT("Detail"), DefWhite, SAMPLERTYPE_Color, -300);
+		Det->Coordinates.Expression = UVm;
+		UMaterialExpressionConstant* Half = NewObject<UMaterialExpressionConstant>(M);
+		Half->R = 0.5f; Add(Half, -950, -520);
+		UMaterialExpressionSubtract* Sub = NewObject<UMaterialExpressionSubtract>(M);
+		Sub->A.Expression = Det; Sub->B.Expression = Half; Add(Sub, -820, -420);
+		UMaterialExpressionConstant* Two = NewObject<UMaterialExpressionConstant>(M);
+		Two->R = 2.f; Add(Two, -950, -300);
+		UMaterialExpressionMultiply* Sgn = NewObject<UMaterialExpressionMultiply>(M);
+		Sgn->A.Expression = Sub; Sgn->B.Expression = Two; Add(Sgn, -690, -420);
+		UMaterialExpressionComponentMask* Xm = NewObject<UMaterialExpressionComponentMask>(M);
+		Xm->Input.Expression = Set; Xm->R = true; Xm->G = false; Xm->B = false; Xm->A = false;
+		Add(Xm, -820, -260);
+		UMaterialExpressionMultiply* Str = NewObject<UMaterialExpressionMultiply>(M);
+		Str->A.Expression = Sgn; Str->B.Expression = Xm; Add(Str, -560, -420);
+		UMaterialExpressionMultiply* Gate = NewObject<UMaterialExpressionMultiply>(M);
+		Gate->A.Expression = Str; Gate->B.Expression = Amt; Add(Gate, -430, -420);
+		UMaterialExpressionConstant* One = NewObject<UMaterialExpressionConstant>(M);
+		One->R = 1.f; Add(One, -560, -180);
+		UMaterialExpressionAdd* Gain = NewObject<UMaterialExpressionAdd>(M);
+		Gain->A.Expression = One; Gain->B.Expression = Gate; Add(Gain, -300, -320);
+		UMaterialExpressionMultiply* Mul = NewObject<UMaterialExpressionMultiply>(M);
+		Mul->A.Expression = BaseColor; Mul->B.Expression = Gain; Add(Mul, -170, -60);
+		BaseColor = Mul;
+	}
+
+	if (Spec.bTint)
+	{
+		// The tint palette is a lookup texture and a faithful selector needs the palette ROW, which
+		// is not yet decoded. Exposing the parameters keeps the binding real and round-trippable
+		// while the visual stays the untinted albedo - an honest placeholder, not an invented tint.
+		MakeTex(TEXT("TintPalette"), DefWhite, SAMPLERTYPE_Color, 900);
+		MakeScalar(TEXT("tintPaletteSelector"), 0.f, 960);
+	}
+
+	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
+	EO->BaseColor.Expression = BaseColor;
+
+	if (Spec.bNormal)
+	{
+		UMaterialExpressionTextureSampleParameter2D* N =
+			MakeTex(TEXT("Normal"), DefNormal, SAMPLERTYPE_Normal, 300);
+		EO->Normal.Expression = N;
+		MakeScalar(TEXT("bumpiness"), 1.f, 340);
+	}
+	if (Spec.bSpec)
+	{
+		UMaterialExpressionTextureSampleParameter2D* S =
+			MakeTex(TEXT("Specular"), DefWhite, SAMPLERTYPE_Color, 600);
+		UMaterialExpressionScalarParameter* Int =
+			MakeScalar(TEXT("specularIntensityMult"), 1.f, 640);
+		UMaterialExpressionMultiply* Mul = NewObject<UMaterialExpressionMultiply>(M);
+		Mul->A.Expression = S; Mul->B.Expression = Int; Add(Mul, -700, 600);
+		EO->Specular.Expression = Mul;
+		EO->Specular.MaskR = 1; EO->Specular.Mask = 1;
+		EO->Specular.MaskG = 0; EO->Specular.MaskB = 0; EO->Specular.MaskA = 0;
+		MakeScalar(TEXT("specularFalloffMult"), 100.f, 700);
+		MakeScalar(TEXT("specularFresnel"), 0.97f, 760);
+	}
+	else
+	{
+		// Matt's calibration, 2026-07-30: roads and sidewalks want roughly 0.35-0.5 specular. A
+		// preset with no spec map gets the middle of that range rather than UE's flat default, so
+		// an unmapped surface still reads as a surface and not as paper.
+		UMaterialExpressionScalarParameter* Flat = MakeScalar(TEXT("Specular"), 0.42f, 600);
+		EO->Specular.Expression = Flat;
+	}
+	if (Spec.bEmissive)
+	{
+		UMaterialExpressionScalarParameter* Mult =
+			MakeScalar(TEXT("emissiveMultiplier"), 1.f, 1100);
+		// ⛔ NO TIME GATE HERE, AND THAT WAS A REAL MISTAKE (corrected 2026-07-30 by Matt).
+		// I first multiplied emissive by a global NightFactor so lit windows would not glow at
+		// noon. Matt: "the textures for these are tied to meshes and the meshes are rendered via
+		// ymap... the structure more resembles datasets". MEASURED, and he is right: the game gates
+		// them at the ARCHETYPE level - 3,936 CTimeArchetypeDef carrying a 24-bit `timeFlags` hour
+		// mask (e.g. 32505919 = hours 0-5 + 20-23, night; 16777215 = all 24h). It swaps WHICH
+		// ARCHETYPE IS VISIBLE per hour; it is not a shader effect at all.
+		// A shader-side gate would therefore be a UE-only invention that does NOT round-trip to
+		// GTA - and round-trip is one of the two places fidelity actually matters. So emissive is
+		// just emissive here, and the time behaviour belongs to entity visibility driven by
+		// timeFlags, which the archetype index now carries.
+		UMaterialExpressionMultiply* Emit = NewObject<UMaterialExpressionMultiply>(M);
+		Emit->A.Expression = DiffuseTex; Emit->B.Expression = Mult; Add(Emit, -700, 1100);
+		EO->EmissiveColor.Expression = Emit;
+	}
+	if (Spec.Bucket == 3 || Spec.Bucket == 2)
+	{
+		EO->OpacityMask.Expression = DiffuseTex;
+		EO->OpacityMask.MaskA = 1; EO->OpacityMask.Mask = 1;
+		EO->OpacityMask.MaskR = 0; EO->OpacityMask.MaskG = 0; EO->OpacityMask.MaskB = 0;
+	}
+	else if (Spec.Bucket == 1)
+	{
+		EO->Opacity.Expression = DiffuseTex;
+		EO->Opacity.MaskA = 1; EO->Opacity.Mask = 1;
+		EO->Opacity.MaskR = 0; EO->Opacity.MaskG = 0; EO->Opacity.MaskB = 0;
+	}
+	M->PostEditChange();
+	M->MarkPackageDirty();
+	FAssetRegistryModule::AssetCreated(M);
+	UE_LOG(LogTemp, Display, TEXT("[RUDE] generated master %s"), *Name);
+	return M;
+}
+
 static UMaterialInterface* EnsureDetailMaster()
 {
 	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_Detail.M_RUDE_Detail");
@@ -1675,6 +1911,26 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 			"/Game/RUDE/Textures"), TextureByName.Num());
 	}
 
+	// The shader def drives master selection: build the capability signature from what this shader
+	// ACTUALLY binds, then let the generator emit (once) the master for that signature.
+	auto MasterForDef = [](const FShaderDef& D) -> UMaterialInterface*
+	{
+		FRudeMasterSpec Spec;
+		Spec.Bucket = D.RenderBucket;
+		for (const TPair<FString, FString>& T : D.AllTex)
+		{
+			const FString& S = T.Key;
+			if (S.StartsWith(TEXT("Bump"), ESearchCase::IgnoreCase))          { Spec.bNormal = true; }
+			else if (S.StartsWith(TEXT("Spec"), ESearchCase::IgnoreCase))     { Spec.bSpec = true; }
+			else if (S.StartsWith(TEXT("Detail"), ESearchCase::IgnoreCase))   { Spec.bDetail = true; }
+			else if (S.StartsWith(TEXT("TintPalette"), ESearchCase::IgnoreCase)) { Spec.bTint = true; }
+		}
+		// The preset name still tells us a surface EMITS; when it emits is archetype data
+		// (timeFlags), not shader data - see the comment in EnsureGeneratedMaster.
+		if (D.Preset.ToLower().Contains(TEXT("emissive"))) { Spec.bEmissive = true; }
+		return EnsureGeneratedMaster(Spec);
+	};
+
 	auto MasterForPreset = [](const FString& Preset, int32 Bucket) -> UMaterialInterface*
 	{
 		const FString P = Preset.ToLower();
@@ -1768,7 +2024,19 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		UMaterialInterface* Master = nullptr;
 		if (Def)
 		{
-			Master = bTerrain ? EnsureTerrainMaster() : MasterForPreset(Def->Preset, Def->RenderBucket);
+			// Terrain, decals and foliage keep their hand-built masters: those encode behaviour the
+			// generator does not model (4-layer vertex-colour blend, coplanar WPO offset, two-sided
+			// leaf shading). EVERYTHING ELSE now comes from the generator, so a preset's master is
+			// determined by what it binds rather than by a name-matching ladder.
+			const FString LowerPreset = Def->Preset.ToLower();
+			const bool bSpecialCase =
+				bTerrain
+				|| Def->RenderBucket == 2 || LowerPreset.Contains(TEXT("decal"))
+				|| LowerPreset.StartsWith(TEXT("trees")) || LowerPreset.StartsWith(TEXT("grass"))
+				|| LowerPreset.Contains(TEXT("foliage")) || LowerPreset.Contains(TEXT("plant"));
+			Master = bSpecialCase
+				? (bTerrain ? EnsureTerrainMaster() : MasterForPreset(Def->Preset, Def->RenderBucket))
+				: MasterForDef(*Def);
 		}
 		FString ConfigKey;
 		if (Def)
@@ -2577,6 +2845,11 @@ struct FRudeArchetypeIndex
 	TMap<FString, FString> ArchToAsset;   // lowercase archetype name -> lowercase drawable asset
 	TSet<FString> FragmentAssets;         // assets that resolve under yft/ instead of ydr/
 	TMap<FString, FString> DictEntries;   // entry mesh name -> ydd dictionary stem (under ydd/)
+	// ⭐ timeFlags per archetype: a 24-bit hour mask on CTimeArchetypeDef (bit N = visible during
+	// hour N). 3,936 archetypes carry one; the common masks are night windows (0-5 + 20-23). THIS
+	// is how the game shows lit windows after dusk - by swapping which archetype is visible, not by
+	// changing a material. Captured so the behaviour can be driven in UE and still round-trip.
+	TMap<FString, uint32> ArchTimeFlags;  // lowercase archetype name -> hour mask
 };
 
 // Optional MLO lookup riding the index walk: the walk already parses every ytyp once, and a
@@ -2650,6 +2923,16 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 			const bool bDictArch = AType == TEXT("ASSET_TYPE_DRAWABLEDICTIONARY");
 			if (!bDrawableArch && !bFragmentArch && !bDictArch) { continue; }
 			const FString ArchLower = NameN->GetContent().TrimStartAndEnd().ToLower();
+			// ⭐ CAPTURE timeFlags. Only CTimeArchetypeDef carries it - a 24-bit hour mask where
+			// bit N means "visible during hour N". This is the dataset that makes lit windows
+			// appear after dusk (the common masks are hours 0-5 + 20-23), and losing it here is
+			// what forced an earlier attempt to fake the behaviour in a shader.
+			if (const FXmlNode* TimeN = Item->FindChildNode(TEXT("timeFlags")))
+			{
+				const uint32 Mask = (uint32)FCString::Strtoui64(
+					*TimeN->GetAttribute(TEXT("value")), nullptr, 10);
+				if (Mask != 0) { Out.ArchTimeFlags.Add(ArchLower, Mask); }
+			}
 			if (bDictArch)
 			{
 				const FXmlNode* DictN = Item->FindChildNode(TEXT("drawableDictionary"));
