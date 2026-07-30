@@ -45,6 +45,7 @@
 #include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialExpressionVertexNormalWS.h"
 #include "ContentStreaming.h"
+#include "Containers/Ticker.h"
 #include "LevelInstance/LevelInstanceActor.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Engine/LevelStreaming.h"
@@ -1928,7 +1929,7 @@ FString URudeToolset::SpawnSeaLevel(const FString& SizeMetres, const FString& ZM
 }
 
 FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng,
-                                  const FString& ViewMode)
+                                  const FString& ViewMode, const FString& SettleSeconds)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -2003,40 +2004,57 @@ FString URudeToolset::CaptureView(const FString& CamSpec, const FString& OutPng,
 			VC->SetViewRotation(Rot);
 			VC->Invalidate();
 
-			// ⛔ THE SECOND HALF OF THE SAME LAW. Everything above settled the scene for the
-			// camera's OLD position - the streamer has never seen this viewpoint. Draw once so it
-			// does, pull residency again for what is now on screen, then draw again. Only then is
-			// the next frame worth photographing.
+			// ⭐⭐ THE CAPTURE IS DEFERRED, NOT FORCED - and that is the whole lesson.
+			// Three attempts to make this synchronous each produced a NEW false reading: no
+			// barrier (half-built scene), a compile-only barrier (still mid-mount), and a blocking
+			// wait (ok:false for a shot that landed 140s later). Matt, twice: "your screenshots
+			// are being taken too early while everything is mounting."
+			// The editor settles on its OWN tick and nothing a command does from inside that tick
+			// can present a frame. So stop fighting it: set the camera now (the streamer needs the
+			// viewpoint to start pulling for it), then hand a ticker the job of firing the shot
+			// once the world has actually gone quiet across REAL frames. Sky/reflection capture,
+			// mip residency and shader compilation all resolve in that window - none of them can
+			// be waited on from here.
 			GEditor->RedrawLevelEditingViewports(/*bInvalidateHitProxies*/ true);
 			IStreamingManager::Get().StreamAllResources(0.0f);
-			FAssetCompilingManager::Get().FinishAllCompilation();
-			GEditor->RedrawLevelEditingViewports(true);
 
-			FScreenshotRequest::RequestScreenshot(OutPng, /*bShowUI*/ false, /*bAddFilenameSuffix*/ false);
-			// ⛔ THERE IS ONLY ONE PENDING-SCREENSHOT SLOT (2026-07-29). -ExecCmds runs its whole
-			// command list inside a single tick, so two CaptureView calls in one chain both queue
-			// a request before any frame is presented and the second SILENTLY OVERWRITES the
-			// first - the earlier file is simply never written, with ok:true reported for both.
-			// Pumping a full Slate frame here serves this request before the next command can
-			// replace it, which is what makes a LIT+UNLIT pair in one chain actually produce two
-			// files. RedrawLevelEditingViewports alone does NOT do it: the shot is taken on
-			// present, not on redraw.
-			// ⛔⛔ ONE CAPTURE PER -ExecCmds CHAIN. MEASURED, not assumed (2026-07-29):
-			//   · There is a single pending-screenshot slot. Two CaptureViews in one chain both
-			//     queue before any frame is presented, so the second REPLACES the first and only
-			//     the last file is ever written - with ok:true returned for both.
-			//   · The shot is served on a later REAL frame, after the chain finishes. It cannot be
-			//     forced from inside a command: redrawing the viewport and ticking Slate here does
-			//     not present it. A blocking wait was tried and produced the mirror defect -
-			//     ok:false for a capture that landed 140s later. A false failure is no better than
-			//     a false success.
-			// So the honest contract is: this REQUESTS a shot, the file appears after the chain
-			// ends, and the caller polls for it. To take LIT and UNLIT of the same view, run the
-			// editor twice. Do not "fix" this by adding a wait here - that has been tried.
+			const float MinSettle = SettleSeconds.IsEmpty()
+				? 25.0f : FMath::Clamp(FCString::Atof(*SettleSeconds), 0.0f, 600.0f);
+			const double StartedAt = FPlatformTime::Seconds();
+			const FString PngPath = OutPng;
+			// Quiet must be SUSTAINED: compilation dips to zero between batches, so a single
+			// quiet sample fires early. Require several consecutive quiet ticks.
+			TSharedRef<int32> QuietTicks = MakeShared<int32>(0);
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+				[PngPath, StartedAt, MinSettle, QuietTicks](float) -> bool
+				{
+					const bool bBusy =
+						FAssetCompilingManager::Get().GetNumRemainingAssets() > 0
+						|| (GShaderCompilingManager && GShaderCompilingManager->IsCompiling());
+					*QuietTicks = bBusy ? 0 : (*QuietTicks + 1);
+					const double Elapsed = FPlatformTime::Seconds() - StartedAt;
+					if (Elapsed < MinSettle || *QuietTicks < 6)
+					{
+						return true;   // keep ticking
+					}
+					IStreamingManager::Get().StreamAllResources(0.0f);
+					FScreenshotRequest::RequestScreenshot(PngPath, /*bShowUI*/ false,
+					                                      /*bAddFilenameSuffix*/ false);
+					UE_LOG(LogTemp, Display,
+						TEXT("[RUDE] CaptureView: scene quiet after %.1fs, shot requested -> %s"),
+						Elapsed, *PngPath);
+					return false;  // done
+				}), 0.5f);
+
+			// ⭐ Because each capture now waits for its own settle on a real tick, a LIT+UNLIT
+			// pair in ONE chain no longer clobbers itself the way the old immediate requests did -
+			// but they must be given DIFFERENT settle times so the frames they fire on are
+			// genuinely separate. Same settle in one chain still collapses to one file.
 			return FString::Printf(
-				TEXT("{\"ok\":true,\"requested\":\"%s\",\"note\":\"lands after this ExecCmds chain")
-				TEXT(" ends - poll for the file; only the LAST CaptureView in a chain writes\"}"),
-				*OutPng);
+				TEXT("{\"ok\":true,\"requested\":\"%s\",\"settleSeconds\":%.1f,\"note\":\"")
+				TEXT("deferred - fires once compilation is quiet for 6 consecutive ticks AND ")
+				TEXT("%.0fs have passed; poll for the file\"}"),
+				*OutPng, MinSettle, MinSettle);
 		}
 	}
 	return Fail(TEXT("no perspective level viewport"));

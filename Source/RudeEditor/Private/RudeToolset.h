@@ -125,9 +125,14 @@ public:
 	// ViewMode: "" / "LIT" (default) · "UNLIT" · "WIREFRAME". ⭐ Use UNLIT to answer "did the
 	// textures bind?" - a Lit shot multiplies albedo by scene lighting, so under a dark sky an
 	// untextured city and a fully textured one photograph as the same grey (2026-07-29).
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Point the viewport somewhere and save a screenshot to disk. Use UNLIT to see texture colours without lighting.", RudeAudience="agent"))
+	// SettleSeconds: minimum quiet time before the shot fires (default 25). ⭐ The capture is
+	// DEFERRED onto the editor tick, not taken inline - the editor mounts asynchronously (sky and
+	// reflection capture, mip residency, shader compilation) and NOTHING a command does from
+	// inside a tick can present a frame. Three synchronous attempts each produced a different
+	// false reading; see LOG 2026-07-29. Poll for the file.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Point the viewport somewhere and save a screenshot once the scene has finished loading. Use UNLIT to see texture colours without lighting.", RudeAudience="agent"))
 	static FString CaptureView(const FString& CamSpec, const FString& OutPng,
-	                           const FString& ViewMode);
+	                           const FString& ViewMode, const FString& SettleSeconds);
 
 	// File a FLAT export dump into the filebase. You export from whatever extractor you
 	// already use into any folder (they dump files flat); this sorts them by type into
