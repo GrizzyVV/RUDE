@@ -841,6 +841,7 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 		FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
 
 	int32 Imported = 0;
+	int32 InvalidNames = 0;
 	FString Missing;
 	for (const FXmlNode* Item : Root->GetChildrenNodes())
 	{
@@ -879,6 +880,19 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 		const FString PackageName = DestFolder / TxdName / TexName;
 		if (!FPackageName::IsValidLongPackageName(PackageName))
 		{
+			// ⛔ THIS USED TO `continue` IN SILENCE, and that silence cost a whole import cycle
+			// (2026-07-30): 1,943 texture dictionaries imported with texturesImported=0 and ok:true
+			// on every one. The cause was a DOT in the folder name - a package path segment may not
+			// contain '.', UE reserves it to separate package from object - so every texture failed
+			// this check and vanished without a word.
+			// It is NOT silently sanitised: renaming the caller's asset path behind their back
+			// trades one invisible problem for another. Say what was rejected and why.
+			++InvalidNames;
+			if (InvalidNames <= 5)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[RUDE] ImportYtd: '%s' is not a valid package name "
+					"- a path segment cannot contain '.'; texture skipped"), *PackageName);
+			}
 			continue;
 		}
 		UPackage* Package = CreatePackage(*PackageName);
@@ -920,8 +934,9 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 	}
 
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"txd\":\"%s\",\"imported\":%d,\"missingPixels\":[%s]}"),
-		*TxdName, Imported, *Missing);
+		TEXT("{\"ok\":true,\"txd\":\"%s\",\"imported\":%d,\"invalidNames\":%d,")
+		TEXT("\"missingPixels\":[%s]}"),
+		*TxdName, Imported, InvalidNames, *Missing);
 }
 
 FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlPath)
