@@ -291,33 +291,6 @@ struct FRudeMasterSpec
 	}
 };
 
-// The night-gate knob. ONE global scalar every night-emissive master multiplies by, so a level
-// blueprint, a sequence, or the operator drives dusk/dawn in one place instead of per material.
-// Matt: night emissives "are only shown at night... either a data set or the material is
-// intelligent enough to know when dusk starts and dawn ends". The data set is the PRESET NAME
-// (emissivenight); this is the knob it feeds.
-static UMaterialParameterCollection* EnsureNightCollection()
-{
-	const TCHAR* FullPath = TEXT("/RUDE/Masters/MPC_RUDE_TimeOfDay.MPC_RUDE_TimeOfDay");
-	if (UMaterialParameterCollection* C =
-			LoadObject<UMaterialParameterCollection>(nullptr, FullPath))
-	{
-		return C;
-	}
-	UPackage* Pkg = CreatePackage(TEXT("/RUDE/Masters/MPC_RUDE_TimeOfDay"));
-	if (!Pkg) { return nullptr; }
-	UMaterialParameterCollection* C = NewObject<UMaterialParameterCollection>(
-		Pkg, TEXT("MPC_RUDE_TimeOfDay"), RF_Public | RF_Standalone);
-	FCollectionScalarParameter Night;
-	Night.ParameterName = TEXT("NightFactor");
-	Night.DefaultValue = 0.f;               // DAY by default: never light windows at noon
-	C->ScalarParameters.Add(Night);
-	C->PostEditChange();
-	C->MarkPackageDirty();
-	FAssetRegistryModule::AssetCreated(C);
-	return C;
-}
-
 static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 {
 	const FString Name = Spec.Key();
