@@ -1741,7 +1741,14 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	}
 
 	// Geometries under DrawableModelsHigh
+	// ⛔ A DROPPED GEOMETRY IS COUNTED AND NAMED (2026-07-31). This loop used to `if (Parse) add;`
+	// with no else - a drawable whose 4th of 6 geometries failed to parse imported "ok":true with
+	// a quietly smaller mesh, and NOTHING in the verdict could tell that apart from a model that
+	// genuinely has 4 geometries. Same law the batch counters already follow: a skip with no
+	// counter is indistinguishable from "nothing to do".
 	TArray<RudeYdr::FGeo> Geos;
+	int32 GeosFailed = 0;
+	FString GeoErrors;
 	if (const FXmlNode* High = DrawableRoot->FindChildNode(TEXT("DrawableModelsHigh")))
 	{
 		for (const FXmlNode* ModelItem : High->GetChildrenNodes())
@@ -1756,13 +1763,27 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 					{
 						Geos.Add(MoveTemp(Geo));
 					}
+					else
+					{
+						++GeosFailed;
+						if (GeosFailed <= 4)
+						{
+							GeoErrors += FString::Printf(TEXT("%s\"%s\""),
+								GeoErrors.IsEmpty() ? TEXT("") : TEXT(","), *Error);
+						}
+						UE_LOG(LogTemp, Warning,
+							TEXT("[RUDE] ImportYdr %s: geometry %d dropped - %s"),
+							*MeshName, GeosFailed, *Error);
+					}
 				}
 			}
 		}
 	}
 	if (Geos.Num() == 0)
 	{
-		return Fail(TEXT("no geometry in DrawableModelsHigh"));
+		return Fail(GeosFailed > 0
+			? FString::Printf(TEXT("no geometry survived parsing (%d dropped)"), GeosFailed)
+			: TEXT("no geometry in DrawableModelsHigh"));
 	}
 
 	// Create the StaticMesh asset
@@ -2240,11 +2261,12 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	int32 ValueParams = 0;
 	for (const FShaderDef& D : Shaders) { ValueParams += D.Values.Num(); }
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,")
+		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"geometriesDropped\":%d,")
+		TEXT("\"geometryErrors\":[%s],\"vertices\":%d,\"triangles\":%d,")
 		TEXT("\"boundTextures\":%d,\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
 		TEXT("\"unmappedSamplers\":%d,\"valueParamsSeen\":%d,\"valueParamsBound\":%d,")
 		TEXT("\"valueParamsUnsupported\":%d,\"slots\":[%s]}"),
-		*PackageName, Geos.Num(), TotalVerts, TotalTris, BoundTextures,
+		*PackageName, Geos.Num(), GeosFailed, *GeoErrors, TotalVerts, TotalTris, BoundTextures,
 		UnsupportedByMaster, MissingTextures, UnmappedSamplers, ValueParams,
 		ValueParamsBound, ValueParamsUnsupported, *SlotsJson);
 }
@@ -3888,13 +3910,31 @@ FString URudeToolset::ExportYtyp(const FString& YdrSpecs, const FString& YtypNam
 		{
 			Bsr = FCString::Atof(*R->GetAttribute(TEXT("value")));
 		}
-		// collidable iff the drawable embeds a <Bounds> with >=1 child (gates bit 17)
+		// Collidable iff the drawable embeds a <Bounds> that actually describes collision.
+		// ⛔ THIS USED TO REQUIRE <Children>, WHICH IS ONLY TRUE OF A *COMPOSITE* ROOT (fixed
+		// 2026-07-31). A phBound root may legitimately be a primitive - Box, Sphere, Cylinder -
+		// and those carry no <Children> at all: measured 220 of 1,012 bound-bearing base-game
+		// ydr (21.7%; Box 160 / Sphere 53 / Cylinder 7), a figure the converter's own docstring
+		// records. Every one of them was exported with the collidable bit CLEAR, so a fifth of
+		// all collidable props shipped as pass-through geometry - invisible in the editor,
+		// visible only by walking through a crate in game. Presence of a <Bounds> with a known
+		// type is the real signal; <Children> is one shape of it.
+		// ⚠ The type is an ATTRIBUTE - `<Bounds type="Composite">` - NOT a <Type> child element.
+		// Checked against real emitted corpus XML before trusting it: a FindChildNode("Type")
+		// test would have compiled, run, and never once fired.
 		bool bCollidable = false;
 		if (const FXmlNode* B = Root->FindChildNode(TEXT("Bounds")))
 		{
+			const FString BoundType = B->GetAttribute(TEXT("type")).TrimStartAndEnd();
 			if (const FXmlNode* C = B->FindChildNode(TEXT("Children")))
 			{
 				bCollidable = C->GetChildrenNodes().Num() > 0;
+			}
+			// A primitive (or BVH/Geometry) root IS collision, with no children to count.
+			if (!bCollidable && !BoundType.IsEmpty()
+				&& !BoundType.Equals(TEXT("Composite"), ESearchCase::IgnoreCase))
+			{
+				bCollidable = true;
 			}
 		}
 		// embedded ShaderGroup TextureDictionary -> empty archetype txd

@@ -57,10 +57,25 @@ static FAutoConsoleCommand GRudeRun(
 		TArray<FString> Values(Args.GetData() + 1, Args.Num() - 1);
 		FString Result;
 		FString Error;
+		// ⛔ A CONSOLE COMMAND CANNOT SET A PROCESS EXIT CODE, so a headless harness keying on
+		// `-ExecCmds` exit status sees success no matter what happened (measured 2026-07-31).
+		// The contract instead is a STABLE, GREPPABLE MARKER: any failure - a dead tool, a bad
+		// call, or a tool reporting ok:false - prints `RUDE_RUN_FAILED`, and nothing else in the
+		// plugin ever prints that token. Harness rule: grep the log for RUDE_RUN_FAILED and treat
+		// a hit as a failed run. (Control flow is deliberately unchanged: aborting the chain here
+		// would skip a later cleanup step, which is worse than reporting honestly and continuing.)
 		if (!Fn || !FRudeInvoke::Call(Fn, Values, Result, Error))
 		{
-			UE_LOG(LogRudePanel, Error, TEXT("[RUDE.Run] %s: %s"), *Args[0],
+			UE_LOG(LogRudePanel, Error, TEXT("[RUDE.Run] RUDE_RUN_FAILED %s: %s"), *Args[0],
 				Fn ? *Error : TEXT("no such tool"));
+			return;
+		}
+		if (FRudeInvoke::ReportedFailure(Result))
+		{
+			// The call SUCCEEDED but the tool reported ok:false - that is still a failed run, and
+			// it used to be logged at Display like any success.
+			UE_LOG(LogRudePanel, Error, TEXT("[RUDE.Run] RUDE_RUN_FAILED %s -> %s"), *Args[0],
+				*Result);
 			return;
 		}
 		UE_LOG(LogRudePanel, Display, TEXT("[RUDE.Run] %s -> %s"), *Args[0], *Result);
