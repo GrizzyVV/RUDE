@@ -4132,6 +4132,27 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		ValSeen, ValBound, ValUnsupported, *FailedFiles);
 }
 
+// ⛔⛔ WHY THIS WRAPPER EXISTS — `-unattended` SILENTLY CANCELS EVERY SAVE (measured 2026-07-31,
+// root cause read out of the engine source, not guessed).
+// `FEditorFileUtils::SaveDirtyPackages` → `InternalSavePackages` → `PromptForCheckoutAndSave`,
+// which begins (FileHelpers.cpp:4659-4667):
+//     if (GIsRunningUnattendedScript) { return UEditorLoadingAndSavingUtils::SavePackages(...); }
+//     if (FApp::IsUnattended() && !bAlreadyCheckedOut) { return PR_Cancelled; }
+// A commandlet/`-ExecCmds` run sets `FApp::IsUnattended()` but NOT `GIsRunningUnattendedScript`
+// (that flag belongs to scripted automation), so the save fell into the SECOND branch: cancelled,
+// nothing written, `ok:false`, and the whole chain's work lost with a false-looking summary.
+// The engine's own escape hatch is the first branch — it guards with exactly this TGuardValue when
+// it needs a modal-free save (FileHelpers.cpp:5919). Setting it ONLY while unattended keeps the
+// interactive path (checkout prompts, source control) untouched for a human at the editor.
+static bool RudeSaveDirty(bool bMaps, bool bContent)
+{
+	TGuardValue<bool> UnattendedScriptGuard(GIsRunningUnattendedScript,
+		FApp::IsUnattended() ? true : GIsRunningUnattendedScript);
+	return FEditorFileUtils::SaveDirtyPackages(
+		/*bPromptUserToSave*/ false, bMaps, bContent, /*bFastSave*/ false,
+		/*bNotifyNoPackagesSaved*/ false, /*bCanBeDeclined*/ false);
+}
+
 FString URudeToolset::SaveAssets()
 {
 	// ⛔ THE COMPILE-BEFORE-SAVE LAW, ENFORCED HERE (it was documented but wired NOWHERE - the
@@ -4139,13 +4160,12 @@ FString URudeToolset::SaveAssets()
 	// exactly the 381-asset bulkdata corruption incident. Block until every compilation settles,
 	// THEN save. This is the single choke point every agent chain saves through.
 	FAssetCompilingManager::Get().FinishAllCompilation();
-	// Content packages only: FEditorFileUtils::SaveDirtyPackages with bSaveMapPackages=false -
-	// an agent persisting its imports must not silently commit the operator's level edits.
-	const bool bOk = FEditorFileUtils::SaveDirtyPackages(
-		/*bPromptUserToSave*/ false, /*bSaveMapPackages*/ false,
-		/*bSaveContentPackages*/ true, /*bFastSave*/ false,
-		/*bNotifyNoPackagesSaved*/ false, /*bCanBeDeclined*/ false);
-	return FString::Printf(TEXT("{\"ok\":%s}"), bOk ? TEXT("true") : TEXT("false"));
+	// Content packages only (bSaveMapPackages=false) - an agent persisting its imports must not
+	// silently commit the operator's level edits.
+	const bool bOk = RudeSaveDirty(/*bMaps*/ false, /*bContent*/ true);
+	return FString::Printf(TEXT("{\"ok\":%s,\"unattended\":%s}"),
+		bOk ? TEXT("true") : TEXT("false"),
+		FApp::IsUnattended() ? TEXT("true") : TEXT("false"));
 }
 
 FString URudeToolset::SetWorldHour(const FString& Hour)
@@ -4388,11 +4408,9 @@ FString URudeToolset::FixLevelRefs(const FString& Mode)
 		}
 		World->MarkPackageDirty();
 		// Maps ONLY here - repairing the map package is this tool's entire purpose, and it is the
-		// one thing SaveAssets deliberately refuses to touch.
-		bSaved = FEditorFileUtils::SaveDirtyPackages(
-			/*bPromptUserToSave*/ false, /*bSaveMapPackages*/ true,
-			/*bSaveContentPackages*/ false, /*bFastSave*/ false,
-			/*bNotifyNoPackagesSaved*/ false, /*bCanBeDeclined*/ false);
+		// one thing SaveAssets deliberately refuses to touch. Through RudeSaveDirty, so an
+		// unattended APPLY actually writes instead of being cancelled (see its comment).
+		bSaved = RudeSaveDirty(/*bMaps*/ true, /*bContent*/ false);
 	}
 	UE_LOG(LogTemp, Display,
 	       TEXT("[RUDE] FixLevelRefs: %d streaming levels (%d dangling), %d dangling level "

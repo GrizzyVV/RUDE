@@ -258,6 +258,13 @@ namespace RudeBuildArea
 		// that point throws the actors away, which is exactly what the first run measured:
 		// actorsPacked 0, instancesAfter 0, 111 unpaired. Saving maps AND content here also
 		// captures the OFPA external-actor packages the move created.
+		// ⛔ THE GUARD IS LOAD-BEARING HEADLESS: under `-unattended` (but without
+		// GIsRunningUnattendedScript) PromptForCheckoutAndSave returns PR_Cancelled and writes
+		// NOTHING — FileHelpers.cpp:4659-4667. That is why this warning used to fire on every
+		// headless pack. Setting the flag routes to the engine's own modal-free save path, the
+		// same TGuardValue the engine uses at FileHelpers.cpp:5919.
+		TGuardValue<bool> UnattendedScriptGuard(GIsRunningUnattendedScript,
+			FApp::IsUnattended() ? true : GIsRunningUnattendedScript);
 		if (!FEditorFileUtils::SaveDirtyPackages(/*bPromptUserToSave*/ false,
 			/*bSaveMapPackages*/ true, /*bSaveContentPackages*/ true, /*bFastSave*/ false,
 			/*bNotifyNoPackagesSaved*/ false, /*bCanBeDeclined*/ false))
