@@ -82,44 +82,50 @@ Two argument-passing traps, both measured:
 ## 3. The tool surface
 
 > ⛔ **`Source/RudeEditor/Private/RudeToolset.h` IS the tool surface — this table is a summary and
-> WILL lag.** It said "24 tools" while the header declared 30, and omitted `SetWorldHour`,
-> `FixLevelRefs` and `ExportYdrBinaryBatch` entirely. A count in prose drifts every time a tool
-> lands; the header cannot. **Read the header, and treat any disagreement as this file being stale.**
-> Recently added and missing below: `SetWorldHour` (time-of-day visibility from the game's
-> `timeFlags` masks) · `FixLevelRefs` (repairs dangling sublevel references) ·
-> `ExportYdrBinaryBatch` (batch export — a district is a batch size, not a different workflow).
+> WILL lag.** It has now rotted twice: it said "24 tools" while the header declared 30, and its own
+> stale-note then named only three missing rows while SIX were absent (`SetWorldHour` ·
+> `FixLevelRefs` · `ExportYdrBinaryBatch` · `ImportScenarioRegion` · `PackAreaLevelInstance` ·
+> `ImportVehicle`). A count in prose drifts every time a tool lands; the header cannot. **Read the
+> header, and treat any disagreement as this file being stale.** (2026-07-31: all six rows added
+> below — the table matches `-list` again, until it doesn't.)
 
 Sorted alphabetically, which is exactly the order `FRudeInvoke::CollectTools` produces, so this
 table **diffs line-for-line against `-list`**. That is the intended way to check it.
 
-`Audience`: **human** = shown in the panel (20 of them); **agent** = plumbing, tagged
-`RudeAudience="agent"`, hidden from the panel but present on the CLI and MCP (4 of them).
+`Audience`: **human** = shown in the panel (22 of them); **agent** = plumbing, tagged
+`RudeAudience="agent"`, hidden from the panel but present on the CLI and MCP (8 of them).
 
 | Tool | Parameters (in order) | What it does | Audience |
 |---|---|---|---|
-| `CaptureView` | `CamSpec, OutPng` | Aim the perspective viewport (`"x,y,z,pitch,yaw"` in UE cm/degrees; `;` also accepted) and write a PNG — the agent-vision primitive. Blocks on `FinishAllCompilation` first, then the shot lands on the NEXT draw: poll for the file | agent |
+| `CaptureView` | `CamSpec, OutPng, ViewMode, SettleSeconds` | Aim the perspective viewport (`"x,y,z,pitch,yaw"` in UE cm/degrees; `;` also accepted) and write a PNG — the agent-vision primitive. Blocks on `FinishAllCompilation` first, then the shot lands on the NEXT draw: poll for the file. `ViewMode` UNLIT answers "did the textures bind?" (a Lit shot multiplies albedo by scene lighting); `SettleSeconds` = minimum quiet time before the deferred shot fires (default 25) | agent |
 | `CreateFilebase` | `FilebaseRoot, GameRoot, Options` | Seed the **filebase**: a load-order-aware folder tree the user exports their own game files into (`00_base` < `10_update` < `20_dlc/NNN_name`, higher wins). Enumerates the install's directory names only — **no archive is opened or decrypted**. `Options` = `CORE` (default) or `ALL` | human |
 | `ExportTexture` | `TexturePath, OutPngPath` | Write a `UTexture2D`'s source pixels (BGRA8) out as a PNG | human |
 | `ExportYbn` | `AssetPath, OutXmlPath` | Mesh collision → standalone `.ybn` **XML**. Note: prop collision actually travels *inside* the ydr's embedded `<Bounds>`; this is for shared/world collision work | human |
 | `ExportYbnBinary` | `AssetPath, OutYbnPath, WorldOffset` | Mesh collision → **binary** `.ybn` (RSC7 v43): phBoundComposite → GeometryBVH with quantized verts, stackless BVH and the mandatory subtree table, page-aware layout. `WorldOffset` = `"x,y,z"` GTA metres for absolute world placement (empty = mesh-local). Validated in game | human |
 | `ExportYdr` | `AssetPath, OutXmlPath` | Static Mesh → `.ydr` **XML** (the editable interchange form): inverse transform, shader presets recovered from slot names, embedded collision `<Bounds>` | human |
 | `ExportYdrBinary` | `AssetPath, OutYdrPath` | Static Mesh → **binary** `.ydr` (RSC7 v165): GTAV1 vertex layout, `normal_spec` parameter template with name-hash binding, embedded phBoundComposite collision, page-plan-safe layout. Drawable name = output filename. Validated in game | human |
+| `ExportYdrBinaryBatch` | `AssetFolder, OutDir, Filter` | Batch `ExportYdrBinary`: walk a content folder recursively (or a list file of content paths), optional case-insensitive name-substring `Filter`; each mesh lands at `<OutDir>/<AssetName>.ydr` through the same code path as the single-asset tool | agent |
 | `ExportYmap` | `EntitiesJsonPath, MapName, OutDir` | Placement JSON (UE space) → a complete FiveM resource: `stream/<name>.ymap` + `fxmanifest.lua` carrying the required `this_is_a_map` | human |
 | `ExportYtdBinary` | `TextureSpecs, OutYtdPath, MaxDim` | Textures → **binary** `.ytd` (RSC7 v13) with full mip chains stopping at 4x4. `TextureSpecs` = comma-joined `"ContentPath;RageName[;Usage[;Format]]"`; `Format` = `AUTO\|DXT1\|DXT5\|ATI2\|RAW` (AUTO: NORMAL→ATI2, meaningful alpha→DXT5, else DXT1). `MaxDim` box-downscales oversized sources (`0`/empty = no cap). Validated in game | human |
 | `ExportYtyp` | `YdrSpecs, YtypName, OutYtypPath` | Emit a CMapTypes `.ytyp` — one `CBaseArchetypeDef` per drawable — with the in-game-proven collision model (embedded bounds gate flag bit 17 **and** a non-empty `physicsDictionary`). `YdrSpecs` = comma-separated `"absPath.ydr.xml[;txd[;physDict]]"` | human |
-| `ImportArea` | `AreaName, CatalogPath, CorpusRoot, DestMeshFolder, Filter` | Import a district by its **human name** ("Downtown Los Santos") using an area catalog JSON, then delegate to `ImportMapArea` — one code path, no drift. Empty `AreaName` lists every alias. Underscores read as spaces (console arguments) | human |
-| `ImportMapArea` | `CorpusRoot, YmapPrefix, DestMeshFolder, Filter` | **The one-call thread-pull:** archetype index from `<CorpusRoot>/ytyp` → parse `<CorpusRoot>/ymap/<prefix>*.xml` → import every referenced drawable (ydr / yft / ydd entry) → spawn via `ImportScene`. `YmapPrefix` is a **comma-separated list**; exact basenames ride as `<name>.ymap`. `Filter` = `HD` (default) or `ALL`. ⚠ REPLACES the previously spawned area | human |
+| `FixLevelRefs` | `Mode` | Drop streaming-level entries whose package no longer exists on disk, then save the map. `Mode="APPLY"` writes; anything else reports what it WOULD remove and changes nothing | agent |
+| `ImportArea` | `AreaName, CatalogPath, CorpusRoot, DestMeshFolder, Filter, Mode` | Import a district by its **human name** ("Downtown Los Santos") using an area catalog JSON, then delegate to `ImportMapArea` — one code path, no drift. Empty `AreaName` lists every alias. Underscores read as spaces (console arguments) | human |
+| `ImportMapArea` | `CorpusRoot, YmapPrefix, DestMeshFolder, Filter, Mode` | **The one-call thread-pull:** archetype index from `<CorpusRoot>/ytyp` → parse `<CorpusRoot>/ymap/<prefix>*.xml` → import every referenced drawable (ydr / yft / ydd entry) → spawn via `ImportScene`. `YmapPrefix` is a **comma-separated list**; exact basenames ride as `<name>.ymap`. `Filter` = `HD` (default) or `ALL`. `Mode="FORCE"` re-imports meshes that already exist — the only refresh path the yft/ydd lanes have; empty = skip existing. ⚠ REPLACES the previously spawned area | human |
 | `ImportMlo` | `CorpusRoot, MloArchetypeName, DestMeshFolder, Filter` | Build an MLO **interior**: locate the `CMloArchetypeDef` (name matching is hash-tolerant both ways), import every mesh its entities reference, spawn each room's entities at MLO-local transforms under one root actor **at the world origin** (v1), and map `CLightAttrDef`s to point/spot lights. `Filter` = empty/`ALL`, or a comma-separated **room-name** list. Re-running replaces this archetype's actors by tag | human |
+| `ImportScenarioRegion` | `CorpusRoot, RegionName, Filter` | Import one scenario region (GTA's ambient life) as editable actors — every scenario point becomes its own actor, chaining-graph routes drawn visibly | human |
 | `ImportScene` | `ManifestPath, MeshFolder, Filter` | Re-spawn a scene manifest into the open level **without re-importing anything**: one actor per ymap, one instanced-static-mesh component per unique drawable, proxy cubes for missing meshes, idempotent (clears its previous spawn). `Filter` = `HD` (default, i.e. HD/ORPHANHD lod levels) or `ALL` | human |
+| `ImportVehicle` | `CorpusRoot, VehicleName, DestFolder` | Import a vehicle: the body drawable plus its wheel drawable placed at each wheel bone | human |
 | `ImportYddEntry` | `XmlPath, EntryName, DestFolder` | Import ONE named entry out of a `.ydd.xml` drawable dictionary. `EntryName` is matched case-insensitively **and by joaat hash both ways** (entries are usually `hash_XXXXXXXX`); the imported mesh takes `EntryName`, the archetype-facing identity. An unknown entry fails loudly, listing what *is* there | human |
 | `ImportYdr` | `XmlPath, DestFolder` | One `.ydr.xml` → `UStaticMesh`. Material slots named `<shader_preset>__<geoIndex>`; Material Instances auto-created from the RUDE masters with **RenderBucket-driven routing** (bucket is RAGE's authoritative signal — preset names lie); textures bound by name from `/Game/RUDE/Textures`; complex-as-simple collision so you can walk it in PIE. Reimport is edit-in-place | human |
 | `ImportYdrBatch` | `ListPath, DestFolder, Mode` | Same lane over a text file of absolute `.ydr.xml` paths, one per line. Skip-if-exists (idempotent re-runs) unless `Mode="FORCE"`, which reimports in place — the re-bind pass after textures land | human |
 | `ImportYtd` | `XmlPath, PixelFolder, DestFolder` | `.ytd.xml` + decoded PNGs → `UTexture2D`s with Usage-driven semantics (NORMAL → `TC_Normalmap` + sRGB off, SPECULAR → sRGB off, DIFFUSE → sRGB on). Assets land in `<DestFolder>/<TxdName>/` | human |
 | `ImportYtdBatch` | `ListPath, DestFolder, Mode` | Same over a list file. **The pixel folder is derived, not passed**: the decoded pixels live in a sibling `<stem>/` folder beside each XML, so the pair is self-describing. Skip-if-exists unless `Mode="FORCE"` | human |
 | `IngestExport` | `DumpFolder, SourceName, FilebaseRoot, Move` | File a **flat** export dump into the filebase, sorted by type into the right precedence slot, so nobody hand-sorts. `SourceName` = `base` / `update` / a DLC pack name (empty = the dump folder's own name). `Move` = `MOVE` (default) or `COPY` — ⚠ MOVE relocates recursively and replaces name collisions | human |
+| `PackAreaLevelInstance` | `AreaName, ActorTag, Mode` | Pack an already-spawned area into a Level Instance at `/Game/RUDE/Areas/<slug>`. ⛔ PivotType stays WorldOrigin (RAGE placements are absolute — re-basing mis-places the area silently on export). `Mode="HEADLESS"` builds with no dialog; anything else uses the engine path with its modal Save-As | agent |
 | `Ping` | *(none)* | Version + liveness. The panel shows this as a footer strip instead of a menu row — a person wants to *see* the plugin is alive, not run a tool to ask | agent |
 | `ProbeYdrBinary` | `BinPath` | Parse a **binary** `.ydr` and report its whole drawable graph as JSON (shaders, models, geometries, vertex declarations, embedded bound). Reads untrusted files: every access bounds-checked, malformed input returns `ok:false`, a v159 (Enhanced) drawable is reported as such rather than silently misread | agent |
 | `SaveAssets` | *(none)* | Save every dirty **content** package — never the level, which stays the operator's call. Exists so an agent-run import chain can persist its own work. Calls `FinishAllCompilation` first | agent |
+| `SetWorldHour` | `Hour` | Show only what GTA shows at this hour (`0`–`23`): a visibility sweep over the `RUDE_TIME`-tagged ISM components built from the game's own 24-bit `timeFlags` hour masks. Never a shader gate | agent |
 | `SpawnSeaLevel` | `SizeMetres, ZMetres` | Spawn/move the sea-level reference plane (GTA's ocean sits at world z=0). A **visual reference, not game data** — FiveM water comes from `water.xml`, which RUDE does not read or write. Lands in the `RUDE_ENV` folder so respawns leave it alone | human |
 
 ### Pipeline order (what to call, in what order)
@@ -278,12 +284,16 @@ UnrealEditor-Cmd.exe "<path>\<YourProject>.uproject" -run=/Script/RudeEditor.Rud
 
 ```
 RUDE.uplugin                     module RudeEditor, LoadingPhase Default, depends on ToolsetRegistry
-Content/Masters/                 M_RUDE_Opaque / Cutout / Decal / DecalGeo / Foliage / Terrain / Water
-                                 (mounted at /RUDE/Masters; import routes each RAGE shader to one of
-                                  these by RenderBucket first, preset name as fallback)
+Content/Masters/                 M_RUDE_Opaque / Cutout / DecalGeo / Foliage / Terrain / Water / Detail
+                                 + Gen/ (30 signature-generated masters — committed, so a fresh clone
+                                  ships all 37; EnsureGeneratedMaster remains the load-or-create path)
+                                 (mounted at /RUDE/Masters; import routes each RAGE shader by
+                                  RenderBucket first, preset name as fallback)
 Source/RudeEditor/Private/
-  RudeToolset.h                  THE tool surface - 24 UFUNCTIONs. Start here.
-  RudeToolset.cpp                every implementation
+  RudeToolset.h                  THE tool surface (every UFUNCTION tool). Start here.
+  RudeToolset.cpp                the implementations (bulk)
+  RudeScenario/BuildArea/Vehicle.cpp   lane implementations split out for size — still URudeToolset
+                                 statics, reached only through FRudeInvoke
   RudeInvoke.{h,cpp}             the ONE reflective call path (§1)
   RudeToolPanel.{h,cpp}          the Slate panel + the RUDE.Panel and RUDE.Run console commands
   RudeCommandlet.{h,cpp}         the CLI - argument handling only, dispatch is FRudeInvoke
@@ -296,6 +306,13 @@ Source/RudeEditor/Private/
 
 Honest state, so nobody re-derives these the hard way:
 
+- **`SaveAssets` persists NOTHING under `-unattended`** (measured 2026-07-31): in a commandlet /
+  `-unattended` run, `FEditorFileUtils::SaveDirtyPackages` returns `false` and writes no packages —
+  the tool reports `ok:false` and no `.uasset` lands on disk. So a CLI-driven import chain that ends
+  with `SaveAssets` (the documented pattern in §3) silently loses all its work. Current operating
+  model: building happens with the editor OPEN (agent via MCP, or a human); but the CLI is listed as
+  a first-class surface in §2, so headless persistence is an open product question tracked on the
+  maintainer's register — not a wontfix.
 - **`ImportArea` needs an area-catalog JSON that this repository does not ship** (checked 2026-07-28:
   no such file is tracked). Without one, use `ImportMapArea` with an explicit prefix list.
 - **`ExportYmap` overwrites `fxmanifest.lua` unconditionally** — no existence check, and the write
