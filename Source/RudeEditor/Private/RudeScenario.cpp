@@ -257,12 +257,13 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 	// pass writes "<stem>.<kind>.xml" beside the binary, which `resolve` then flattens into
 	// `_resolved/<kind>/`. So the corpus convention is <CorpusRoot>/ymt/<region>.ymt.xml -
 	// character-for-character the ytyp/ymap shape ImportMapArea already globs.
-	// ⚠ MEASURED 2026-07-28, and the reason for the tolerance below: quarry.py's cmd_meta still
-	// loops `for kind in ('ytyp','ymap')` and no extraction has ever passed --types ymt, so a
-	// filebase built today has NO ymt folder at all (LOG "SCENARIO DATA RECON" filebase note) -
-	// the emitter is wired, the PIPELINE STAGE is not. Two tolerances keep the tool drivable
-	// across that gap and cost nothing once it closes: CorpusRoot may point straight AT a folder
-	// of *.ymt.xml, and RegionName may be a path to one file.
+	// ⭐ PIPELINE STAGE WIRED 2026-07-30: quarry.py's cmd_meta now loops ('ytyp','ymap','ymt'),
+	// so an extraction that passes --types ymt yields <slot>/ymt/<region>.ymt.xml with no hand
+	// conversion (PSO 'PSIN' manifests are counted-skipped there - a different container).
+	// ⚠ EXISTING filebases predate that and still have no ymt folder until re-extracted with
+	// ymt in --types. The two tolerances below were built for that gap and stay because they
+	// cost nothing and keep the tool drivable on ad-hoc folders: CorpusRoot may point straight
+	// AT a folder of *.ymt.xml, and RegionName may be a path to one file.
 	FString Dir = CorpusRoot / TEXT("ymt");
 	if (!FPaths::DirectoryExists(Dir)) { Dir = CorpusRoot; }
 	TArray<FString> Found;

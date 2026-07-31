@@ -2257,11 +2257,13 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	{
 		SlotsJson += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(",") : TEXT(""), *SlotNames[i]);
 	}
-	// ⭐ Report the VALUE params that arrived. They are parsed but not yet bound to anything - no
-	// master exposes Detail and the spec/bump scalars have no home either - so reporting the count
-	// is what keeps that honest: the number says "the data reached the engine", and a reader can see
-	// it is non-zero while nothing consumes it yet. Silence here would look identical to QUARRY
-	// still dropping them, which is exactly the confusion that cost a day.
+	// ⭐ Report the VALUE params that arrived, split three ways: valueParamsSeen (the data reached
+	// the engine), valueParamsBound (a master consumed it - the generated masters + the binding
+	// loop above do bind spec/bump/detail/emissive/tint now), valueParamsUnsupported (arrived but
+	// the routed master has no such parameter - a COUNTED no-op, because SetScalarParameterValue
+	// validates nothing and a silent one is invisible). Seen >> bound is a coverage measurement,
+	// not an error; silence on any of the three would look identical to QUARRY dropping the data,
+	// which is exactly the confusion that cost a day.
 	int32 ValueParams = 0;
 	for (const FShaderDef& D : Shaders) { ValueParams += D.Values.Num(); }
 	return FString::Printf(
