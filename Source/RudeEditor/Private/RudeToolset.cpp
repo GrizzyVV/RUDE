@@ -4394,8 +4394,14 @@ FString URudeToolset::FixLevelRefs(const FString& Mode)
 		// Re-save the map so the stale imports are rewritten away, then RE-ASK the registry. The
 		// verification is the point: if the dependency survives, something live still holds it and
 		// this repair does not apply - say so instead of reporting success.
+		// ⛔ THROUGH RudeSaveDirty (2026-08-01). This was a RAW SaveDirtyPackages call and it is the
+		// third save site the headless-cancel bug hid in: under `-unattended` the save silently did
+		// nothing, so the re-save that IS the repair never happened and the tool honestly reported
+		// mapDepsCleared=false. The verification was doing its job - the repair was not.
 		World->MarkPackageDirty();
-		FEditorFileUtils::SaveDirtyPackages(false, /*maps*/true, /*content*/false, false, false, false);
+		const bool bRepairSaved = RudeSaveDirty(/*bMaps*/ true, /*bContent*/ false);
+		UE_LOG(LogTemp, Display, TEXT("[RUDE] FixLevelRefs: repair re-save %s"),
+			bRepairSaved ? TEXT("OK") : TEXT("FAILED"));
 		FAssetRegistryModule& ARM =
 			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 		IAssetRegistry& AR = ARM.Get();
