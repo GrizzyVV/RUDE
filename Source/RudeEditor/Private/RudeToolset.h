@@ -288,8 +288,11 @@ public:
 	// Emit a complete FiveM placement resource: stream/<name>.ymap (XML CMapData)
 	// + fxmanifest.lua (with the REQUIRED this_is_a_map). EntitiesJsonPath: JSON
 	// array of {archetype, ue:{x,y,z}, ue_quat:{x,y,z,w}?} in UE space; transforms
-	// use the pinned EXPORT-lane conventions (cm->m Y-mirror; gta_quat =
-	// (-x, y, -z, w), bench-proven). Returns JSON: {ok, ymapPath, entities}.
+	// use the cm->m Y-mirror and gta_quat = (x, -y, z, w) - the SAME involution the IMPORT
+	// lane uses, because a ymap <rotation> stores the entity's INVERSE orientation (proven
+	// against Rockstar's own <entitiesExtents>, 2026-08-03). The previous "(-x, y, -z, w),
+	// bench-proven" shipped every authored entity facing the wrong way.
+	// Returns JSON: {ok, ymapPath, entities}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Create a ready-to-use FiveM map resource from a list of placed objects."))
 	static FString ExportYmap(const FString& EntitiesJsonPath, const FString& MapName,
 	                          const FString& OutDir);

@@ -229,13 +229,21 @@ UnrealEditor-Cmd.exe "<path>\<YourProject>.uproject" -run=/Script/RudeEditor.Rud
    already faces outward in UE; reversing it renders inside-out. The OBJ lane *does* reverse, because
    UE's OBJ importer adds its own handedness flip.
 3. **UVs:** raw pass-through (both engines are V-down).
-4. **Rotations — TWO LANES with different maps. Do not unify them.**
-   - **Export lane** (authoring for FiveM): `gta_quat = (-ue_x, ue_y, -ue_z, ue_w)` — an involution,
-     bench-proven in game.
-   - **Import lane** (reading `.ymap` XML out of the interchange folder):
-     `ue_quat = (gx, -gy, gz, gw)` — a pure Y-mirror reflection. Verified against a curving
-     boardwalk whose sections kink under the export-lane map and knit under this one. Identity
-     rotations are unaffected either way, which is why a wrong choice here looks *mostly* right.
+4. **Rotations — ONE map for ymap entities, both directions.** ⛔ This entry previously said "TWO
+   LANES with different maps, do not unify them", and that was wrong in a way that shipped: the two
+   maps differ by a conjugation, so a UE → GTA → UE round trip inverted every rotation and every
+   authored entity reached FiveM facing the wrong way.
+   - **A ymap `<rotation>` stores the entity's INVERSE orientation.** So both directions use
+     `(x, -y, z, w)` — an involution, and its own inverse.
+   - **Proven against Rockstar's own data, not by reasoning:** a ymap declares
+     `<entitiesExtentsMin/Max>`, so transforming each archetype's bbox by the entity transform and
+     unioning must reproduce it. On single-entity ymaps the inverse reproduces the declared extents
+     exactly (0.0000 m) while the forward quaternion is 22.77 m out. Corpus-wide, 81.25% of
+     1,690,098 rotations differ between the two maps and 79.54% by more than 5° — visible at a
+     glance in game, had an exported placement ever been looked at.
+   - ⚠ **NOT a global rule.** A phBound `CompositeTransform` stores a **forward** matrix and keeps
+     the pure mirror `(-x, y, -z, w)` (verified on 4,031/4,031 real composite children). The
+     distinction is *ymap entity = inverse-stored, phBound = forward-stored* — not *two lanes*.
 5. **XML payload parsing:** never rely on line structure inside XML text content — UE's `FXmlFile`
    does not preserve it. Parse a token stream sliced by the vertex layout's semantic widths.
 6. **Emitted placement resources require `this_is_a_map 'yes'`** in `fxmanifest.lua`, or the ymap

@@ -4013,10 +4013,30 @@ FString URudeToolset::ExportYmap(const FString& EntitiesJsonPath, const FString&
 		const TSharedPtr<FJsonObject>* Q;
 		if ((*E)->TryGetObjectField(TEXT("ue_quat"), Q))
 		{
-			// EXPORT-lane involution (bench-pinned): gta_quat = (-x, y, -z, w)
-			Qx = -(*Q)->GetNumberField(TEXT("x"));
-			Qy = (*Q)->GetNumberField(TEXT("y"));
-			Qz = -(*Q)->GetNumberField(TEXT("z"));
+			// ⛔⛔ THIS WAS THE INVERSE OF THE CORRECT ROTATION, AND IT SHIPPED (fixed 2026-08-03).
+			// The import lane applies g(q) = (x, -y, z, w) (:3146, :3427); this wrote
+			// m(q) = (-x, y, -z, w). Both are involutions, but they are DIFFERENT ones, so
+			// g(m(q)) = conj(q): a UE -> GTA -> UE round trip inverted every rotation. Every
+			// entity authored in Unreal shipped to FiveM facing the wrong way, and the old
+			// comment called that "bench-pinned".
+			// WHICH ONE IS RIGHT WAS PROVEN AGAINST ROCKSTAR'S OWN DATA, not reasoned: a ymap
+			// declares <entitiesExtentsMin/Max>, so transforming each archetype's bbMin/bbMax by
+			// the entity transform and unioning must reproduce it. On the single-entity ymap
+			// facelobbyfake_lod (one entity, rot z=-0.2377 w=0.9713) the INVERSE reproduces the
+			// declared extents EXACTLY (max error 0.0000 m) while the forward quaternion is
+			// 22.77 m out in Y - re-verified in this session, independently of the audit that
+			// found it. Corpus-wide, 81.25% of 1,690,098 entity rotations have forward != inverse
+			// and 79.54% differ by more than 5 degrees: unmistakable by eye, had anyone looked at
+			// an exported placement in game.
+			// ⇒ A ymap <rotation> stores the entity's INVERSE orientation, so ue->gta is
+			// conj(mirror(q_ue)) == (x, -y, z, w) - THE SAME involution the import lane uses. The
+			// two lanes must share this formula; it is its own inverse.
+			// ⚠ NOT a global rule: a phBound CompositeTransform stores a FORWARD matrix and keeps
+			// the pure mirror at :1480 (verified 4,031/4,031 real composite children). The
+			// distinction is "ymap entity = inverse-stored, phBound = forward-stored".
+			Qx = (*Q)->GetNumberField(TEXT("x"));
+			Qy = -(*Q)->GetNumberField(TEXT("y"));
+			Qz = (*Q)->GetNumberField(TEXT("z"));
 			Qw = (*Q)->GetNumberField(TEXT("w"));
 		}
 		MinX = FMath::Min(MinX, X); MinY = FMath::Min(MinY, Y); MinZ = FMath::Min(MinZ, Z);
