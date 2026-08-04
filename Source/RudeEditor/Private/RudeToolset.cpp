@@ -739,6 +739,15 @@ namespace RudeYdr
 		TArray<FVector4f> Colors;      // Colour0 as 0-1 RGBA -> UE vertex colour
 		TArray<FVector4f> Colors1;     // Colour1 as 0-1 RGBA -> smuggled into UV2/UV3
 		TArray<int32> Indices;         // winding already flipped for the mirror
+		// ⛔ A geometry with NO TexCoord0 in its layout gets UV (0,0) on every vertex, which hands
+		// MikkTSpace a zero-AREA triangle for the whole geometry - the tangent basis it returns for
+		// that section is arbitrary, and any normal map bound to it lights wrong. The importer used
+		// to do this in total silence (the UV default is the `IsValidIndex ? : ZeroVector` ternary in
+		// the builder, which reads as a bounds guard, not as a substitution). MEASURED over 900
+		// resolved ydr / 3,444 geometries: 8 (0.232%) carry no TexCoord0 - and they are not all
+		// proxies (prop_tree_fallen_01, prop_bush_lrg_03 are shipped props). Small, real, and
+		// previously unreportable.
+		bool bHasUV0 = false;
 	};
 
 	static bool ParseGeometry(const FXmlNode* GeoNode, FGeo& Out, FString& Error)
@@ -771,6 +780,7 @@ namespace RudeYdr
 					Error = FString::Printf(TEXT("unknown vertex semantic '%s' - refusing to misalign"), *Child->GetTag());
 					return false;
 				}
+				if (Child->GetTag() == TEXT("TexCoord0")) { Out.bHasUV0 = true; }
 				Semantics.Add(Child->GetTag());
 				LineWidth += W;
 			}
@@ -1080,36 +1090,74 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 
 	int32 Imported = 0;
 	int32 InvalidNames = 0;
+	// ⛔ THREE SILENT SUBSTITUTIONS, NOW COUNTED (2026-08-04). Each one is latent in today's corpus
+	// and each one is invisible if it ever stops being latent - which is the definition of the bug
+	// class this file keeps paying for.
+	//   Declared        - items the manifest actually offered. Without it, "imported" cannot be read:
+	//                     imported 0 out of 0 (43 of 40,077 shared manifests declare no texture at
+	//                     all) is a no-op, imported 0 out of 40 is a total loss, and the verdict
+	//                     spelled them identically.
+	//   ItemsWithoutName- an item with no <Name> was dropped by a bare `continue`; not even
+	//                     "declared" saw it. MEASURED over the whole resolved corpus (82,241
+	//                     manifests / 428,210 items): 0 today.
+	//   UsageDefaulted  - a MISSING <Usage> silently becomes DIFFUSE, which sets CompressionSettings,
+	//                     SRGB and LODGroup. A normal map that arrives without <Usage> is imported as
+	//                     an sRGB colour texture and renders as garbage lighting with every counter
+	//                     reading clean. MEASURED corpus-wide: 0 items lack <Usage> today, so this is
+	//                     a tripwire on a converter regression, not a live loss.
+	//   UsageUnknown    - <Usage> present but outside the vocabulary this function branches on
+	//                     (DIFFUSE/NORMAL/SPECULAR). MEASURED corpus-wide: UNKNOWN 24,458 + TERRAIN
+	//                     2,041 + FENCE 234 = 26,733 of 428,210 items (6.24%) land in the sRGB
+	//                     else-branch. That is defensible and it is now DISCLOSED rather than assumed.
+	int32 Declared = 0, ItemsWithoutName = 0, UsageDefaulted = 0, UsageUnknown = 0;
+	int32 MissingPixelCount = 0;
 	FString Missing;
 	for (const FXmlNode* Item : Root->GetChildrenNodes())
 	{
 		const FXmlNode* NameNode = Item->FindChildNode(TEXT("Name"));
 		if (!NameNode || NameNode->GetContent().TrimStartAndEnd().IsEmpty())
 		{
+			++ItemsWithoutName;
 			continue;
 		}
+		++Declared;
 		const FString TexName = NameNode->GetContent().TrimStartAndEnd();
 		const FXmlNode* UsageNode = Item->FindChildNode(TEXT("Usage"));
+		if (!UsageNode) { ++UsageDefaulted; }
 		const FString Usage = UsageNode ? UsageNode->GetContent().TrimStartAndEnd() : TEXT("DIFFUSE");
+		if (Usage != TEXT("DIFFUSE") && Usage != TEXT("NORMAL") && Usage != TEXT("SPECULAR"))
+		{
+			++UsageUnknown;
+		}
 
 		// decoded pixels (offline BC-decode bridge until native decode lands)
 		const FString PngPath = PixelFolder / (TexName + TEXT(".png"));
 		TArray<uint8> PngBytes;
+		// ⛔ The missingPixels ARRAY is capped by nothing and read by no batch; MissingPixelCount is
+		// the scalar a caller can actually aggregate (ImportYtdBatch could not sum a JSON list).
+		auto NoPixels = [&]()
+		{
+			++MissingPixelCount;
+			if (MissingPixelCount <= 30)
+			{
+				Missing += FString::Printf(TEXT("%s\"%s\""), Missing.IsEmpty() ? TEXT("") : TEXT(","), *TexName);
+			}
+		};
 		if (!FFileHelper::LoadFileToArray(PngBytes, *PngPath))
 		{
-			Missing += FString::Printf(TEXT("%s\"%s\""), Missing.IsEmpty() ? TEXT("") : TEXT(","), *TexName);
+			NoPixels();
 			continue;
 		}
 		TSharedPtr<IImageWrapper> Png = ImageWrapper.CreateImageWrapper(EImageFormat::PNG);
 		if (!Png.IsValid() || !Png->SetCompressed(PngBytes.GetData(), PngBytes.Num()))
 		{
-			Missing += FString::Printf(TEXT("%s\"%s\""), Missing.IsEmpty() ? TEXT("") : TEXT(","), *TexName);
+			NoPixels();
 			continue;
 		}
 		TArray<uint8> BGRA;
 		if (!Png->GetRaw(ERGBFormat::BGRA, 8, BGRA))
 		{
-			Missing += FString::Printf(TEXT("%s\"%s\""), Missing.IsEmpty() ? TEXT("") : TEXT(","), *TexName);
+			NoPixels();
 			continue;
 		}
 		const int32 W = Png->GetWidth();
@@ -1171,10 +1219,26 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 		++Imported;
 	}
 
+	// ⛔ ok IS COMPUTED, AND ONLY ON THE TOTAL-LOSS SHAPE (2026-08-04). The 2026-07-30 incident was
+	// exactly this: 1,943 dictionaries, every texture rejected by the package-name check, imported=0,
+	// and a hardcoded ok:true on every one - so the batch counted 1,943 successes. The gate is
+	// "I had work, I rejected all of it, I produced nothing", NOT "invalidNames > 0":
+	// MEASURED over the whole resolved corpus (82,241 manifests incl. the 42,164 __embedded
+	// siblings), 45 dictionaries carry at least one texture whose NAME is not a legal package
+	// segment (78 items - names with a space, e.g. baller2 'generic_ cav_detail_dash'), and only 2
+	// manifests have a bad STEM. Failing all 45 would report a 39-of-40 partial import as a total
+	// failure AND drop its 39 textures out of the batch's texturesImported sum, because the batch
+	// only aggregates the ok path. A partial loss is a NUMBER (invalidNames), not a failure.
+	// Note the second half of the gate: Declared == 0 stays ok - 43 of 40,077 shared manifests
+	// genuinely declare no texture, and "nothing to do" is not "nothing worked".
+	const bool bTotalLoss = (Declared > 0 && Imported == 0 && InvalidNames > 0);
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"txd\":\"%s\",\"imported\":%d,\"invalidNames\":%d,")
-		TEXT("\"missingPixels\":[%s]}"),
-		*TxdName, Imported, InvalidNames, *Missing);
+		TEXT("{\"ok\":%s,\"txd\":\"%s\",\"declared\":%d,\"imported\":%d,\"invalidNames\":%d,")
+		TEXT("\"itemsWithoutName\":%d,\"usageDefaulted\":%d,\"usageUnknown\":%d,")
+		TEXT("\"missingPixelCount\":%d,\"missingPixels\":[%s]}"),
+		bTotalLoss ? TEXT("false") : TEXT("true"),
+		*TxdName, Declared, Imported, InvalidNames, ItemsWithoutName, UsageDefaulted, UsageUnknown,
+		MissingPixelCount, *Missing);
 }
 
 FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlPath)
@@ -1660,8 +1724,11 @@ FString URudeToolset::Ping()
 // root or a <Fragment>'s inner <Drawable> (both via ImportYdr), or a <DrawableDictionary>
 // <Item> (ImportYddEntry) - anything carrying ShaderGroup + DrawableModelsHigh children.
 // MeshName is the ASSET name, decided by the CALLER (file stem, <Name>, or dictionary entry).
+// TextureScope ◑ = the archetype's <textureDictionary>, if the caller knows it. Empty means
+// "no scope", which is what both public entry points pass today - see the TexturesByName block
+// for the measurement that says wiring it is worth doing (exact scoping 20.07% -> 68.54%).
 static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName,
-                                  const FString& DestFolder);
+                                  const FString& DestFolder, const FString& TextureScope = FString());
 
 FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolder)
 {
@@ -1715,7 +1782,7 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 }
 
 static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName,
-                                  const FString& DestFolder)
+                                  const FString& DestFolder, const FString& TextureScope)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -1885,6 +1952,16 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	TPolygonGroupAttributesRef<FName> GroupSlotNames = Attributes.GetPolygonGroupMaterialSlotNames();
 
 	int32 TotalVerts = 0, TotalTris = 0;
+	// ⛔ "triangles" USED TO REPORT ONLY THE SURVIVORS. Both `continue`s below drop a triangle and
+	// ++TotalTris fires only on the ones that were created, so a file whose indices had been
+	// scrambled by an emitter or binary-reader regression produced a plausible-looking triangle
+	// count and no complaint at all. Split, because the two mean opposite things: DEGENERATE is
+	// normal in shipped art, OUT-OF-RANGE is never normal and means the index buffer is not what
+	// the vertex buffer says it is. MEASURED over 900 resolved ydr / 2,560,879 triangles:
+	// out-of-range 0, degenerate 30 (0.0012%). Today it is an honest sub-0.01% loss; the point is
+	// that a future 30% loss would look identical without these two fields.
+	int32 TrisOutOfRange = 0, TrisDegenerate = 0;
+	int32 GeometriesWithoutUV = 0;
 	TArray<FString> SlotNames;
 
 	for (int32 GeoIdx = 0; GeoIdx < Geos.Num(); ++GeoIdx)
@@ -1896,6 +1973,7 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 			? Shaders[Geo.ShaderIndex].Preset : TEXT("default");
 		const FString SlotName = FString::Printf(TEXT("%s__%d"), *ShaderName, GeoIdx);
 		SlotNames.Add(SlotName);
+		if (!Geo.bHasUV0) { ++GeometriesWithoutUV; }
 
 		const FPolygonGroupID GroupID = MeshDesc->CreatePolygonGroup();
 		GroupSlotNames[GroupID] = FName(*SlotName);
@@ -1925,10 +2003,12 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 			// XML, and an upper-bound-only check let -1 through into TArray's fatal RangeCheck.
 			if (!VertexIDs.IsValidIndex(I0) || !VertexIDs.IsValidIndex(I1) || !VertexIDs.IsValidIndex(I2))
 			{
+				++TrisOutOfRange;
 				continue;
 			}
 			if (I0 == I1 || I1 == I2 || I0 == I2)
 			{
+				++TrisDegenerate;
 				continue;   // degenerate
 			}
 			TArray<FVertexInstanceID> Insts;
@@ -1951,8 +2031,41 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	Mesh->CommitMeshDescription(0);
 
 	// --- Material auto-derive: family master -> MaterialInstanceConstant per slot ---
-	// Texture lookup table: every UTexture2D under /Game/RUDE/Textures by lowercase name
-	TMap<FString, FAssetData> TextureByName;
+	// ⛔⛔ THE TEXTURE LIBRARY IS KEYED BY BARE NAME, AND RAGE TEXTURE NAMES ARE NOT UNIQUE.
+	// This used to be TMap<FString, FAssetData> with TMap::Add's last-writer-wins, so which
+	// dictionary's copy a mesh bound depended on the order the ASSET REGISTRY happened to enumerate
+	// packages in - i.e. it could differ between two runs of the same import, while boundTextures
+	// counted every one of them as a success. That makes a material screenshot non-reproducible,
+	// which is fatal to "look at the screen" as evidence independently of whether anything renders
+	// wrong.
+	// MEASURED over the WHOLE resolved corpus (82,241 dictionaries = 40,077 shared + 42,164
+	// __embedded siblings, 428,210 texture items): 120,326 distinct names, of which 47,839 (39.8%)
+	// live in more than one dictionary and 23,324 (19.4%) disagree on Width/Height between
+	// dictionaries. From the CONSUMER side, over 2,000 sampled ydr / 21,409 texture references:
+	// 91.35% of every reference a drawable makes is satisfiable from more than one dictionary.
+	//
+	// ⚠ SO "REFUSE THE AMBIGUOUS BIND AND COUNT IT" - the obvious-looking fix, and the one the
+	// audit recommended - IS WRONG AT THIS SCALE: it would drop 76.5% of all texture bindings and
+	// render the city untextured. The 2,260-name figure that fix was sized against came from a
+	// 6,000-dictionary sample that excluded the embedded manifests entirely.
+	// WHAT IS ACTUALLY DONE, cheapest correct thing first:
+	//   1. the drawable's OWN <stem>__embedded dictionary wins outright. MEASURED: resolves 20.07%
+	//      of all references exactly, and it is exact BY CONSTRUCTION - that dictionary was carved
+	//      out of this very drawable.
+	//   2. otherwise, if the name exists in exactly one dictionary, take it (8.63% of references).
+	//   3. otherwise take the lexicographically first candidate and ++AmbiguousTextures. Not
+	//      correct - DETERMINISTIC, which is the property a screenshot needs. The counter is what
+	//      makes the residual sayable instead of assumed.
+	// ◑ THE REAL FIX NEEDS ONE PIECE OF DATA THIS FUNCTION IS NOT GIVEN: the archetype's
+	// <textureDictionary>. MEASURED against 1,500 drawables that have an archetype (16,827
+	// references): the archetype txd + its +hi/+hidr variants resolve 48.47% of references, so
+	// embedded-first + archetype-scope would take EXACT scoping from 20.07% to 68.54%, leaving
+	// 31.46% for RAGE's parent-txd chain. TextureScope below is the hook: BuildCorpusArchetypeIndex
+	// already parses <textureDictionary> off every archetype it walks, and ImportIndexedDrawable
+	// already holds the archetype - wiring it is one field on FRudeArchetypeIndex and one argument.
+	// Deliberately NOT done here because this function has no caller that can supply it yet, and a
+	// parameter nothing sets is honest only if it is labelled.
+	TMap<FString, TArray<FAssetData>> TexturesByName;
 	{
 		FAssetRegistryModule& ARM =
 			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
@@ -1960,7 +2073,7 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		// ⛔⛔ WAIT FOR THE REGISTRY, OR THIS QUERY LIES. GetAssets answers from whatever has been
 		// scanned SO FAR - it does not block. Driven from -ExecCmds at editor startup (which is how
 		// every agent/CI run drives RUDE) the initial scan is still in flight, so this returns few
-		// or NO textures, TextureByName comes back empty, and every FindTexture misses. The import
+		// or NO textures, TexturesByName comes back empty, and every FindTexture misses. The import
 		// then "succeeds" with boundTextures 0 and writes MaterialInstances with nothing bound.
 		// MEASURED 2026-07-29: a FORCE rebind of 4,956 downtown meshes bound essentially nothing
 		// this way - the city rendered untextured with default-checker patches - while 13 of the 17
@@ -1978,12 +2091,26 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		AR.GetAssets(Filter, Found);
 		for (const FAssetData& AD : Found)
 		{
-			TextureByName.Add(AD.AssetName.ToString().ToLower(), AD);
+			TexturesByName.FindOrAdd(AD.AssetName.ToString().ToLower()).Add(AD);
+		}
+		// ⛔ SORT, DO NOT TRUST THE REGISTRY'S ORDER. GetAssets answers in whatever order the
+		// registry discovered packages, which is the exact non-determinism this whole block exists
+		// to remove. FName::LexicalLess gives the same winner on every machine and every run.
+		int32 MultiName = 0;
+		for (TPair<FString, TArray<FAssetData>>& P : TexturesByName)
+		{
+			if (P.Value.Num() > 1)
+			{
+				++MultiName;
+				P.Value.Sort([](const FAssetData& A, const FAssetData& B)
+					{ return A.PackageName.LexicalLess(B.PackageName); });
+			}
 		}
 		// An empty texture library is never normal for a project that has imported any ytd. Say so
 		// once, loudly, rather than letting thousands of silent misses look like missing source data.
-		UE_LOG(LogTemp, Display, TEXT("[RUDE] texture library: %d textures visible under "
-			"/Game/RUDE/Textures"), TextureByName.Num());
+		UE_LOG(LogTemp, Display, TEXT("[RUDE] texture library: %d distinct names under "
+			"/Game/RUDE/Textures (%d of them present in more than one dictionary)"),
+			TexturesByName.Num(), MultiName);
 	}
 
 	// The shader def drives master selection: build the capability signature from what this shader
@@ -2043,17 +2170,60 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		return LoadObject<UMaterialInterface>(nullptr, Path);
 	};
 
-	auto FindTexture = [&TextureByName](const FString& TexName) -> UTexture2D*
+	// Dictionary a texture asset came from = the LAST segment of its package path, because
+	// ImportYtd writes every texture to <DestFolder>/<TxdName>/<TexName>. Reading it off the
+	// FAssetData costs nothing and needs no asset load.
+	auto DictOf = [](const FAssetData& AD) -> FString
+	{
+		const FString Path = AD.PackagePath.ToString();
+		int32 Slash;
+		return Path.FindLastChar(TEXT('/'), Slash) ? Path.RightChop(Slash + 1).ToLower() : Path.ToLower();
+	};
+	const FString EmbeddedDict = (MeshName + TEXT("__embedded")).ToLower();
+	// ◑ Wired to nothing yet - see the block comment on TexturesByName. When ImportIndexedDrawable
+	// can pass the archetype's <textureDictionary>, these four spellings are the scope to try.
+	TArray<FString> ScopeDicts;
+	if (!TextureScope.IsEmpty())
+	{
+		const FString S = TextureScope.ToLower();
+		ScopeDicts = { S, S + TEXT("+hi"), S + TEXT("+hidr"), S + TEXT("+hidd") };
+	}
+	int32 AmbiguousTextures = 0;
+	int32 TexturesFromEmbedded = 0;
+	auto FindTexture = [&](const FString& TexName) -> UTexture2D*
 	{
 		if (TexName.IsEmpty())
 		{
 			return nullptr;
 		}
-		if (const FAssetData* AD = TextureByName.Find(TexName.ToLower()))
+		const TArray<FAssetData>* Cands = TexturesByName.Find(TexName.ToLower());
+		if (!Cands || Cands->Num() == 0)
 		{
-			return Cast<UTexture2D>(AD->GetAsset());
+			return nullptr;
 		}
-		return nullptr;
+		if (Cands->Num() == 1)
+		{
+			return Cast<UTexture2D>((*Cands)[0].GetAsset());
+		}
+		for (const FAssetData& AD : *Cands)
+		{
+			if (DictOf(AD) == EmbeddedDict)
+			{
+				++TexturesFromEmbedded;
+				return Cast<UTexture2D>(AD.GetAsset());
+			}
+		}
+		for (const FString& S : ScopeDicts)
+		{
+			for (const FAssetData& AD : *Cands)
+			{
+				if (DictOf(AD) == S) { return Cast<UTexture2D>(AD.GetAsset()); }
+			}
+		}
+		// Deterministic, not correct. The counter is the whole point: without it an
+		// import-order-dependent bind was indistinguishable from an exact one.
+		++AmbiguousTextures;
+		return Cast<UTexture2D>((*Cands)[0].GetAsset());
 	};
 
 	int32 BoundTextures = 0;
@@ -2062,11 +2232,15 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	// ~4309): binding "Normal" onto a master that HAS no Normal succeeds, persists in the uasset,
 	// shows in the MI editor - and renders nothing. So a rising "boundTextures" proves nothing.
 	// UnsupportedByMaster counts exactly those silent no-ops; a non-zero value is a real defect.
+	int32 ValueParamsSeen = 0;       // params that REACHED the bind decision (see the verdict note)
 	int32 ValueParamsBound = 0;      // value param the master DOES expose, so it took effect
 	int32 ValueParamsUnsupported = 0;// value param arrived but no master parameter accepts it
+	int32 ValueParamsDeduped = 0;    // params on a geometry that reused a cached MI - never bound
 	int32 UnsupportedByMaster = 0;   // sampler mapped, but the MASTER has no such parameter
 	int32 MissingTextures = 0;       // XML named a texture that is not imported in this project
 	int32 UnmappedSamplers = 0;      // a sampler name with no entry in GSamplerBinds (see below)
+	int32 SlotsWithoutShaderDef = 0; // geometry's ShaderIndex resolves to no shader definition
+	int32 SlotsWithoutMaterial = 0;  // slot kept WorldGridMaterial - see the block below the loop
 
 	// Sampler name -> master parameter. Keyed by NAME; FString== and TMap<FString,> hashing are
 	// both case-INSENSITIVE, so no normalisation is needed. The converter's older 3-name emission
@@ -2093,6 +2267,8 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		const FString& Slot = SlotNames[GeoIdx];
 		const int32 ShaderIdx = Geos[GeoIdx].ShaderIndex;
 		const FShaderDef* Def = Shaders.IsValidIndex(ShaderIdx) ? &Shaders[ShaderIdx] : nullptr;
+		if (!Def) { ++SlotsWithoutShaderDef; }
+		else { ValueParamsSeen += Def->Values.Num(); }
 
 		UMaterialInterface* SlotMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
 		const bool bTerrain = Def && Def->Preset.StartsWith(TEXT("terrain"), ESearchCase::IgnoreCase);
@@ -2113,23 +2289,54 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 				? (bTerrain ? EnsureTerrainMaster() : MasterForPreset(Def->Preset, Def->RenderBucket))
 				: MasterForDef(*Def);
 		}
+		// ⛔⛔ THE DEDUPE KEY MUST CARRY EVERYTHING THE MATERIALINSTANCE IS BUILT FROM.
+		// It used to be Preset|Diffuse|Normal|Specular (+4 terrain layer names). That key omits
+		// RenderBucket - which SELECTS THE MASTER two blocks above, and therefore the blend mode -
+		// every sampler outside the legacy three (Detail, TintPalette, Dirt, TextureSamp,
+		// distanceMapSampler, BumpSampler_layerN), and ALL value params. Two geometries whose
+		// shaders differed only in those fields collided, and the second silently got the first
+		// one's MI: wrong detail texture, wrong specular response, or an opaque master on an
+		// alpha-blended surface. Nothing counted it, because a cache HIT is indistinguishable from
+		// a correct share.
+		// MEASURED by replicating both keys over 3,000 resolved ydr / 12,181 geometries:
+		// 170 geometries (1.396%) received an MI built from a DIFFERENT shader - 160 differing in
+		// value params (bumpiness 0.2 vs 0.4 on kt1_11_apt_01; specular hash_27B9B2FA 0.5 vs 0.93
+		// on cs1_02_biln019), 7 in bound textures, 3 in RenderBucket (an opaque master reused for
+		// a bucket-1 geometry). 101 of 3,000 files (3.37%) are affected.
+		// COST OF THE FIX, measured on the same sample: 11,186 -> 11,346 MaterialInstances, +1.43%.
+		// Dedupe still works; it can no longer merge two different shaders.
 		FString ConfigKey;
 		if (Def)
 		{
-			ConfigKey = Def->Preset + TEXT("|") + Def->Diffuse + TEXT("|") + Def->Normal + TEXT("|") + Def->Specular;
-			if (bTerrain)
+			ConfigKey = FString::Printf(TEXT("%s|b%d"), *Def->Preset, Def->RenderBucket);
+			// TMap iteration order is not a contract - sort, or the same shader can produce two
+			// different keys and the dedupe silently stops deduping.
+			TArray<FString> Keys;
+			Def->AllTex.GenerateKeyArray(Keys);
+			Keys.Sort();
+			for (const FString& K : Keys)
 			{
-				for (int32 li = 0; li < 4; ++li)
-				{
-					const FString* T = Def->AllTex.Find(FString::Printf(TEXT("TextureSampler_layer%d"), li));
-					ConfigKey += TEXT("|") + (T ? *T : FString());
-				}
+				ConfigKey += FString::Printf(TEXT("|%s=%s"), *K, **Def->AllTex.Find(K));
+			}
+			Keys.Reset();
+			Def->Values.GenerateKeyArray(Keys);
+			Keys.Sort();
+			for (const FString& K : Keys)
+			{
+				const FVector4& V = *Def->Values.Find(K);
+				ConfigKey += FString::Printf(TEXT("|%s=%.6g,%.6g,%.6g,%.6g"),
+					*K, V.X, V.Y, V.Z, V.W);
 			}
 			ConfigKey.ToLowerInline();
 		}
+		bool bSlotResolved = false;
 		if (Master && MIByConfig.Contains(ConfigKey))
 		{
 			SlotMaterial = MIByConfig[ConfigKey];
+			bSlotResolved = true;
+			// The dedupe branch never reaches the bind loop, so its value params were counted in
+			// "seen" and accounted for by nothing. They are a THIRD residual, not a loss.
+			ValueParamsDeduped += Def->Values.Num();
 		}
 		else if (Master)
 		{
@@ -2159,6 +2366,7 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 					for (const FMaterialParameterInfo& I : Infos) { MasterParams.Add(I.Name); }
 				}
 				bool bBoundDiffuse = false;
+				bool bBoundDetail = false;
 				auto BindTex = [&](const TCHAR* Param, const FString& TexName) -> bool
 				{
 					if (TexName.IsEmpty()) { return false; }
@@ -2169,6 +2377,7 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 					MIC->SetTextureParameterValueEditorOnly(FMaterialParameterInfo(PName), T);
 					++BoundTextures;
 					if (PName == FName(TEXT("Diffuse"))) { bBoundDiffuse = true; }
+					if (PName == FName(TEXT("Detail")))  { bBoundDetail = true; }
 					return true;
 				};
 
@@ -2228,12 +2437,14 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 				// detail overlay is inert until a Detail texture genuinely bound. Same shape as the
 				// decal 'Visible' gate: never switch an effect on because a parameter EXISTS - only
 				// because the data it needs arrived.
+				// ⚠ The predicate is now the BIND RESULT (bBoundDetail), not a second FindTexture on
+				// DetailSampler. Same answer - the walk above already bound it through the same
+				// guard - but the old spelling resolved the name TWICE, which double-counted it in
+				// the ambiguity counter added 2026-08-04 and loaded the asset a second time.
 				if (MasterParams.Contains(FName(TEXT("Detail"))))
 				{
-					const FString* DetailTex = Def->AllTex.Find(TEXT("DetailSampler"));
-					const bool bDetail = DetailTex && FindTexture(*DetailTex) != nullptr;
 					MIC->SetScalarParameterValueEditorOnly(
-						FMaterialParameterInfo(TEXT("DetailAmount")), bDetail ? 1.f : 0.f);
+						FMaterialParameterInfo(TEXT("DetailAmount")), bBoundDetail ? 1.f : 0.f);
 				}
 
 				// ---- VALUE params -> the MI, guarded exactly like textures ----
@@ -2275,9 +2486,23 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 				MIPackage->MarkPackageDirty();
 				FAssetRegistryModule::AssetCreated(MIC);
 				SlotMaterial = MIC;
+				bSlotResolved = true;
 				MIByConfig.Add(ConfigKey, MIC);
 			}
 		}
+		// ⛔⛔ THE WORST-CASE FAILURE IN THIS FILE WAS INVISIBLE. SlotMaterial starts as
+		// UMaterial::GetDefaultMaterial(MD_Surface) - WorldGridMaterial - and BOTH branches above
+		// require a non-null Master. Master is null when the ShaderIndex is out of range, when any
+		// Ensure*Master hits `if (!Pkg) return nullptr`, or when MasterForPreset's LoadObject of
+		// /RUDE/Masters/M_RUDE_Opaque fails because the plugin's content is not mounted. In that
+		// last case EVERY slot of EVERY mesh silently gets WorldGridMaterial while boundTextures,
+		// missingTextures and unsupportedByMaster all read 0 - a verdict IDENTICAL to "this
+		// drawable has no textures", on an entire city. There was no counter and no field.
+		// Split by cause, because they are diagnosed differently: a non-zero slotsWithoutShaderDef
+		// is bad corpus data, a non-zero slotsWithoutMaterial on the first mesh of a batch means
+		// the masters are unreachable. (MEASURED: 0 out-of-range ShaderIndex in 900 resolved ydr /
+		// 3,444 geometries, so today only the master path can fire this.)
+		if (!bSlotResolved) { ++SlotsWithoutMaterial; }
 
 		FStaticMaterial Mat(SlotMaterial, FName(*Slot));
 		Mat.UVChannelData.bInitialized = true;
@@ -2303,24 +2528,55 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	{
 		SlotsJson += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(",") : TEXT(""), *SlotNames[i]);
 	}
-	// ⭐ Report the VALUE params that arrived, split three ways: valueParamsSeen (the data reached
-	// the engine), valueParamsBound (a master consumed it - the generated masters + the binding
-	// loop above do bind spec/bump/detail/emissive/tint now), valueParamsUnsupported (arrived but
-	// the routed master has no such parameter - a COUNTED no-op, because SetScalarParameterValue
-	// validates nothing and a silent one is invisible). Seen >> bound is a coverage measurement,
-	// not an error; silence on any of the three would look identical to QUARRY dropping the data,
-	// which is exactly the confusion that cost a day.
-	int32 ValueParams = 0;
-	for (const FShaderDef& D : Shaders) { ValueParams += D.Values.Num(); }
+	// ⭐ Report the VALUE params that arrived, split FOUR ways so the residual closes exactly:
+	//     valueParamsSeen == valueParamsBound + valueParamsUnsupported + valueParamsDeduped
+	// holds identically whenever slotsWithoutMaterial == 0, and any gap is now a real defect
+	// rather than a shrug.
+	// ⛔ WHAT WAS WRONG: seen was `for (const FShaderDef& D : Shaders) ValueParams += D.Values.Num()`
+	// - a sum over the whole shader TABLE - while bound/unsupported only ever incremented for a
+	// geometry that WON its config group. Params on shaders no geometry references, and params on
+	// every geometry that hit the MI cache, were counted as "seen" and then accounted for by
+	// nothing. MEASURED over 2,000 corpus ydr: seen reported 56,507 against 54,000 reachable -
+	// 2,507 params (4.4%) that appeared in seen and in neither residual. The comment above this
+	// block called that gap "a coverage measurement", which is exactly how a 4% regression in
+	// binding would have hidden: it would have looked like today's healthy run.
+	// Seen is now summed PER GEOMETRY over the shader that geometry actually uses, which is the
+	// same population the bind loop walks. It is a count of bind DECISIONS, not of distinct params
+	// in the file - that is the only definition that can balance.
+	// ⛔ ok IS COMPUTED. slotsWithoutMaterial > 0 means at least one slot silently kept
+	// WorldGridMaterial, and the pathological case (masters unmounted) makes that EVERY slot of
+	// EVERY mesh while every other counter reads 0. A tool whose ok cannot express its own
+	// worst-case failure is not reporting, it is decorating.
+	const bool bMeshOk = (SlotsWithoutMaterial == 0);
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"geometries\":%d,\"geometriesDropped\":%d,")
-		TEXT("\"geometryErrors\":[%s],\"vertices\":%d,\"triangles\":%d,")
-		TEXT("\"boundTextures\":%d,\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
-		TEXT("\"unmappedSamplers\":%d,\"valueParamsSeen\":%d,\"valueParamsBound\":%d,")
-		TEXT("\"valueParamsUnsupported\":%d,\"slots\":[%s]}"),
-		*PackageName, Geos.Num(), GeosFailed, *GeoErrors, TotalVerts, TotalTris, BoundTextures,
-		UnsupportedByMaster, MissingTextures, UnmappedSamplers, ValueParams,
-		ValueParamsBound, ValueParamsUnsupported, *SlotsJson);
+		TEXT("{\"ok\":%s,\"assetPath\":\"%s\",\"geometries\":%d,\"geometriesDropped\":%d,")
+		TEXT("\"geometryErrors\":[%s],\"geometriesWithoutUV\":%d,\"vertices\":%d,\"triangles\":%d,")
+		TEXT("\"trianglesOutOfRange\":%d,\"trianglesDegenerate\":%d,")
+		TEXT("\"boundTextures\":%d,\"texturesFromEmbedded\":%d,\"ambiguousTextures\":%d,")
+		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
+		TEXT("\"unmappedSamplers\":%d,\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
+		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,")
+		TEXT("\"valueParamsUnsupported\":%d,\"valueParamsDeduped\":%d,\"slots\":[%s]}"),
+		bMeshOk ? TEXT("true") : TEXT("false"),
+		*PackageName, Geos.Num(), GeosFailed, *GeoErrors, GeometriesWithoutUV, TotalVerts, TotalTris,
+		TrisOutOfRange, TrisDegenerate,
+		BoundTextures, TexturesFromEmbedded, AmbiguousTextures,
+		UnsupportedByMaster, MissingTextures, UnmappedSamplers,
+		SlotsWithoutShaderDef, SlotsWithoutMaterial,
+		ValueParamsSeen, ValueParamsBound, ValueParamsUnsupported, ValueParamsDeduped, *SlotsJson);
+}
+
+// Read one integer field out of a tool's JSON verdict. Lifted to file scope from ImportYdrBatch's
+// local lambda (2026-08-04) because THREE aggregators now need it and a second copy is how two
+// batches drift apart. The leading quote in the needle is load-bearing: it stops "imported" from
+// matching inside "texturesImported" and "triangles" from matching inside "trianglesDegenerate".
+// A missing field reads 0, which is the right answer for a unit that predates the field.
+static int32 RudeSumField(const FString& Json, const TCHAR* Key)
+{
+	const FString Needle = FString::Printf(TEXT("\"%s\":"), Key);
+	const int32 At = Json.Find(Needle);
+	if (At == INDEX_NONE) { return 0; }
+	return FCString::Atoi(*Json.Mid(At + Needle.Len()));
 }
 
 // Jenkins one-at-a-time over the LOWERCASED name - RAGE's name hash, pinned to QUARRY's
@@ -3038,6 +3294,57 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 	return true;
 }
 
+// ⛔⛔ THE MAP LANE USED TO REDUCE A WHOLE UNIT VERDICT TO ONE BOOLEAN. This function called
+// ImportYdr/ImportYddEntry, tested `R.Contains("\"ok\":true")`, and dropped R on the floor -
+// so geometriesDropped, boundTextures, missingTextures, unsupportedByMaster, unmappedSamplers and
+// every value-param field were discarded on the PRIMARY path. ImportMapArea, ImportArea and
+// ImportMlo are the tools an operator and an agent actually run, and this is the ONLY path that
+// serves the yft (302,847 entity placements) and ydd (165,552) lanes - there is no per-lane batch
+// for them the way ImportYdrBatch serves ydr. A whole-city import that bound zero textures and
+// dropped hundreds of geometries printed the same verdict as a perfect one. That is the exact
+// failure ImportYdrBatch was fixed for on 2026-07-29, still live one level up.
+struct FRudeImportTally
+{
+	int32 GeosDropped = 0, GeosNoUV = 0, TrisOutOfRange = 0, TrisDegenerate = 0;
+	int32 Bound = 0, FromEmbedded = 0, Ambiguous = 0, Unsupported = 0, MissingTex = 0;
+	int32 UnmappedSamp = 0, NoShaderDef = 0, NoMaterial = 0;
+	int32 ValSeen = 0, ValBound = 0, ValUnsupported = 0, ValDeduped = 0;
+
+	void Accumulate(const FString& R)
+	{
+		GeosDropped    += RudeSumField(R, TEXT("geometriesDropped"));
+		GeosNoUV       += RudeSumField(R, TEXT("geometriesWithoutUV"));
+		TrisOutOfRange += RudeSumField(R, TEXT("trianglesOutOfRange"));
+		TrisDegenerate += RudeSumField(R, TEXT("trianglesDegenerate"));
+		Bound          += RudeSumField(R, TEXT("boundTextures"));
+		FromEmbedded   += RudeSumField(R, TEXT("texturesFromEmbedded"));
+		Ambiguous      += RudeSumField(R, TEXT("ambiguousTextures"));
+		Unsupported    += RudeSumField(R, TEXT("unsupportedByMaster"));
+		MissingTex     += RudeSumField(R, TEXT("missingTextures"));
+		UnmappedSamp   += RudeSumField(R, TEXT("unmappedSamplers"));
+		NoShaderDef    += RudeSumField(R, TEXT("slotsWithoutShaderDef"));
+		NoMaterial     += RudeSumField(R, TEXT("slotsWithoutMaterial"));
+		ValSeen        += RudeSumField(R, TEXT("valueParamsSeen"));
+		ValBound       += RudeSumField(R, TEXT("valueParamsBound"));
+		ValUnsupported += RudeSumField(R, TEXT("valueParamsUnsupported"));
+		ValDeduped     += RudeSumField(R, TEXT("valueParamsDeduped"));
+	}
+
+	FString ToJson() const
+	{
+		return FString::Printf(
+			TEXT("\"geometriesDropped\":%d,\"geometriesWithoutUV\":%d,\"trianglesOutOfRange\":%d,")
+			TEXT("\"trianglesDegenerate\":%d,\"boundTextures\":%d,\"texturesFromEmbedded\":%d,")
+			TEXT("\"ambiguousTextures\":%d,\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
+			TEXT("\"unmappedSamplers\":%d,\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
+			TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,\"valueParamsUnsupported\":%d,")
+			TEXT("\"valueParamsDeduped\":%d"),
+			GeosDropped, GeosNoUV, TrisOutOfRange, TrisDegenerate, Bound, FromEmbedded, Ambiguous,
+			Unsupported, MissingTex, UnmappedSamp, NoShaderDef, NoMaterial,
+			ValSeen, ValBound, ValUnsupported, ValDeduped);
+	}
+};
+
 // Resolve ONE indexed drawable to its corpus XML and import it (skip-if-exists) - dictionary
 // entries live INSIDE their dict's ydd XML (one file, many drawables); plain drawables and
 // fragments stay one-file-per-asset under ydr/ and yft/. The skip check runs on the ENTRY
@@ -3045,7 +3352,7 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 static void ImportIndexedDrawable(const FString& CorpusRoot, const FRudeArchetypeIndex& Index,
                                   const FString& Drawable, const FString& DestMeshFolder,
                                   int32& MeshOk, int32& MeshSkip, int32& MeshFail, int32& MeshMissing,
-                                  bool bForce = false)
+                                  FRudeImportTally& Tally, bool bForce = false)
 {
 	const FString* Dict = Index.DictEntries.Find(Drawable);
 	const bool bFrag = !Dict && Index.FragmentAssets.Contains(Drawable);
@@ -3068,6 +3375,10 @@ static void ImportIndexedDrawable(const FString& CorpusRoot, const FRudeArchetyp
 	}
 	const FString R = Dict ? URudeToolset::ImportYddEntry(XmlPath, Drawable, DestMeshFolder)
 	                       : URudeToolset::ImportYdr(XmlPath, DestMeshFolder);
+	// Accumulate on BOTH paths: a mesh that came back ok:false because every slot fell to
+	// WorldGridMaterial still reports the counters that say WHY, and throwing them away because
+	// of the boolean is how this got lost the first time.
+	Tally.Accumulate(R);
 	if (R.Contains(TEXT("\"ok\":true"))) { ++MeshOk; } else { ++MeshFail; }
 }
 
@@ -3145,22 +3456,40 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	YmapFiles.Sort();
 	if (YmapFiles.Num() == 0) { return Fail(TEXT("no ymaps match the prefix")); }
 	int32 TotalEnts = 0, Resolved = 0;
+	// ⛔ "ymaps" REPORTED THE GLOB MATCH COUNT. YmapFiles.Num() is how many FILENAMES matched the
+	// prefix, and it was emitted verbatim as the number of ymaps imported - while THREE separate
+	// `continue`s could eliminate a file with no counter at all: an FXmlFile parse failure, a
+	// missing <entities> node, and a file that contributed zero entities. MEASURED over 1,500
+	// resolved ymap XML: 0 parse failures and 0 missing <entities> today, but 219 files (14.6%)
+	// carry an EMPTY <entities> element and so produce no scene while still counting toward
+	// "ymaps" - i.e. the number overstates coverage by ~15% on a typical prefix, and a wholesale
+	// XML-corruption event would be invisible because the glob would still match.
+	// ⚠ YmapsUnreadable is also the only place UE's FXmlFile can disagree with the offline
+	// analysis: the corpus join rate was measured with lxml, and FXmlFile is a different,
+	// hand-rolled tokenizer. Until this field exists and reads 0 on a full run, that rate is an
+	// upper bound.
+	int32 YmapsParsed = 0, YmapsUnreadable = 0, YmapsNoEntitiesNode = 0, YmapsWithEntities = 0;
+	int32 EntitiesSkipped = 0;   // entity missing <archetypeName> or <position> - was a bare continue
 	TSet<FString> NeededDrawables;
 	FString ScenesJson;
 	for (const FString& F : YmapFiles)
 	{
 		FXmlFile Xml(CorpusRoot / TEXT("ymap") / F);
-		if (!Xml.IsValid()) { continue; }
+		if (!Xml.IsValid()) { ++YmapsUnreadable; continue; }
+		++YmapsParsed;
 		const FXmlNode* Root = Xml.GetRootNode();
 		const FXmlNode* Ents = Root ? Root->FindChildNode(TEXT("entities")) : nullptr;
-		if (!Ents) { continue; }
+		if (!Ents) { ++YmapsNoEntitiesNode; continue; }
 		FString EntJson;
 		int32 SceneEnts = 0;
 		for (const FXmlNode* E : Ents->GetChildrenNodes())
 		{
 			const FXmlNode* AN = E->FindChildNode(TEXT("archetypeName"));
 			const FXmlNode* Pos = E->FindChildNode(TEXT("position"));
-			if (!AN || !Pos) { continue; }
+			// Counted, not silent. No index consequence on THIS lane (a ymap entity is not
+			// referenced by ordinal the way an MLO's attachedObjects references one), but an
+			// entity that vanishes between the file and the manifest must be sayable.
+			if (!AN || !Pos) { ++EntitiesSkipped; continue; }
 			const FString Arch = AN->GetContent().TrimStartAndEnd().ToLower();
 			const double Px = FCString::Atod(*Pos->GetAttribute(TEXT("x")));
 			const double Py = FCString::Atod(*Pos->GetAttribute(TEXT("y")));
@@ -3200,6 +3529,7 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 				TFlags ? *TFlags : 0u);
 		}
 		if (SceneEnts == 0) { continue; }
+		++YmapsWithEntities;
 		FString YmapName = FPaths::GetBaseFilename(F);
 		YmapName.RemoveFromEnd(TEXT(".ymap"));
 		ScenesJson += FString::Printf(TEXT("%s{\"ymap\":\"%s\",\"entities\":[%s]}"),
@@ -3217,12 +3547,13 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	// ---- 3) import every referenced drawable present in the corpus (skip-if-exists) ----
 	// (per-drawable lane selection factored to ImportIndexedDrawable, shared with ImportMlo)
 	int32 MeshOk = 0, MeshSkip = 0, MeshFail = 0, MeshMissing = 0, Done = 0, DictNeeded = 0;
+	FRudeImportTally Tally;
 	for (const FString& D : NeededDrawables)
 	{
 		++Done;
 		if (Index.DictEntries.Contains(D)) { ++DictNeeded; }
 		ImportIndexedDrawable(CorpusRoot, Index, D, DestMeshFolder, MeshOk, MeshSkip, MeshFail,
-		                      MeshMissing, bForceMeshes);
+		                      MeshMissing, Tally, bForceMeshes);
 		if (Done % 100 == 0)
 		{
 			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportMapArea meshes %d/%d (ok %d, skip %d, fail %d)"),
@@ -3239,12 +3570,38 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	// ---- 4) spawn through the proven ImportScene path ----
 	// The spawn only understands lod levels - never hand it the FORCE token.
 	const FString Spawn = ImportScene(ManifestPath, DestMeshFolder, LodFilter);
+	// ⛔⛔ ok WAS A LITERAL, AND THE SPAWN'S OWN VERDICT WAS NESTED UNDERNEATH IT. This function
+	// calls ImportScene and then opens its format string with a hardcoded "ok":true - so
+	// "no editor world", the failure that produces an import with nothing placed in it, was
+	// reported as a success by the only field the CLI exit code, the RUDE.Run console path and the
+	// Slate status line actually read (all three go through FRudeInvoke::ReportedFailure, a
+	// substring search for "ok":false). Worse, that substring search scans the WHOLE string, so a
+	// failed nested spawn turned the PANEL red while the JSON an agent parses still said
+	// ok:true - the two observers disagreed about the same run.
+	// THE GATE, EXACTLY: forward the spawn's ok; fail if NO ymap contributed a scene; fail if ANY
+	// ymap failed to parse. The last one is deliberately zero-tolerance and it is the cheap answer
+	// to an open question - the 99.4% corpus join rate was measured with lxml, while UE's FXmlFile
+	// is a different hand-rolled tokenizer whose failures were dropped by an uncounted `continue`.
+	// MEASURED: 0 of 1,500 resolved ymaps fail to parse offline, so a non-zero ymapsUnreadable
+	// means the two parsers disagree, and that is exactly what should stop a run.
+	// meshesFailed and meshesMissingFromCorpus stay NUMBERS - a city always has some of both, and
+	// a gate that fires on every run is a gate nobody reads.
+	const bool bSpawnOk = !Spawn.Contains(TEXT("\"ok\":false"));
+	const bool bAreaOk = bSpawnOk && (YmapsWithEntities > 0) && (YmapsUnreadable == 0);
 	return FString::Printf(TEXT(
-		"{\"ok\":true,\"ymaps\":%d,\"entities\":%d,\"resolved\":%d,\"meshesImported\":%d,"
-		"\"meshesSkipped\":%d,\"meshesFailed\":%d,\"meshesMissingFromCorpus\":%d,"
+		"{\"ok\":%s,\"ymapsMatched\":%d,\"ymapsParsed\":%d,\"ymapsUnreadable\":%d,"
+		"\"ymapsWithoutEntitiesNode\":%d,\"ymapsWithEntities\":%d,\"ymaps\":%d,"
+		"\"entities\":%d,\"entitiesSkipped\":%d,\"resolved\":%d,\"meshesImported\":%d,"
+		"\"meshesSkipped\":%d,\"meshesFailed\":%d,\"meshesMissingFromCorpus\":%d,%s,"
 		"\"manifest\":\"%s\",\"spawn\":%s}"),
-		YmapFiles.Num(), TotalEnts, Resolved, MeshOk, MeshSkip, MeshFail, MeshMissing,
-		*ManifestPath, *Spawn);
+		bAreaOk ? TEXT("true") : TEXT("false"),
+		YmapFiles.Num(), YmapsParsed, YmapsUnreadable, YmapsNoEntitiesNode, YmapsWithEntities,
+		// "ymaps" is KEPT and now means what its name says - ymaps that contributed a scene.
+		// Renaming it outright would silently change every existing caller's reading; the four
+		// new fields say where the difference went.
+		YmapsWithEntities,
+		TotalEnts, EntitiesSkipped, Resolved, MeshOk, MeshSkip, MeshFail, MeshMissing,
+		*Tally.ToJson(), *ManifestPath, *Spawn);
 }
 
 FString URudeToolset::ImportArea(const FString& AreaName, const FString& CatalogPath,
@@ -3447,9 +3804,20 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 		int32 Room = -1;        // index into Rooms (from rooms' attachedObjects)
 		int32 Portal = -1;      // index into Portals (doors attach to portals, not rooms)
 		TArray<FMloLight> Lights;
+		// ⛔⛔ A MALFORMED ENTITY KEEPS ITS SLOT. Rooms and portals reference their contents by
+		// ORDINAL - "0-based into <entities>" is this file's own stated contract - so dropping an
+		// entity from the array re-bases every attachedObjects index after it and silently attaches
+		// the wrong props to the wrong rooms. badAttachedRefs cannot catch it: after a drop the
+		// shifted indices are all still IN RANGE, so every check passes and the interior is quietly
+		// wrong. RudeScenario.cpp:139-157 already solves exactly this for points and nodes with the
+		// same reasoning ("Compacting the array renumbers everything after it - a corruption that no
+		// in-range check can catch"); the pattern existed and was simply not applied here.
+		// MEASURED over 105 MLO archetypes / 11,451 entities: 0 occurrences today. Latent, and
+		// latent is the point - the trigger is a hand-edited, truncated or re-emitted ytyp.
+		bool bValid = true;
 	};
 	TArray<FMloEntity> Ents;
-	int32 OtherExtensions = 0, LightsSkipped = 0;
+	int32 OtherExtensions = 0, LightsSkipped = 0, EntitiesMissingTransform = 0;
 	FString LightProblem;
 
 	if (const FXmlNode* EntsN = Mlo->FindChildNode(TEXT("entities")))
@@ -3458,7 +3826,15 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 		{
 			const FXmlNode* AN = E->FindChildNode(TEXT("archetypeName"));
 			const FXmlNode* Pos = E->FindChildNode(TEXT("position"));
-			if (!AN || !Pos) { continue; }
+			if (!AN || !Pos)
+			{
+				// Slot preserved, entity marked dead - see FMloEntity::bValid.
+				++EntitiesMissingTransform;
+				FMloEntity Dead;
+				Dead.bValid = false;
+				Ents.Add(MoveTemp(Dead));
+				continue;
+			}
 			FMloEntity Ent;
 			Ent.ArchLower = AN->GetContent().TrimStartAndEnd().ToLower();
 			// MLO-LOCAL transform through the pinned IMPORT-lane convention (pos Y-mirror*100,
@@ -3657,6 +4033,9 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 	};
 	auto Passes = [&](const FMloEntity& E) -> bool
 	{
+		// A slot-preserving placeholder is not a thing to import or spawn - it exists only so the
+		// entities after it keep their ordinals.
+		if (!E.bValid) { return false; }
 		if (E.Room >= 0) { return RoomPasses(E.Room); }
 		if (Portals.IsValidIndex(E.Portal))
 		{
@@ -3668,7 +4047,7 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 	int32 Unroomed = 0;
 	for (const FMloEntity& E : Ents)
 	{
-		if (E.Room < 0 && E.Portal < 0) { ++Unroomed; }
+		if (E.bValid && E.Room < 0 && E.Portal < 0) { ++Unroomed; }
 	}
 
 	// ---- 3) import every referenced drawable present in the corpus (skip-if-exists;
@@ -3680,10 +4059,12 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 		if (const FString* Asset = Index.ArchToAsset.Find(E.ArchLower)) { Needed.Add(*Asset); }
 	}
 	int32 MeshOk = 0, MeshSkip = 0, MeshFail = 0, MeshMissing = 0, Done = 0;
+	FRudeImportTally Tally;
 	for (const FString& D : Needed)
 	{
 		++Done;
-		ImportIndexedDrawable(CorpusRoot, Index, D, DestMeshFolder, MeshOk, MeshSkip, MeshFail, MeshMissing);
+		ImportIndexedDrawable(CorpusRoot, Index, D, DestMeshFolder, MeshOk, MeshSkip, MeshFail,
+		                      MeshMissing, Tally);
 		if (Done % 100 == 0)
 		{
 			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportMlo meshes %d/%d (ok %d, skip %d, fail %d)"),
@@ -3894,20 +4275,35 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 	const FString LightProblemJson = LightProblem.IsEmpty()
 		? FString()
 		: FString::Printf(TEXT("\"lightProblem\":\"%s\","), *LightProblem);
+	// "entities" stays the SLOT COUNT (that is what rooms and portals index into); the placeholders
+	// added for malformed records are broken out separately so the two can never be confused.
+	// ok is computed: an interior that indexed nothing or placed nothing is not a success, and the
+	// per-mesh tally is forwarded so this lane - which together with ImportMapArea is the ONLY
+	// consumer of the yft and ydd import paths - finally reports the quality of what it imported.
+	// ⚠ DELIBERATELY WEAK. I have no measurement of how often a legitimate room filter leaves an
+	// interior with nothing to place, so the gate fires only on shapes that cannot be legitimate:
+	// an MLO with neither a room nor a portal (it did not parse as an interior at all), or one
+	// that placed NOTHING - not even a proxy cube - while having entity slots to place. A gate
+	// that fires on a normal run is a gate that gets ignored; tightening this one needs an
+	// in-editor run across several interiors, which is on the handoff list.
+	const bool bMloOk = (Rooms.Num() > 0 || Portals.Num() > 0)
+		&& (Spawned + Proxies > 0 || Ents.Num() == 0);
 	return FString::Printf(TEXT(
-		"{\"ok\":true,\"archetype\":\"%s\",\"requested\":\"%s\",\"ytyp\":\"%s\","
+		"{\"ok\":%s,\"archetype\":\"%s\",\"requested\":\"%s\",\"ytyp\":\"%s\","
 		"\"rooms\":%d,\"roomNames\":[%s],\"portals\":%d,\"portalRooms\":[%s],"
-		"\"entitySets\":[%s],\"entities\":%d,\"spawned\":%d,\"proxies\":%d,"
+		"\"entitySets\":[%s],\"entities\":%d,\"entitiesMissingTransform\":%d,"
+		"\"spawned\":%d,\"proxies\":%d,"
 		"\"unresolvedArchetypes\":%d,\"lights\":%d,\"lightsSkipped\":%d,%s"
 		"\"otherExtensions\":%d,\"badAttachedRefs\":%d,\"unroomedEntities\":%d,"
 		"\"meshesImported\":%d,\"meshesSkipped\":%d,\"meshesFailed\":%d,"
-		"\"meshesMissingFromCorpus\":%d}"),
+		"\"meshesMissingFromCorpus\":%d,%s}"),
+		bMloOk ? TEXT("true") : TEXT("false"),
 		*Search.FoundName, *Wanted, *FPaths::GetCleanFilename(Search.FoundFile),
 		Rooms.Num(), *RoomNamesJson, Portals.Num(), *PortalsJson,
-		*SetsJson, Ents.Num(), Spawned, Proxies,
+		*SetsJson, Ents.Num(), EntitiesMissingTransform, Spawned, Proxies,
 		Unresolved, NumLights, LightsSkipped, *LightProblemJson,
 		OtherExtensions, BadRefs, Unroomed,
-		MeshOk, MeshSkip, MeshFail, MeshMissing);
+		MeshOk, MeshSkip, MeshFail, MeshMissing, *Tally.ToJson());
 }
 
 // Ported from the in-game-proven tools/emit_ytyp.py - the archetype flag +
@@ -4265,14 +4661,17 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	// run that bound all of them printed the identical line. A batch must aggregate the counters
 	// its unit reports - a silent contributor has to be as loud as a failing one.
 	int32 Bound = 0, Unsupported = 0, MissingTex = 0, UnmappedSamp = 0;
-	int32 ValSeen = 0, ValBound = 0, ValUnsupported = 0;
-	auto SumField = [](const FString& Json, const TCHAR* Key) -> int32
-	{
-		const FString Needle = FString::Printf(TEXT("\"%s\":"), Key);
-		const int32 At = Json.Find(Needle);
-		if (At == INDEX_NONE) { return 0; }
-		return FCString::Atoi(*Json.Mid(At + Needle.Len()));
-	};
+	int32 ValSeen = 0, ValBound = 0, ValUnsupported = 0, ValDeduped = 0;
+	// ⛔ THE BATCH SUMMED SEVEN FIELDS AND STOPPED, and the two it left out were the ones that
+	// report LOST GEOMETRY. ImportYdr has emitted geometriesDropped + geometryErrors since
+	// 2026-07-31; the batch never read them, so a run in which a fraction of every mesh failed to
+	// parse printed imported=N with nothing else moving - the identical failure this batch was
+	// fixed for on 2026-07-29, one level down. MEASURED drop rate on today's corpus is 0 (900
+	// resolved ydr / 3,444 geometries: no unknown semantics, no misalignment), which is exactly
+	// when a blind spot goes unnoticed. Everything ImportYdr counts is now summed here.
+	int32 GeosDropped = 0, GeoErrors = 0, GeosNoUV = 0;
+	int32 TrisOOR = 0, TrisDegen = 0;
+	int32 FromEmbedded = 0, Ambiguous = 0, NoShaderDef = 0, NoMaterial = 0;
 	FString FailedFiles;
 	for (int32 i = 0; i < Lines.Num(); ++i)
 	{
@@ -4289,16 +4688,33 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 			continue;
 		}
 		const FString R = ImportYdr(Path, DestFolder);
+		// ⚠ Counters are read on BOTH paths, matching FRudeImportTally. Since ImportYdr's ok is now
+		// computed (slotsWithoutMaterial), a mesh can come back ok:false while still carrying the
+		// counters that explain WHY - and a hard failure carries none of them, so they read 0.
+		// Dropping them because of the boolean is the same blindness one level down.
+		Bound          += RudeSumField(R, TEXT("boundTextures"));
+		Unsupported    += RudeSumField(R, TEXT("unsupportedByMaster"));
+		MissingTex     += RudeSumField(R, TEXT("missingTextures"));
+		UnmappedSamp   += RudeSumField(R, TEXT("unmappedSamplers"));
+		ValSeen        += RudeSumField(R, TEXT("valueParamsSeen"));
+		ValBound       += RudeSumField(R, TEXT("valueParamsBound"));
+		ValUnsupported += RudeSumField(R, TEXT("valueParamsUnsupported"));
+		ValDeduped     += RudeSumField(R, TEXT("valueParamsDeduped"));
+		GeosDropped    += RudeSumField(R, TEXT("geometriesDropped"));
+		GeosNoUV       += RudeSumField(R, TEXT("geometriesWithoutUV"));
+		TrisOOR        += RudeSumField(R, TEXT("trianglesOutOfRange"));
+		TrisDegen      += RudeSumField(R, TEXT("trianglesDegenerate"));
+		FromEmbedded   += RudeSumField(R, TEXT("texturesFromEmbedded"));
+		Ambiguous      += RudeSumField(R, TEXT("ambiguousTextures"));
+		NoShaderDef    += RudeSumField(R, TEXT("slotsWithoutShaderDef"));
+		NoMaterial     += RudeSumField(R, TEXT("slotsWithoutMaterial"));
+		// geometryErrors is a JSON ARRAY, so it cannot be summed - count the FILES that carry a
+		// non-empty one. Zero here alongside a non-zero geometriesDropped would mean every dropped
+		// geometry is unexplained, which is itself a defect worth seeing.
+		if (R.Contains(TEXT("\"geometryErrors\":[\""))) { ++GeoErrors; }
 		if (R.Contains(TEXT("\"ok\":true")))
 		{
 			++Imported;
-			Bound        += SumField(R, TEXT("boundTextures"));
-			Unsupported  += SumField(R, TEXT("unsupportedByMaster"));
-			MissingTex   += SumField(R, TEXT("missingTextures"));
-			UnmappedSamp += SumField(R, TEXT("unmappedSamplers"));
-			ValSeen        += SumField(R, TEXT("valueParamsSeen"));
-			ValBound       += SumField(R, TEXT("valueParamsBound"));
-			ValUnsupported += SumField(R, TEXT("valueParamsUnsupported"));
 		}
 		else
 		{
@@ -4324,18 +4740,26 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		}
 	}
 	UE_LOG(LogTemp, Display,
-		TEXT("[RUDE] ImportYdrBatch DONE: %d imported, %d skipped, %d failed | textures bound %d, "
-		     "unsupportedByMaster %d, missing %d, unmappedSamplers %d | value params seen %d, "
-		     "bound %d, unsupported %d"),
-		Imported, Skipped, Failed, Bound, Unsupported, MissingTex, UnmappedSamp,
-		ValSeen, ValBound, ValUnsupported);
+		TEXT("[RUDE] ImportYdrBatch DONE: %d imported, %d skipped, %d failed | geometries dropped %d "
+		     "(%d files explained), no-UV %d | triangles out-of-range %d, degenerate %d | textures "
+		     "bound %d (embedded-scoped %d, ambiguous %d), unsupportedByMaster %d, missing %d, "
+		     "unmappedSamplers %d | slots without shader def %d, without material %d | value params "
+		     "seen %d = bound %d + unsupported %d + deduped %d"),
+		Imported, Skipped, Failed, GeosDropped, GeoErrors, GeosNoUV, TrisOOR, TrisDegen,
+		Bound, FromEmbedded, Ambiguous, Unsupported, MissingTex, UnmappedSamp,
+		NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped);
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"imported\":%d,\"skipped\":%d,\"failed\":%d,\"boundTextures\":%d,")
+		TEXT("{\"ok\":true,\"imported\":%d,\"skipped\":%d,\"failed\":%d,")
+		TEXT("\"geometriesDropped\":%d,\"filesWithGeometryErrors\":%d,\"geometriesWithoutUV\":%d,")
+		TEXT("\"trianglesOutOfRange\":%d,\"trianglesDegenerate\":%d,\"boundTextures\":%d,")
+		TEXT("\"texturesFromEmbedded\":%d,\"ambiguousTextures\":%d,")
 		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,\"unmappedSamplers\":%d,")
+		TEXT("\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
 		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,\"valueParamsUnsupported\":%d,")
-		TEXT("\"failedFiles\":[%s]}"),
-		Imported, Skipped, Failed, Bound, Unsupported, MissingTex, UnmappedSamp,
-		ValSeen, ValBound, ValUnsupported, *FailedFiles);
+		TEXT("\"valueParamsDeduped\":%d,\"failedFiles\":[%s]}"),
+		Imported, Skipped, Failed, GeosDropped, GeoErrors, GeosNoUV, TrisOOR, TrisDegen,
+		Bound, FromEmbedded, Ambiguous, Unsupported, MissingTex, UnmappedSamp,
+		NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped, *FailedFiles);
 }
 
 // ⛔⛔ WHY THIS WRAPPER EXISTS — `-unattended` SILENTLY CANCELS EVERY SAVE (measured 2026-07-31,
@@ -4651,6 +5075,16 @@ FString URudeToolset::ImportYtdBatch(const FString& ListPath, const FString& Des
 	}
 	const bool bForce = Mode.TrimStartAndEnd().Equals(TEXT("FORCE"), ESearchCase::IgnoreCase);
 	int32 Imported = 0, Textures = 0, Skipped = 0, Failed = 0;
+	// ⛔ THIS BATCH PARSED EXACTLY ONE FIELD OUT OF THE UNIT VERDICT ("imported") AND DROPPED THE
+	// REST - including invalidNames and missingPixels, the two counters ImportYtd was given
+	// precisely so a silent texture loss could never recur. On 2026-07-30 the unit reported
+	// texturesImported=0 across 1,943 dictionaries and the batch said ok:true; the fix put the
+	// counter on the UNIT and left the aggregator blind, so the same run today would still print
+	// only a total that had gone to zero. MEASURED over the whole resolved corpus: 45 of 82,241
+	// dictionaries carry a texture whose name is not a legal package segment (78 items), so
+	// invalidNames is a small, sharp signal that must not be averaged into silence.
+	int32 Declared = 0, InvalidNames = 0, MissingPixels = 0;
+	int32 UsageDefaulted = 0, UsageUnknown = 0, ItemsWithoutName = 0;
 	FString FailedFiles;
 	for (int32 i = 0; i < Lines.Num(); ++i)
 	{
@@ -4671,15 +5105,20 @@ FString URudeToolset::ImportYtdBatch(const FString& ListPath, const FString& Des
 			continue;
 		}
 		const FString R = ImportYtd(Path, PixelFolder, DestFolder);
+		// ⚠ The counters are read on BOTH paths. A dictionary that failed still declared textures
+		// and still rejected names, and dropping its numbers because its ok flipped is the same
+		// class of blindness this block is fixing.
+		Declared         += RudeSumField(R, TEXT("declared"));
+		InvalidNames     += RudeSumField(R, TEXT("invalidNames"));
+		MissingPixels    += RudeSumField(R, TEXT("missingPixelCount"));
+		UsageDefaulted   += RudeSumField(R, TEXT("usageDefaulted"));
+		UsageUnknown     += RudeSumField(R, TEXT("usageUnknown"));
+		ItemsWithoutName += RudeSumField(R, TEXT("itemsWithoutName"));
 		if (R.Contains(TEXT("\"ok\":true")))
 		{
 			++Imported;
 			// accumulate the per-txd texture count from the tool's own verdict
-			const int32 At = R.Find(TEXT("\"imported\":"));
-			if (At != INDEX_NONE)
-			{
-				Textures += FCString::Atoi(*R.Mid(At + 11));
-			}
+			Textures += RudeSumField(R, TEXT("imported"));
 		}
 		else
 		{
@@ -4691,8 +5130,11 @@ FString URudeToolset::ImportYtdBatch(const FString& ListPath, const FString& Des
 		}
 		if ((i + 1) % 25 == 0)
 		{
-			UE_LOG(LogTemp, Display, TEXT("[RUDE] ImportYtdBatch %d/%d (ok %d, skip %d, fail %d, tex %d)"),
-				i + 1, Lines.Num(), Imported, Skipped, Failed, Textures);
+			UE_LOG(LogTemp, Display,
+				TEXT("[RUDE] ImportYtdBatch %d/%d (ok %d, skip %d, fail %d | declared %d, tex %d, "
+				     "invalidNames %d, missingPixels %d)"),
+				i + 1, Lines.Num(), Imported, Skipped, Failed, Declared, Textures,
+				InvalidNames, MissingPixels);
 		}
 		if ((i + 1) % 100 == 0)
 		{
@@ -4700,9 +5142,19 @@ FString URudeToolset::ImportYtdBatch(const FString& ListPath, const FString& Des
 			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
 		}
 	}
+	UE_LOG(LogTemp, Display,
+		TEXT("[RUDE] ImportYtdBatch DONE: %d dictionaries ok, %d skipped, %d failed | declared %d, "
+		     "textures imported %d, invalidNames %d, missingPixels %d, usage defaulted %d, "
+		     "usage outside DIFFUSE/NORMAL/SPECULAR %d, nameless items %d"),
+		Imported, Skipped, Failed, Declared, Textures, InvalidNames, MissingPixels,
+		UsageDefaulted, UsageUnknown, ItemsWithoutName);
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"imported\":%d,\"texturesImported\":%d,\"skipped\":%d,\"failed\":%d,\"failedFiles\":[%s]}"),
-		Imported, Textures, Skipped, Failed, *FailedFiles);
+		TEXT("{\"ok\":true,\"imported\":%d,\"texturesImported\":%d,\"texturesDeclared\":%d,")
+		TEXT("\"skipped\":%d,\"failed\":%d,\"invalidNames\":%d,\"missingPixels\":%d,")
+		TEXT("\"usageDefaulted\":%d,\"usageUnknown\":%d,\"itemsWithoutName\":%d,")
+		TEXT("\"failedFiles\":[%s]}"),
+		Imported, Textures, Declared, Skipped, Failed, InvalidNames, MissingPixels,
+		UsageDefaulted, UsageUnknown, ItemsWithoutName, *FailedFiles);
 }
 
 FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& MeshFolder,
@@ -4747,6 +5199,18 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 	TMap<FString, UStaticMesh*> MeshCache;      // lowercase drawable -> mesh (nullptr = known-missing)
 	TMap<FString, int32> Missing;               // drawable/archetype -> proxy instance count
 	int32 NumYmaps = 0, NumEntities = 0, NumInstances = 0, NumProxies = 0;
+	// ⛔ "entities" WAS THE POST-FILTER NUMBER, AND THE FILTER WAS SILENT. ++NumEntities fires
+	// AFTER both `continue`s below, so a caller could not tell a manifest that is 12% LOD content
+	// from a manifest whose entities failed to parse - and "entities" reads as "the entities in
+	// this manifest". MEASURED over 1,500 resolved ymap / 239,662 entities: 25,185 (10.51%) are
+	// dropped by the default HD filter (LOD 22,745, SLOD1 2,274, SLOD2 112, SLOD3 37), and 17
+	// carry the unresolvable string hash_6F5D45B3 as their lodLevel - neither HD nor a known LOD
+	// tier, so they get their own bucket rather than being folded into either.
+	// ⚠ An EMPTY lodLevel is KEPT by the predicate below (treated as HD). 0 corpus entities lack
+	// the element today; the count is here so that if one ever does, the assumption is visible
+	// instead of silently spawning something the game would not have drawn.
+	int32 EntitiesInManifest = 0, FilteredByLod = 0, UnknownLodLevel = 0, EmptyLodLevel = 0;
+	int32 MalformedEntities = 0, UniqueMeshLookups = 0;
 
 	for (const TSharedPtr<FJsonValue>& SceneVal : Scenes)
 	{
@@ -4802,13 +5266,18 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		for (const TSharedPtr<FJsonValue>& EntVal : *Entities)
 		{
 			const TSharedPtr<FJsonObject>* Ent;
-			if (!EntVal.IsValid() || !EntVal->TryGetObject(Ent)) { continue; }
-			if (!bAll)
+			if (!EntVal.IsValid() || !EntVal->TryGetObject(Ent)) { ++MalformedEntities; continue; }
+			++EntitiesInManifest;
 			{
 				FString Lod;
 				(*Ent)->TryGetStringField(TEXT("lodLevel"), Lod);
-				if (!Lod.IsEmpty() && Lod != TEXT("LODTYPES_DEPTH_HD") && Lod != TEXT("LODTYPES_DEPTH_ORPHANHD"))
+				const bool bHd = Lod.IsEmpty()
+					|| Lod == TEXT("LODTYPES_DEPTH_HD") || Lod == TEXT("LODTYPES_DEPTH_ORPHANHD");
+				if (Lod.IsEmpty()) { ++EmptyLodLevel; }
+				else if (!bHd && !Lod.StartsWith(TEXT("LODTYPES_DEPTH_"))) { ++UnknownLodLevel; }
+				if (!bAll && !bHd)
 				{
+					++FilteredByLod;
 					continue;
 				}
 			}
@@ -4817,6 +5286,7 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 			if (!(*Ent)->TryGetArrayField(TEXT("ue_location"), Loc) || Loc->Num() != 3 ||
 			    !(*Ent)->TryGetArrayField(TEXT("ue_quat"), Quat) || Quat->Num() != 4)
 			{
+				++MalformedEntities;
 				continue;
 			}
 			++NumEntities;
@@ -4839,6 +5309,13 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 				{
 					Mesh = LoadObject<UStaticMesh>(nullptr, *(MeshFolder / Drawable));
 					MeshCache.Add(Drawable, Mesh);
+					// ⛔ MeshCache.Num() was reported as "uniqueMeshes". The cache DELIBERATELY
+					// stores nullptr for a known-missing drawable (its own comment says so), so
+					// every drawable whose asset failed to load inflated the figure that reads as
+					// "how many distinct meshes this scene placed". Count the ones that LOADED;
+					// keep the lookup total too, because their difference is exactly the missing
+					// set and that is worth having as a number rather than a subtraction.
+					++UniqueMeshLookups;
 				}
 			}
 			if (Mesh)
@@ -4859,14 +5336,23 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 					++NumInstances;
 				}
 			}
-			else if (ProxyCube)
+			else
 			{
+				// ⛔ THE TALLY MOVED OUT OF THE `if (ProxyCube)` BRANCH. An entity with no mesh was
+				// only recorded as missing when the /Engine/BasicShapes/Cube proxy happened to
+				// load; if that LoadObject ever failed, every unresolved entity in the scene
+				// vanished from missingMeshes and topMissing as well as from the viewport, and the
+				// verdict read like a clean import. What is missing is a property of the DATA, not
+				// of whether the placeholder was available.
 				const FString Tag = Drawable.IsEmpty() ? (*Ent)->GetStringField(TEXT("archetype")) : Drawable;
 				Missing.FindOrAdd(Tag)++;
-				if (UInstancedStaticMeshComponent* Ism = GetIsm(TEXT("proxy"), ProxyCube))
+				if (ProxyCube)
 				{
-					Ism->AddInstance(Xf, /*bWorldSpace*/ true);
-					++NumProxies;
+					if (UInstancedStaticMeshComponent* Ism = GetIsm(TEXT("proxy"), ProxyCube))
+					{
+						Ism->AddInstance(Xf, /*bWorldSpace*/ true);
+						++NumProxies;
+					}
 				}
 			}
 		}
@@ -4881,10 +5367,22 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		if (++Shown > 20) { break; }
 		TopMissing += FString::Printf(TEXT("%s\"%s x%d\""), Shown > 1 ? TEXT(",") : TEXT(""), *M.Key, M.Value);
 	}
+	int32 UniqueMeshes = 0;
+	for (const TPair<FString, UStaticMesh*>& M : MeshCache)
+	{
+		if (M.Value) { ++UniqueMeshes; }
+	}
+	// unknownLodLevel is a FLAG, not a partition: an entity with an unrecognisable tier is also
+	// counted in filteredByLod (it is not HD, so the default filter drops it). The partition that
+	// closes is entitiesInManifest == entities + filteredByLod + malformedEntities.
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"ymaps\":%d,\"entities\":%d,\"instances\":%d,\"proxies\":%d,")
-		TEXT("\"uniqueMeshes\":%d,\"missingMeshes\":%d,\"topMissing\":[%s]}"),
-		NumYmaps, NumEntities, NumInstances, NumProxies, MeshCache.Num(), Missing.Num(), *TopMissing);
+		TEXT("{\"ok\":true,\"ymaps\":%d,\"entitiesInManifest\":%d,\"entities\":%d,")
+		TEXT("\"filteredByLod\":%d,\"unknownLodLevel\":%d,\"emptyLodLevel\":%d,")
+		TEXT("\"malformedEntities\":%d,\"instances\":%d,\"proxies\":%d,")
+		TEXT("\"uniqueMeshes\":%d,\"uniqueMeshLookups\":%d,\"missingMeshes\":%d,\"topMissing\":[%s]}"),
+		NumYmaps, EntitiesInManifest, NumEntities, FilteredByLod, UnknownLodLevel, EmptyLodLevel,
+		MalformedEntities, NumInstances, NumProxies,
+		UniqueMeshes, UniqueMeshLookups, Missing.Num(), *TopMissing);
 }
 
 // ======================= RudeYdrBin - READING binary .ydr (RSC7 v165) =======================

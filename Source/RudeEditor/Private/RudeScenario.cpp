@@ -177,6 +177,19 @@ namespace RudeScenario
 		FVector UeLoc = FVector::ZeroVector;
 		FQuat Rot = FQuat::Identity;
 		FString SpawnType;
+		// ⛔ SAME SLOT-PRESERVING RULE AS FScenPoint / FScenNode, and it was MISSING here until
+		// 2026-08-04. WHAT WAS WRONG: a LoadSavePoint with no <offsetPosition> was dropped with a
+		// bare `continue` that compacted the array, while the actor tag RUDE_SCEN_LoadSave:<i>
+		// promises the index into the source <LoadSavePoints> list - so one malformed record
+		// silently renumbered every later spawn point and an exporter would write them back into
+		// the wrong slots. There was also no counter, so `loadSavePoints` reported the POST-drop
+		// count and the loss was invisible in every field. WHAT IT COST: nothing yet - measured
+		// over all 62 corpus regions, every <LoadSavePoints> container (62 region-level and 560
+		// cluster-level) is EMPTY, so this path has never executed on real data. It is fixed
+		// because it is the same class as the point/node lane two structs up, which was fixed for
+		// exactly this reason, and because "0 occurrences on clean data" says nothing about a
+		// hand-authored or truncated region.
+		bool bValid = true;
 	};
 
 	// A filter token: exact type name, or a trailing '*' prefix. Type vocabulary is per-region
@@ -391,6 +404,17 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 	TArray<FScenPoint> Points;
 	int32 PointsMissingTransform = 0;
 	int32 NodesMissingTransform = 0;
+	int32 LoadSaveMissingTransform = 0;
+	// ⛔ THE HEADER COMMENT ON Val() PROMISED THIS NUMBER AND NOTHING PRODUCED IT. It says "a
+	// default that shows up in the verdict means corrupt input, not a normal case" - but no
+	// default ever reached the verdict, because the eleven Rec[] fields are read with a silent
+	// 0 fallback and nothing counted the fallback. WHAT IT COST: latent. Measured over all 62
+	// corpus regions / 46,777 points, every one of the 11 tags is present on every point and
+	// every <vPositionAndDirection> carries its w attribute - 0 defaults corpus-wide. But
+	// Rec[0] is iType, and a missing iType silently reads as TypeNames[0]: a real scenario type,
+	// spelled confidently, for a record that never named one. That is the substitution the
+	// comment claims is visible, so now it is.
+	int32 PointFieldsDefaulted = 0;
 	if (MyPointsN)
 	{
 		static const TCHAR* RecTags[11] = {
@@ -415,7 +439,14 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 			}
 			P.UeLoc = RageToUe(V, TEXT("x"), TEXT("y"), TEXT("z"));
 			P.Yaw = HeadingToUeYawDegrees(FCString::Atod(*V->GetAttribute(TEXT("w"))));
-			for (int32 i = 0; i < 11; ++i) { P.Rec[i] = IVal(It, RecTags[i], 0); }
+			for (int32 i = 0; i < 11; ++i)
+			{
+				// Same read IVal() performs (Atod then narrow), but an ABSENT tag is counted
+				// instead of silently becoming 0 - see PointFieldsDefaulted above.
+				const FXmlNode* RN = It->FindChildNode(RecTags[i]);
+				if (!RN) { ++PointFieldsDefaulted; continue; }
+				P.Rec[i] = (int32)FCString::Atod(*RN->GetAttribute(TEXT("value")));
+			}
 			P.TypeName = ResolveType(P.Rec[0]);
 			P.ModelSetName = ResolveModelSet(P.TypeName, P.Rec[1]);
 			P.Flags = Txt(It, TEXT("Flags"));
@@ -431,12 +462,34 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 		for (const FXmlNode* It : LoadSaveN->GetChildrenNodes())
 		{
 			const FXmlNode* O = It->FindChildNode(TEXT("offsetPosition"));
-			if (!O) { continue; }
 			FScenLoadSave L;
+			if (!O)
+			{
+				// Counted, and the SLOT is kept - see FScenLoadSave::bValid. Never invent an
+				// origin coordinate for a spawn point; never renumber the ones after it either.
+				++LoadSaveMissingTransform;
+				L.bValid = false;
+				L.SpawnType = Txt(It, TEXT("spawnType"));
+				LoadSaves.Add(MoveTemp(L));
+				continue;
+			}
 			L.UeLoc = RageToUe(O, TEXT("x"), TEXT("y"), TEXT("z"));
 			if (const FXmlNode* R = It->FindChildNode(TEXT("offsetRotation")))
 			{
 				// Same quaternion mirror the import lane uses everywhere: (x, -y, z, w).
+				// ❓ UNMEASURED, AND UNMEASURABLE FROM THIS CONTAINER - stated so nobody promotes
+				// it by proximity: it was chosen for CONSISTENCY with the ymap lane, never derived
+				// from scenario data, and the value it produces is not consumed anyway (the marker
+				// below spawns non-directional on purpose). ⚠ A 2026-08-03 review recorded this as
+				// a LIVE question on the strength of "192 of 1,108 corpus <offsetRotation> quats
+				// are discriminating". That count is real but it is not THIS container: measured
+				// 2026-08-04 over all 62 corpus regions, all 1,108 offsetRotation elements sit at
+				// /EntityOverrides/Item/ScenarioPoints/Item/offsetRotation, and every one of the
+				// 622 <LoadSavePoints> containers (62 region-level, 560 inside Clusters) is EMPTY.
+				// So this branch executes ZERO times against the shipped corpus - it is latent,
+				// and it cannot be settled from LoadSavePoints data because there is none. The
+				// population that COULD settle it lives in EntityOverrides, which v1 only counts
+				// (overridePoints); measuring it means reading that container first.
 				L.Rot = FQuat(FCString::Atod(*R->GetAttribute(TEXT("x"))),
 				              -FCString::Atod(*R->GetAttribute(TEXT("y"))),
 				              FCString::Atod(*R->GetAttribute(TEXT("z"))),
@@ -455,6 +508,7 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 	TArray<FScenNode> Nodes;
 	TArray<FScenEdge> Edges;
 	int32 NumChains = 0, BadEdgeRefs = 0, BadChainEdgeIds = 0, EdgesWithoutChain = 0;
+	int32 ChainsWithoutEdgeIds = 0;
 	if (CG)
 	{
 		if (const FXmlNode* NodesN = CG->FindChildNode(TEXT("Nodes")))
@@ -508,7 +562,15 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 			{
 				const int32 ChainIdx = NumChains++;
 				const FXmlNode* IdsN = It->FindChildNode(TEXT("EdgeIds"));
-				if (!IdsN) { continue; }
+				if (!IdsN)
+				{
+					// A chain that owns no edges still COUNTS as a chain (NumChains is already
+					// incremented), so without this counter the only trace would be an indirect
+					// bump in edgesWithoutChain - and only if some edge lost its owner as a
+					// result. Measured 0 of 2,308 corpus chains; latent, and now nameable.
+					++ChainsWithoutEdgeIds;
+					continue;
+				}
 				// EdgeIds renders in the scalar_list law (<=10 inline, then ten per line), so the
 				// whole content is whitespace-parsed - NEVER split on newlines.
 				TArray<FString> Toks;
@@ -645,17 +707,27 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 	// the shipped game is 3,254 points in a single region (chumash_hills), so this stays inside
 	// what the editor handles - but on a World Partition level it is also 3,254 external actor
 	// packages on save, which is a real cost the operator should know about, not a surprise.
-	int32 Spawned = 0, Skipped = 0;
+	// ⛔ THE THREE SPAWN LOOPS BELOW EACH HAD A `continue` ON A FAILED SpawnMarker WITH NO COUNTER,
+	// so `points`, `nodes` and `loadSavePoints` did not add up to what was placed and the residual
+	// had nowhere to live: a run where the editor refused every actor reported spawned 0 /
+	// skipped 0 / ok:true, indistinguishable from an empty region. MarkerSpawnFailures closes all
+	// three at once, and the per-loop `*Filtered` counters below make the accounting EXACT rather
+	// than merely non-zero, so the verdict now satisfies
+	//     points == spawned + pointsFiltered + pointsMissingTransform + (its share of failures)
+	// and the same shape for nodes and loadSavePoints. `skipped` is kept unchanged for callers
+	// that already read it (it is pointsFiltered + pointsMissingTransform).
+	int32 MarkerSpawnFailures = 0;
+	int32 Spawned = 0, Skipped = 0, PointsFiltered = 0;
 	for (int32 i = 0; i < Points.Num(); ++i)
 	{
 		const FScenPoint& P = Points[i];
 		// an invalid slot exists only to hold its index - never spawn it
 		if (!P.bValid) { ++Skipped; continue; }
-		if (!TypeFilter.Passes(P.TypeName.ToLower())) { ++Skipped; continue; }
+		if (!TypeFilter.Passes(P.TypeName.ToLower())) { ++Skipped; ++PointsFiltered; continue; }
 		AActor* A = SpawnMarker(World, ConeMesh,
 			FString::Printf(TEXT("SP_%s_%d"), *P.TypeName, i),
 			P.UeLoc, FRotator(0.f, P.Yaw, 0.f).Quaternion(), PointMarkerScale, true, RootActor);
-		if (!A) { continue; }
+		if (!A) { ++MarkerSpawnFailures; continue; }
 		A->Tags.Add(IdTag);
 		// Identity for a future exporter: the INDEX into this region's MyPoints array is the
 		// only stable handle the format itself provides (points have no name or guid).
@@ -687,11 +759,13 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 	// Region-level spawn points: two exist in the whole shipped game, and they are spawned
 	// rather than counted because the container is part of Points and dropping it silently
 	// would be a hole in the round trip.
-	int32 LoadSaveSpawned = 0;
+	int32 LoadSaveSpawned = 0, LoadSaveFiltered = 0;
 	for (int32 i = 0; i < LoadSaves.Num(); ++i)
 	{
 		const FScenLoadSave& L = LoadSaves[i];
-		if (!TypeFilter.Passes(L.SpawnType.ToLower())) { continue; }
+		// an invalid slot exists only to hold its index - never spawn it (loadSaveMissingTransform)
+		if (!L.bValid) { continue; }
+		if (!TypeFilter.Passes(L.SpawnType.ToLower())) { ++LoadSaveFiltered; continue; }
 		// ⛔ NON-DIRECTIONAL ON PURPOSE (fixed 2026-07-29 after review). These used to spawn a
 		// CONE oriented by the raw mirrored quaternion, which put the facing ~170 deg out: the
 		// cone points along +X, while a scenario point's heading is derived through
@@ -705,7 +779,7 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 		AActor* A = SpawnMarker(World, SphereMesh,
 			FString::Printf(TEXT("LSP_%s_%d"), *L.SpawnType, i),
 			L.UeLoc, FQuat::Identity, PointMarkerScale, false, RootActor);
-		if (!A) { continue; }
+		if (!A) { ++MarkerSpawnFailures; continue; }
 		A->Tags.Add(IdTag);
 		A->Tags.Add(FName(*FString::Printf(TEXT("RUDE_SCEN_LoadSave:%d"), i)));
 		A->Tags.Add(FName(*(TEXT("RUDE_SCEN_Type:") + L.SpawnType)));
@@ -719,16 +793,16 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 	// coincident point at all - so folding them into the point actors would lose data that the
 	// export half has to write back. A sphere, not a cone: the record has no heading field, and
 	// a directional marker would invent one.
-	int32 NodesSpawned = 0;
+	int32 NodesSpawned = 0, NodesFiltered = 0;
 	for (int32 i = 0; i < Nodes.Num(); ++i)
 	{
 		const FScenNode& N = Nodes[i];
 		if (!N.bValid) { continue; }
-		if (!TypeFilter.Passes(N.TypeName.ToLower())) { continue; }
+		if (!TypeFilter.Passes(N.TypeName.ToLower())) { ++NodesFiltered; continue; }
 		AActor* A = SpawnMarker(World, SphereMesh,
 			FString::Printf(TEXT("SN_%s_%d"), *N.TypeName, i),
 			N.UeLoc, FQuat::Identity, NodeMarkerScale, false, RootActor);
-		if (!A) { continue; }
+		if (!A) { ++MarkerSpawnFailures; continue; }
 		A->Tags.Add(IdTag);
 		A->Tags.Add(FName(*FString::Printf(TEXT("RUDE_SCEN_Node:%d"), i)));
 		A->Tags.Add(FName(*(TEXT("RUDE_SCEN_Type:") + N.TypeName)));
@@ -858,21 +932,51 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 		TEXT("[RUDE] ImportScenarioRegion %s: %d/%d points, %d nodes, %d edges (%d splines), %d chains"),
 		*RegionStem, Spawned, Points.Num(), NodesSpawned, Edges.Num(), ChainSplines, NumChains);
 
+	// ⛔ `ok` IS COMPUTED, NOT ASSERTED. WHAT WAS WRONG: this verdict opened with a literal
+	// "ok":true, so a region that parsed 3,254 points and placed NOTHING - every SpawnActor
+	// refused, which is a real editor state and the failure the two loud LoadObject guards above
+	// were written to avoid - returned the same success the three observation surfaces read
+	// (RudeCommandlet.cpp:115, RudeToolPanel.cpp:73 and :317 all decide by searching for
+	// "ok":false). WHAT IT COST: nothing observed; the corpus has no region with zero MyPoints
+	// (measured: 0 of 62). HOW IT IS GATED: a failed marker spawn is now always a failure, and
+	// "parsed records but placed nothing" is a failure ONLY when no type filter is in force - a
+	// filter that legitimately selects nothing is a narrow VIEW, not a broken import, and the
+	// *Filtered counters say which it was.
+	const bool bPlacedNothing = (Spawned + NodesSpawned + LoadSaveSpawned + ChainSplines) == 0;
+	const bool bHadRecords = (Points.Num() + Nodes.Num() + LoadSaves.Num() + Edges.Num()) > 0;
+	const bool bIntact = (MarkerSpawnFailures == 0)
+		&& !(bPlacedNothing && bHadRecords && TypeFilter.IsEmpty());
+	if (!bIntact)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RUDE] ImportScenarioRegion %s: NOT INTACT - %d marker spawn failures, %d/%d "
+			     "points placed, %d/%d nodes, %d/%d loadSave, %d splines"),
+			*RegionStem, MarkerSpawnFailures, Spawned, Points.Num(), NodesSpawned, Nodes.Num(),
+			LoadSaveSpawned, LoadSaves.Num(), ChainSplines);
+	}
+
 	return FString::Printf(TEXT(
-		"{\"ok\":true,\"region\":\"%s\",\"regionFile\":\"%s\",\"points\":%d,\"chains\":%d,"
+		"{\"ok\":%s,\"region\":\"%s\",\"regionFile\":\"%s\",\"points\":%d,\"chains\":%d,"
 		"\"nodes\":%d,\"edges\":%d,\"spawned\":%d,\"skipped\":%d,\"unknownTypes\":[%s],"
 		"\"nodesSpawned\":%d,\"chainSplines\":%d,\"edgesWithoutChain\":%d,"
 		"\"loadSavePoints\":%d,\"loadSaveSpawned\":%d,\"clusters\":%d,\"clusterPoints\":%d,"
 		"\"entityOverrides\":%d,\"overridePoints\":%d,\"typeNames\":%d,"
 		"\"modelSetOutOfRange\":%d,\"pointsMissingTransform\":%d,"
-		"\"nodesMissingTransform\":%d,\"badEdgeRefs\":%d,"
+		"\"nodesMissingTransform\":%d,\"loadSaveMissingTransform\":%d,"
+		"\"pointsFiltered\":%d,\"nodesFiltered\":%d,\"loadSaveFiltered\":%d,"
+		"\"markerSpawnFailures\":%d,\"pointFieldsDefaulted\":%d,\"chainsWithoutEdgeIds\":%d,"
+		"\"badEdgeRefs\":%d,"
 		"\"badChainEdgeIds\":%d,\"clearedActors\":%d,\"filter\":\"%s\"}"),
+		bIntact ? TEXT("true") : TEXT("false"),
 		*Esc(RegionStem), *Esc(FPaths::GetCleanFilename(RegionFile)),
 		Points.Num(), NumChains, Nodes.Num(), Edges.Num(), Spawned, Skipped,
 		*JsonStrArray(UnknownList),
 		NodesSpawned, ChainSplines, EdgesWithoutChain,
 		LoadSaves.Num(), LoadSaveSpawned, NumClusters, ClusterPoints,
 		NumOverrides, OverridePoints, TypeNames.Num(),
-		ModelSetOutOfRange, PointsMissingTransform, NodesMissingTransform, BadEdgeRefs,
+		ModelSetOutOfRange, PointsMissingTransform, NodesMissingTransform, LoadSaveMissingTransform,
+		PointsFiltered, NodesFiltered, LoadSaveFiltered,
+		MarkerSpawnFailures, PointFieldsDefaulted, ChainsWithoutEdgeIds,
+		BadEdgeRefs,
 		BadChainEdgeIds, Cleared, *Esc(Filter.TrimStartAndEnd()));
 }

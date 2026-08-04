@@ -689,6 +689,71 @@ FString URudeToolset::PackAreaLevelInstance(const FString& AreaName, const FStri
 
 	const bool bOnDisk = FPackageName::DoesPackageExist(Created);
 
+	// ⛔ `ok` IS COMPUTED, NOT ASSERTED. WHAT WAS WRONG: this verdict opened with a hardcoded
+	// "ok":true and every quality signal (actorsPacked, instancesAfter, unpairedBefore,
+	// unmatchedIsmActors, deltaValid) sat beside it as a FIELD rather than gating it - so the exact
+	// shape measured on 2026-07-28 (actorsPacked 0, instancesAfter 0, 111 unpaired: the Level
+	// Instance had not finished loading when it was counted) came back looking like a success.
+	// WHAT IT COST: all three RUDE observation surfaces decide success by searching the returned
+	// string for "ok":false - RudeCommandlet.cpp:115 (the CLI exit code), RudeToolPanel.cpp:73 (the
+	// RUDE_RUN_FAILED marker) and :317 (the panel status line), all via FRudeInvoke::ReportedFailure
+	// - so an area silently losing every instance read GREEN on every automated surface and was
+	// visible only to a human diffing four numbers. The BlockLoad fix at :319-328 removed that one
+	// CAUSE; it did not give the verdict any way to report the CLASS.
+	// HOW IT IS MEASURED: instancesBefore / ismComponentsBefore are summed from ToPack - every
+	// actor that will be packed, duplicates included - before the move; instancesAfter /
+	// ismComponents are summed from every label-matched actor found inside the created level after
+	// a blocking load. The engine preserves both exactly on a clean pack (measured in-engine
+	// 2026-07-28: 13,152 instances survived exactly), so an inequality here is a real loss and not
+	// a tolerance question. unpairedBefore and unmatchedIsmActors cover the relabel-on-paste case,
+	// which moves nothing but makes the pairing - and therefore the delta - meaningless.
+	// ⚠ duplicateLabels is deliberately NOT in the gate: `Before` collapses duplicates for PAIRING
+	// while both instance sums walk every actor, so duplicates degrade the per-actor MEASUREMENT
+	// (that is what deltaValid reports) without meaning the pack lost anything. Failing an intact
+	// pack on it would be the same defect pointed the other way.
+	const bool bPackIntact = bOnDisk
+		&& After.Num() > 0
+		&& UnpairedBefore == 0
+		&& UnmatchedIsmActors == 0
+		&& InstancesAfter == InstancesBefore
+		&& IsmAfter == IsmBefore;
+	FString PackReason;
+	if (!bPackIntact)
+	{
+		if (!bOnDisk)
+		{
+			PackReason = FString::Printf(TEXT("the created level '%s' is not on disk"), *Created);
+		}
+		else if (After.Num() == 0)
+		{
+			PackReason = TEXT("not one of the collected actors was found inside the created level");
+		}
+		else if (UnpairedBefore > 0)
+		{
+			PackReason = FString::Printf(
+				TEXT("%d of %d collected actor labels did not survive the pack"),
+				UnpairedBefore, Before.Num());
+		}
+		else if (UnmatchedIsmActors > 0)
+		{
+			PackReason = FString::Printf(
+				TEXT("%d ISM-bearing actor(s) in the level carry a label that was never sent "
+				     "(relabel on paste)"), UnmatchedIsmActors);
+		}
+		else if (InstancesAfter != InstancesBefore)
+		{
+			PackReason = FString::Printf(TEXT("instance count changed %lld -> %lld"),
+				InstancesBefore, InstancesAfter);
+		}
+		else
+		{
+			PackReason = FString::Printf(TEXT("ISM component count changed %d -> %d"),
+				IsmBefore, IsmAfter);
+		}
+		UE_LOG(LogTemp, Error,
+			TEXT("[RUDE] PackAreaLevelInstance '%s': PACK NOT INTACT - %s"), *Area, *PackReason);
+	}
+
 	UE_LOG(LogTemp, Display,
 		TEXT("[RUDE] PackAreaLevelInstance '%s' -> %s | actors %d->%d | ISM %d->%d | instances "
 		     "%lld->%lld | maxWorldDelta %.4f cm (valid=%s) | pivot WorldOrigin, LI at %s"),
@@ -697,7 +762,8 @@ FString URudeToolset::PackAreaLevelInstance(const FString& AreaName, const FStri
 		bDeltaValid ? TEXT("true") : TEXT("false"), *LILoc.ToString());
 
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"level\":\"%s\",\"levelRequested\":\"%s\",\"levelMatchesRequest\":%s,")
+		TEXT("{\"ok\":%s,\"packIntact\":%s,\"packReason\":\"%s\",")
+		TEXT("\"level\":\"%s\",\"levelRequested\":\"%s\",\"levelMatchesRequest\":%s,")
 		TEXT("\"levelOnDisk\":%s,\"actorsCollected\":%d,\"actorsPacked\":%d,\"actorsInLevel\":%d,")
 		TEXT("\"matchedByTag\":%d,\"matchedByFolder\":%d,\"skippedLevelInstances\":%d,")
 		TEXT("\"skippedAlreadyPacked\":%d,")
@@ -708,6 +774,8 @@ FString URudeToolset::PackAreaLevelInstance(const FString& AreaName, const FStri
 		TEXT("\"maxScaleDelta\":%.5f,\"sampledInstances\":%d,\"deltaValid\":%s,")
 		TEXT("\"unpairedBefore\":%d,\"unpairedComponents\":%d,\"unmatchedIsmActors\":%d,")
 		TEXT("\"duplicateLabels\":%d,\"foldersSurviving\":%d}"),
+		bPackIntact ? TEXT("true") : TEXT("false"),
+		bPackIntact ? TEXT("true") : TEXT("false"), *Esc(PackReason),
 		*Esc(Created), *Esc(Requested), bMatches ? TEXT("true") : TEXT("false"),
 		bOnDisk ? TEXT("true") : TEXT("false"), Before.Num() + DuplicateLabels, After.Num(),
 		ActorsInLevel,

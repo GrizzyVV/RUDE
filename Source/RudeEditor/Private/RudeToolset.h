@@ -28,8 +28,23 @@ public:
 	// Import a ydr XML file (.ydr.xml) as a UStaticMesh asset.
 	// XmlPath: absolute path to a *.ydr.xml file on disk.
 	// DestFolder: content folder for the new asset (e.g. "/Game/RUDE/Meshes/Props").
-	// Returns a JSON string: {ok, assetPath, geometries, vertices, triangles, slots}
+	// Returns a JSON string: {ok, assetPath, geometries, geometriesDropped, geometryErrors,
+	// geometriesWithoutUV, vertices, triangles, trianglesOutOfRange, trianglesDegenerate,
+	// boundTextures, texturesFromEmbedded, ambiguousTextures, unsupportedByMaster,
+	// missingTextures, unmappedSamplers, slotsWithoutShaderDef, slotsWithoutMaterial,
+	// valueParamsSeen, valueParamsBound, valueParamsUnsupported, valueParamsDeduped, slots}
 	// or {ok:false, error} on failure.
+	// ⛔ 2026-08-04: ok is COMPUTED - false when any slot silently kept WorldGridMaterial
+	// (slotsWithoutMaterial > 0). If /RUDE/Masters cannot be created or loaded, EVERY slot of
+	// EVERY mesh took the engine default while every counter read 0 and ok said true - a whole
+	// untextured city and a clean verdict were the same output.
+	// valueParamsSeen == valueParamsBound + valueParamsUnsupported + valueParamsDeduped holds
+	// exactly whenever slotsWithoutMaterial == 0. It counts bind DECISIONS (per geometry),
+	// not distinct params in the file; the old spelling summed the whole shader table, which
+	// included 4.4% of params no geometry could ever reach.
+	// ambiguousTextures counts binds where the texture NAME exists in more than one imported
+	// dictionary and neither the drawable's own __embedded dictionary nor a supplied scope
+	// disambiguated it - the pick is deterministic (lexicographic) but not proven correct.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring one GTA V model into Unreal as a Static Mesh you can edit."))
 	static FString ImportYdr(const FString& XmlPath, const FString& DestFolder);
 
@@ -52,7 +67,13 @@ public:
 	// PixelFolder: folder of decoded PNGs matching the entry names (BC-decode
 	// happens offline until native decode lands).
 	// DestFolder: content folder root; assets land in <DestFolder>/<TxdName>/.
-	// Returns JSON: {ok, txd, imported, missingPixels:[...]}.
+	// Returns JSON: {ok, txd, declared, imported, invalidNames, itemsWithoutName,
+	// usageDefaulted, usageUnknown, missingPixelCount, missingPixels:[...first 30]}.
+	// ok is COMPUTED (2026-08-04) and false only on the total-loss shape: the manifest
+	// declared textures, every one was rejected by the package-name check, and nothing
+	// imported - the exact 2026-07-30 incident. A PARTIAL rejection stays ok:true with a
+	// non-zero invalidNames, because failing it would also drop the textures that DID
+	// import out of ImportYtdBatch's total.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V texture set into Unreal, with normal and specular maps set up correctly."))
 	static FString ImportYtd(const FString& XmlPath, const FString& PixelFolder,
 	                         const FString& DestFolder);
@@ -63,7 +84,14 @@ public:
 	// hash-manifest resumability model, name-level) UNLESS Mode is "FORCE" - then every
 	// file reimports in place (rebinds MaterialInstances against currently-imported
 	// textures; the texture-pass re-bind flow). Progress goes to the log.
-	// Returns JSON: {ok, imported, skipped, failed, failedFiles:[...first 30]}.
+	// Returns JSON: {ok, imported, skipped, failed, geometriesDropped,
+	// filesWithGeometryErrors, geometriesWithoutUV, trianglesOutOfRange,
+	// trianglesDegenerate, boundTextures, texturesFromEmbedded, ambiguousTextures,
+	// unsupportedByMaster, missingTextures, unmappedSamplers, slotsWithoutShaderDef,
+	// slotsWithoutMaterial, valueParamsSeen, valueParamsBound, valueParamsUnsupported,
+	// valueParamsDeduped, failedFiles:[...first 30]}.
+	// The batch now sums EVERY counter its unit reports; it used to sum seven and drop
+	// geometriesDropped/geometryErrors - the lost-geometry ones.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring in many GTA V models at once from a list file. Skips anything already imported."))
 	static FString ImportYdrBatch(const FString& ListPath, const FString& DestFolder,
 	                              const FString& Mode);
@@ -76,8 +104,14 @@ public:
 	// Meshes resolve by lowercase drawable name under MeshFolder; unresolved archetypes
 	// and missing meshes render as proxy cubes (corpus-hole policy). Transforms are the
 	// manifest's UE-space values (already through the pinned GTA->UE convention).
-	// Returns JSON: {ok, ymaps, entities, instances, proxies, uniqueMeshes,
-	// missingMeshes, topMissing:[...first 20]}.
+	// Returns JSON: {ok, ymaps, entitiesInManifest, entities, filteredByLod,
+	// unknownLodLevel, emptyLodLevel, malformedEntities, instances, proxies,
+	// uniqueMeshes, uniqueMeshLookups, missingMeshes, topMissing:[...first 20]}.
+	// entitiesInManifest == entities + filteredByLod + malformedEntities holds exactly.
+	// "entities" has always been the POST-filter count; the LOD filter drops 10.51% of a
+	// typical manifest (measured, 1,500 resolved ymap / 239,662 entities) and used to do
+	// it with no counter. uniqueMeshes now counts meshes that LOADED - it used to report
+	// MeshCache.Num(), and the cache deliberately memoises nullptr for known-missing.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Re-place an area you already imported, into the level you have open. Reads the manifest that Build Map Area wrote, so it spawns the objects again WITHOUT re-importing any models."))
 	static FString ImportScene(const FString& ManifestPath, const FString& MeshFolder,
 	                           const FString& Filter);
@@ -198,7 +232,11 @@ public:
 	// Assets land in <DestFolder>/<TxdName>/ via the same path as ImportYtd. A txd whose content
 	// folder already exists on disk is SKIPPED unless Mode is "FORCE" (re-import in place).
 	// Progress goes to the log every 100. Returns JSON:
-	// {ok, imported, texturesImported, skipped, failed, failedFiles:[...first 30]}.
+	// {ok, imported, texturesImported, texturesDeclared, skipped, failed, invalidNames,
+	// missingPixels, usageDefaulted, usageUnknown, itemsWithoutName,
+	// failedFiles:[...first 30]}. It used to parse ONE field out of the unit verdict
+	// ("imported") and drop invalidNames and missingPixels - the two counters added
+	// specifically so the 2026-07-30 silent texture loss could not recur.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring in many GTA V texture sets at once from a list file. Skips sets already imported unless you force it."))
 	static FString ImportYtdBatch(const FString& ListPath, const FString& DestFolder,
 	                              const FString& Mode);
@@ -218,8 +256,18 @@ public:
 	// Empty Mode = previous behaviour (skip existing); old 5-argument calls keep working because
 	// FRudeInvoke does no arity check. "+FORCE" on Filter is still accepted as an alias, so a
 	// deliberate FORCE can never degrade into a silent no-op. Textures remain a separate pass
-	// until native BC decode lands. Returns JSON: {ok, ymaps, entities, resolved,
-	// meshesImported, meshesSkipped, meshesFailed, spawn:{...ImportScene stats}}.
+	// until native BC decode lands. Returns JSON: {ok, ymapsMatched, ymapsParsed,
+	// ymapsUnreadable, ymapsWithoutEntitiesNode, ymapsWithEntities, ymaps, entities,
+	// entitiesSkipped, resolved, meshesImported, meshesSkipped, meshesFailed,
+	// meshesMissingFromCorpus, <every per-mesh counter ImportYdr reports, summed>,
+	// manifest, spawn:{...ImportScene stats}}.
+	// ⛔ 2026-08-04: "ymaps" used to be the GLOB MATCH count and is now the number of ymaps
+	// that CONTRIBUTED a scene - measured, 219 of 1,500 resolved ymaps (14.6%) carry an empty
+	// <entities> element and inflated the old figure. ymapsMatched keeps the old number.
+	// ok is COMPUTED: it forwards the nested spawn's ok (a "no editor world" spawn used to be
+	// reported as a successful import) and fails on an unreadable ymap or a run that produced
+	// no scene at all. The per-mesh counters are new here too: this lane used to reduce each
+	// unit verdict to a single ok:true test and discard the rest.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build a whole area of the map in your open level - brings in the models it needs and places them. WARNING: this REPLACES any area you loaded before."))
 	static FString ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
 	                             const FString& DestMeshFolder, const FString& Filter,
@@ -267,9 +315,16 @@ public:
 	// interior; else a comma-separated ROOM-name list (case-insensitive) spawns only those
 	// rooms plus their portal doors. Portals and entity sets are SUMMARIZED in the verdict,
 	// not spawned (v1). Returns JSON: {ok, archetype, requested, ytyp, rooms, roomNames,
-	// portals, portalRooms, entitySets, entities, spawned, proxies, unresolvedArchetypes,
-	// lights, lightsSkipped[, lightProblem], otherExtensions, badAttachedRefs,
-	// unroomedEntities, meshesImported, meshesSkipped, meshesFailed, meshesMissingFromCorpus}.
+	// portals, portalRooms, entitySets, entities, entitiesMissingTransform, spawned, proxies,
+	// unresolvedArchetypes, lights, lightsSkipped[, lightProblem], otherExtensions,
+	// badAttachedRefs, unroomedEntities, meshesImported, meshesSkipped, meshesFailed,
+	// meshesMissingFromCorpus, <every per-mesh counter ImportYdr reports, summed>}.
+	// ⛔ 2026-08-04: "entities" is the SLOT count and stays so, because rooms and portals index
+	// into it by ordinal - a malformed record now keeps its slot (bValid=false) instead of being
+	// dropped, which used to re-base every attachedObjects index after it and silently attach the
+	// wrong props to the wrong rooms with badAttachedRefs still reading 0. The per-mesh counters
+	// are new: this lane and ImportMapArea are the only consumers of the yft/ydd import paths and
+	// both used to discard the whole unit verdict.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build a GTA V interior (MLO) in your open level - rooms, furniture and lights, standing at the world origin. Give the interior's archetype name; optionally list room names to spawn only those rooms."))
 	static FString ImportMlo(const FString& CorpusRoot, const FString& MloArchetypeName,
 	                         const FString& DestMeshFolder, const FString& Filter);

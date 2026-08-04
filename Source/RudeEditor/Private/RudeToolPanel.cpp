@@ -70,12 +70,18 @@ static FAutoConsoleCommand GRudeRun(
 				Fn ? *Error : TEXT("no such tool"));
 			return;
 		}
-		if (FRudeInvoke::ReportedFailure(Result))
+		if (FRudeInvoke::ReportedFailure(Result) || Result.IsEmpty())
 		{
 			// The call SUCCEEDED but the tool reported ok:false - that is still a failed run, and
 			// it used to be logged at Display like any success.
+			// ⛔ AN EMPTY RESULT COUNTS TOO. WHAT WAS WRONG: ReportedFailure only finds the literal
+			// "ok":false, so a tool that returned NOTHING printed the success line and no harness
+			// grepping RUDE_RUN_FAILED could see it - while the Slate path 240 lines below calls
+			// the same case out explicitly (:318-323). Same core, two different answers. WHAT IT
+			// COST: latent - measured, none of the 30 AICallable tools has an empty-return path
+			// today - but this is the surface an agent drives, and it is the one that was silent.
 			UE_LOG(LogRudePanel, Error, TEXT("[RUDE.Run] RUDE_RUN_FAILED %s -> %s"), *Args[0],
-				*Result);
+				Result.IsEmpty() ? TEXT("(no output)") : *Result);
 			return;
 		}
 		UE_LOG(LogRudePanel, Display, TEXT("[RUDE.Run] %s -> %s"), *Args[0], *Result);

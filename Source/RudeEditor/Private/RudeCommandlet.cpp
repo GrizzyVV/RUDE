@@ -97,5 +97,20 @@ int32 URudeCommandlet::Main(const FString& Params)
 		return 1;
 	}
 	Say(Result);
+	// ⛔ AN EMPTY RESULT IS NOT A SUCCESS. WHAT WAS WRONG: the exit code came from
+	// ReportedFailure() alone, which searches for the literal "ok":false - so a tool that returned
+	// NOTHING scored 0, the same code a clean run gets. WHAT IT COST: latent, and measured as such
+	// - none of the 30 AICallable tools has a `return FString()` path today. It is fixed anyway
+	// because this file's own contract (header: "the reflective call path lives in RudeInvoke,
+	// shared with the Slate panel so the two surfaces cannot diverge") was already broken here:
+	// RudeToolPanel.cpp:318-323 calls an empty result out explicitly - "it is neither success nor
+	// a reported failure, and folding it into 'completed' would let a tool that produced nothing
+	// look like it worked" - while the CLI and RUDE.Run folded it into success.
+	if (Result.IsEmpty())
+	{
+		Say(FString::Printf(TEXT("%s returned no output - treating that as a failure, because an "
+			"empty verdict is neither a success nor a reported failure"), **ToolName));
+		return 1;
+	}
 	return FRudeInvoke::ReportedFailure(Result) ? 1 : 0;
 }

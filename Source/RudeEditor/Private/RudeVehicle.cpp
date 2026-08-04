@@ -58,10 +58,38 @@ namespace RudeVehicle
 	// instead writes (x,-y,z,w) for a ymap entity - the conjugate - because a ymap stores the
 	// entity's INVERSE rotation; mirror(conj(stored)) == (x,-y,z,w). A skeleton bone is not a ymap
 	// entity and carries no such inversion, so the plain mirror is what applies here.
-	// 🧠 INFERRED, and honestly flagged: the ~84% of wheel bones whose rotation is identity cannot
-	// tell the two apart. The falsifiable probe is a vehicle whose wheel bone really is rotated -
-	// faggio2 (fork rake -0.1736 on X) - imported and looked at: wrong convention tilts the front
-	// wheel BACKWARD instead of forward.
+	//
+	// ✅ MEASURED 2026-08-04 - this used to be flagged 🧠 INFERRED and the flag is now retired.
+	// WHAT WAS WRONG WITH THE OLD NOTE: it named a falsifiable probe - "faggio2 (fork rake -0.1736
+	// on X), imported and looked at: the wrong convention tilts the front wheel BACKWARD" - and
+	// that probe CANNOT discriminate. WHAT IT WOULD HAVE COST: nothing has shipped wrong, but an
+	// agent running that probe would have "confirmed" the convention on an observation that is
+	// IDENTICAL under both hypotheses. HOW IT WAS MEASURED (offline, whole corpus, no editor):
+	//   * 1,763 vehicle yft / 7,056 wheel bones. 186 (2.64%) carry a non-identity own rotation and
+	//     182 a non-identity ancestor - and on every one of them the wheel's own rotation exactly
+	//     CANCELS its fork/gear parent's, so the wheel's MODEL-SPACE orientation composes to
+	//     0.00 deg under BOTH hypotheses (faggio2, bati, sanchez, enduro, akula, lazer: 0.00 deg
+	//     either way). The wheel never tilts. What the two conventions disagree about is the
+	//     wheel's POSITION: faggio2 0.509 m, sanchez 0.591 m, hexer 0.964 m, lazer 1.743 m.
+	//   * The real discriminator is physical and lives inside the file: every wheel of a vehicle
+	//     rests on ONE ground plane. Composing the chain FORWARD (what Resolve() below does) vs
+	//     INVERSE-stored (ymap-style conj at every level), then taking each wheel's lowest point
+	//     through its own sidecar bbox: over the 126 vehicles where every wheel bone has its own
+	//     axle sidecar (exact radius, no prototype substitution) FORWARD wins 110-16, and over the
+	//     44 where the two answers differ by more than 5 cm FORWARD wins 44-0. Median ground
+	//     spread FORWARD 1.1 mm, INVERSE 36.7 mm. The 16 INVERSE-leaning cases are all under
+	//     3.2 cm - inside front/rear tyre-radius noise - and not one of them is decisive.
+	//   * The oracle is an exact transliteration, not an approximation: UE composes
+	//     Q(AxB) = Q(B)Q(A), T(AxB) = Q(B)(S(B)T(A))Q(B)^-1 + T(B) (TransformNonVectorized.h:
+	//     1316-1330) and FQuat's A*B applies B then A (Quat.h:29-31) - the same Hamilton order.
+	// CONCLUSION: a bone <Rotation> is a FORWARD orientation, the composition below is right, and
+	// the plain mirror is the correct GTA->UE map for it. ⛔ DO NOT "fix" this to (x,-y,z,w) - the
+	// inversion is a ymap CEntityDef property and was proven for that record only.
+	// THE PROBE THAT WOULD ACTUALLY FALSIFY THIS (it replaces the fork-rake one): import `sanchez`
+	// or `hexer` and read the FRONT wheel's Y OFFSET from the actor origin, never its tilt.
+	// Correct: sanchez wheel_lf lands at UE (0, -84.6, -16.6) cm. The inverse convention would put
+	// it at UE (0, -27.0, -29.9) cm - tucked under the engine. Oracle:
+	// scratchpad/rude_owner/bone_convention.py (ground-plane spread over the discriminating set).
 	static FTransform GtaToUe(const FTransform& G)
 	{
 		const FQuat Q = G.GetRotation();
@@ -478,12 +506,22 @@ FString URudeToolset::ImportVehicle(const FString& CorpusRoot, const FString& Ve
 		Missing.Add(TEXT("this fragment has no wheel_* bones - nothing to place wheels on"));
 	}
 
+	// ⛔ THE LIST IS CAPPED; THE COUNT IS NOT. WHAT WAS WRONG: this loop stopped at 20 entries and
+	// the verdict emitted only "missing":[...] - so the ONE field carrying every failure this tool
+	// can have (four sources: :359 nameless group, :386 absent sidecar, :394 failed child import,
+	// :481 bone with no prototype, plus the no-wheel-bones note at :506) silently capped, and a bus with
+	// 30 sidecar failures read as a bounded 20. WHAT IT COST: nothing measured yet - the only
+	// in-engine run to date is `adder` (2026-08-02) with missing[] empty - but it is the vehicle
+	// lane's only failure channel. Every other RUDE tool that caps a list reports the total beside
+	// it (ImportYdrBatch caps failedFiles at 30 and still reports `failed`); this now matches.
 	FString MissingJson, WheelMeshesJson;
-	for (int32 i = 0; i < Missing.Num() && i < 20; ++i)
+	const int32 MissingListCap = 20;
+	for (int32 i = 0; i < Missing.Num() && i < MissingListCap; ++i)
 	{
 		MissingJson += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(",") : TEXT(""),
 			*JsonEscape(Missing[i]));
 	}
+	const int32 MissingTruncated = FMath::Max(0, Missing.Num() - MissingListCap);
 	int32 Nw = 0, NonWheelChildMeshes = 0;
 	for (const FGeoChild& C : GeoChildren)
 	{
@@ -505,12 +543,29 @@ FString URudeToolset::ImportVehicle(const FString& CorpusRoot, const FString& Ve
 		? FString::Printf(TEXT("\"%s\""), *JsonEscape(AnyWheel->AssetPath))
 		: FString(TEXT("null"));
 	const FString ActorLabel = Actor->GetActorLabel();
+
+	// ⛔ `ok` IS COMPUTED, NOT ASSERTED. WHAT WAS WRONG: this verdict opened with a literal
+	// "ok":true, so a fragment that HAS wheel bones and placed ZERO wheels - literally the failure
+	// this file was written to prevent (see the header: "a car sitting on the ground with no
+	// wheels at all") - returned success to all three observation surfaces, every one of which
+	// decides purely by searching for "ok":false (RudeCommandlet.cpp:115, RudeToolPanel.cpp:73
+	// and :317 via FRudeInvoke::ReportedFailure). WHAT IT COST: nothing observed - the single
+	// in-engine run, `adder` 2026-08-02, reported wheelsPlaced 4 / wheelBones 4 and is unaffected
+	// - but an old corpus with no `--extras` sidecars produces exactly this shape and used to read
+	// green. HOW IT IS MEASURED: wheelBones is what the SKELETON declares, wheelsPlaced is what
+	// actually received a mesh, so wheelBones > 0 && wheelsPlaced == 0 is a wheel-less vehicle by
+	// the fragment's own account. wheelBones == 0 stays ok:true on purpose: helicopters, boats and
+	// planes are fragments with skeletons and no wheels, and that is a correct import.
+	const bool bWheelsIntact = (WheelBones == 0) || (WheelsPlaced > 0);
 	return FString::Printf(TEXT(
-		"{\"ok\":true,\"vehicle\":\"%s\",\"bodyAsset\":\"%s\",\"bodyGeos\":%d,"
+		"{\"ok\":%s,\"wheelsIntact\":%s,\"vehicle\":\"%s\",\"bodyAsset\":\"%s\",\"bodyGeos\":%d,"
 		"\"wheelMesh\":%s,\"wheelMeshes\":[%s],\"wheelsPlaced\":%d,\"wheelsMirrored\":%d,"
 		"\"wheelBones\":%d,\"bonesRead\":%d,\"geoChildren\":%d,\"nonWheelChildMeshes\":%d,"
-		"\"actor\":\"%s\",\"missing\":[%s]}"),
+		"\"actor\":\"%s\",\"missingCount\":%d,\"missingTruncated\":%d,\"missing\":[%s]}"),
+		bWheelsIntact ? TEXT("true") : TEXT("false"),
+		bWheelsIntact ? TEXT("true") : TEXT("false"),
 		*Name, *JsonEscape(BodyAssetPath), BodyGeos, *WheelMeshField,
 		*WheelMeshesJson, WheelsPlaced, WheelsMirrored, WheelBones, Bones.Num(),
-		GeoChildren.Num(), NonWheelChildMeshes, *JsonEscape(ActorLabel), *MissingJson);
+		GeoChildren.Num(), NonWheelChildMeshes, *JsonEscape(ActorLabel),
+		Missing.Num(), MissingTruncated, *MissingJson);
 }
