@@ -1207,12 +1207,14 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 	{
 		FString Preset = TEXT("default");
 		FString Diffuse, Normal, Specular;
+		int32 Bucket = 0;                    // RAGE draw bucket: 0 opaque, 1 alpha, 2 decal, 3 cutout
 		TArray<FVector3f> Pos;
 		TArray<FVector3f> Nrm;
 		TArray<FVector2f> UV;
 		TArray<int32> Indices;
 	};
 	TArray<FOutGeo> OutGeos;
+	int32 BucketUnrecovered = 0;
 
 	for (const FPolygonGroupID GroupID : MeshDesc->PolygonGroups().GetElementIDs())
 	{
@@ -1259,7 +1261,50 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 				{
 					Geo.Specular = T->GetName();
 				}
+				// FIXED 2026-08-03 - <RenderBucket> was the literal 0 on every shader this exporter
+				// emitted. ImportYdr treats RenderBucket as authoritative for master selection
+				// ("preset names lie" - :1961), so the UE -> ydr half of the round trip flattened
+				// every alpha, decal and cutout shader to opaque and returned the same ok:true it
+				// returns for a perfect export: glass and windows turn opaque, decals z-fight
+				// instead of offsetting, cutout foliage renders as solid quads. MEASURED over a
+				// 2,500-file random sample of the resolved base-game ydr corpus: bucket != 0 on
+				// 3,326 of 9,389 shaders = 35.4%, and on 1,417 of 2,500 FILES = 56.7%
+				// (histogram {0:6063, 2:2108, 3:781, 1:423, 6:14} - note bucket 6 exists and is
+				// outside the {0,1,2,3} the code's own comment documents).
+				// RECOVERY IS EXACT, NOT SNIFFED: the generated masters encode the bucket in their
+				// own asset name as the "_b<N>" suffix (FRudeMasterSpec::Key at :290 builds
+				// "M_RUDE_<flags>_b<bucket>"), and that value came from the file's RenderBucket on
+				// import (:1942). So parsing the suffix returns the original number rather than
+				// guessing from substrings like "Decal"/"Alpha", which would invent a bucket for
+				// the name-routed masters (M_RUDE_Foliage/Terrain/Detail/Water carry no bucket at
+				// all, and M_RUDE_DecalGeo is also reached by a preset merely NAMED "*decal*").
+				// Anything without the suffix stays 0 and is COUNTED - see renderBucketUnrecovered.
+				bool bGotBucket = false;
+				if (const UMaterialInterface* Parent = MIC->Parent)
+				{
+					const FString PN = Parent->GetName();
+					int32 BPos = INDEX_NONE;
+					if (PN.FindLastChar(TEXT('b'), BPos) && BPos > 0 && PN[BPos - 1] == TEXT('_')
+						&& BPos + 1 < PN.Len())
+					{
+						const FString Digits = PN.Mid(BPos + 1);
+						if (Digits.IsNumeric())
+						{
+							Geo.Bucket = FCString::Atoi(*Digits);
+							bGotBucket = true;
+						}
+					}
+				}
+				if (!bGotBucket) { ++BucketUnrecovered; }
 			}
+			else
+			{
+				++BucketUnrecovered;   // slot is not a MaterialInstanceConstant
+			}
+		}
+		else
+		{
+			++BucketUnrecovered;       // no material slot matched this polygon group
 		}
 
 		// Non-RUDE slot: pick the preset from which textures are present, so a
@@ -1346,7 +1391,7 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 		Xml += TEXT("   <Item>\n");
 		Xml += FString::Printf(TEXT("    <Name>%s</Name>\n"), *G.Preset);
 		Xml += FString::Printf(TEXT("    <FileName>%s.sps</FileName>\n"), *G.Preset);
-		Xml += TEXT("    <RenderBucket value=\"0\" />\n    <Parameters>\n");
+		Xml += FString::Printf(TEXT("    <RenderBucket value=\"%d\" />\n    <Parameters>\n"), G.Bucket);
 		if (!G.Diffuse.IsEmpty())
 		{
 			Xml += FString::Printf(TEXT("     <Item name=\"DiffuseSampler\" type=\"Texture\">\n      <Name>%s</Name>\n     </Item>\n"), *G.Diffuse);
@@ -1593,9 +1638,16 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 	{
 		return Fail(TEXT("failed to write output file"));
 	}
+	// renderBucketUnrecovered: shader slots whose draw bucket could not be read back from the
+	// material (no MIC, or a parent master that does not carry the "_b<N>" suffix - the name-routed
+	// M_RUDE_Foliage/Terrain/Detail/Water/DecalGeo masters do not). Those slots emit bucket 0, which
+	// is the old behaviour for EVERY slot; reporting the count is what stops a lossy export from
+	// looking identical to a lossless one. A non-zero value here means the round trip is not yet
+	// lossless for this mesh.
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"xmlPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d}"),
-		*OutXmlPath, OutGeos.Num(), TotalVerts, TotalTris);
+		TEXT("{\"ok\":true,\"xmlPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,")
+		TEXT("\"renderBucketUnrecovered\":%d}"),
+		*OutXmlPath, OutGeos.Num(), TotalVerts, TotalTris, BucketUnrecovered);
 }
 
 FString URudeToolset::Ping()
@@ -3872,6 +3924,10 @@ FString URudeToolset::ExportYtyp(const FString& YdrSpecs, const FString& YtypNam
 	if (Specs.Num() == 0) { return Fail(TEXT("no ydr specs (want absPath[;txd[;physDict]], ...)")); }
 
 	FString Archetypes;
+	// ADDED 2026-08-03 - two specs whose drawables share a <Name> used to emit two same-named
+	// <Item>s and report archetypes:2, while the game keeps exactly one. Silent halving of the
+	// archetype set, with a count that says otherwise.
+	TSet<FString> SeenNames;
 	for (const FString& SpecStr : Specs)
 	{
 		TArray<FString> F;
@@ -3890,6 +3946,12 @@ FString URudeToolset::ExportYtyp(const FString& YdrSpecs, const FString& YtypNam
 			if (!S.IsEmpty()) { Name = S; }
 		}
 		Name.ToLowerInline();
+		if (SeenNames.Contains(Name))
+		{
+			return Fail(FString::Printf(TEXT("duplicate archetype name '%s' (from %s); the game keeps only one"),
+			                            *Name, *F[0]));
+		}
+		SeenNames.Add(Name);
 		auto Vec = [&](const TCHAR* Tag, float V[3]) -> bool
 		{
 			const FXmlNode* E = Root->FindChildNode(Tag);
@@ -3905,11 +3967,13 @@ FString URudeToolset::ExportYtyp(const FString& YdrSpecs, const FString& YtypNam
 		{
 			return Fail(FString::Printf(TEXT("missing bounds fields: %s"), *F[0]));
 		}
-		float Bsr = 0.f;
-		if (const FXmlNode* R = Root->FindChildNode(TEXT("BoundingSphereRadius")))
-		{
-			Bsr = FCString::Atof(*R->GetAttribute(TEXT("value")));
-		}
+		// FIXED 2026-08-03 - bsRadius was OPTIONAL while its three sibling bounds fields above are
+		// hard requirements: a drawable with no <BoundingSphereRadius> shipped bsRadius 0 with
+		// ok:true. bsRadius is the archetype's cull sphere, so radius 0 is an entity the engine can
+		// cull immediately - an invisible prop reported as a successful export.
+		const FXmlNode* RNode = Root->FindChildNode(TEXT("BoundingSphereRadius"));
+		if (!RNode) { return Fail(FString::Printf(TEXT("missing bounds fields: %s"), *F[0])); }
+		const float Bsr = FCString::Atof(*RNode->GetAttribute(TEXT("value")));
 		// Collidable iff the drawable embeds a <Bounds> that actually describes collision.
 		// ⛔ THIS USED TO REQUIRE <Children>, WHICH IS ONLY TRUE OF A *COMPOSITE* ROOT (fixed
 		// 2026-07-31). A phBound root may legitimately be a primitive - Box, Sphere, Cylinder -
@@ -3950,6 +4014,20 @@ FString URudeToolset::ExportYtyp(const FString& YdrSpecs, const FString& YtypNam
 		const FString PhysDict = (F.Num() > 2 && !F[2].IsEmpty()) ? F[2] : (bCollidable ? Name : TEXT(""));
 		const uint32 Flags = (bCollidable || !PhysDict.IsEmpty()) ? 537001984u : 536870912u;
 		const int32 LodDist = FMath::Max(100, (int32)(Bsr * 4.f));
+		// FIXED 2026-08-03 - hdTextureDist was emitted as lodDist. It is the HD-texture streaming
+		// radius, NOT the draw distance, and the two are unrelated in the game's own data: measured
+		// over 12,582 ASSET_TYPE_DRAWABLE archetypes from a 300-file sample of the resolved base-game
+		// ytyp corpus, hdTextureDist == lodDist in 1.61% of archetypes. The distributions barely
+		// overlap - modal hdTextureDist 5.0 (3,078), then 50.0 (1,015) and 149.5 (910); modal
+		// lodDist 100 (3,020), then 299 (1,096). RUDE emitted >= 100 for EVERY archetype, i.e. at
+		// least 20x the game's single most common value, so the engine resident-loaded HD textures
+		// for every RUDE prop far earlier than for a base-game prop and any streaming/memory
+		// comparison between a RUDE area and a Rockstar area was measuring this default.
+		// The 3.0 factor is the measured median hdTextureDist/bsRadius ratio (p25 1.19, median 2.94,
+		// p75 8.70) and the 5..150 clamp brackets the observed value band (p10 5, p50 50, p90 168).
+		// HONEST LIMIT: the real distribution is multi-modal and per-archetype intent is NOT
+		// recoverable from bsRadius alone - this is a defensible default, not a recovered value.
+		const int32 HdDist = FMath::Clamp((int32)(Bsr * 3.f), 5, 150);
 		Archetypes += FString::Printf(TEXT(
 			"  <Item type=\"CBaseArchetypeDef\">\n"
 			"   <lodDist value=\"%d\" />\n   <flags value=\"%u\" />\n"
@@ -3962,7 +4040,7 @@ FString URudeToolset::ExportYtyp(const FString& YdrSpecs, const FString& YtypNam
 			"   <assetType>ASSET_TYPE_DRAWABLE</assetType>\n   <assetName>%s</assetName>\n"
 			"   <extensions />\n  </Item>\n"),
 			LodDist, Flags, BbMin[0], BbMin[1], BbMin[2], BbMax[0], BbMax[1], BbMax[2],
-			Bsc[0], Bsc[1], Bsc[2], Bsr, LodDist, *Name, *Txd, *PhysDict, *Name);
+			Bsc[0], Bsc[1], Bsc[2], Bsr, HdDist, *Name, *Txd, *PhysDict, *Name);
 	}
 	const FString Ytyp = FString::Printf(TEXT(
 		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapTypes>\n <extensions />\n <archetypes>\n%s"
@@ -3999,16 +4077,62 @@ FString URudeToolset::ExportYmap(const FString& EntitiesJsonPath, const FString&
 	FString Rows;
 	double MinX = 1e18, MinY = 1e18, MinZ = 1e18, MaxX = -1e18, MaxY = -1e18, MaxZ = -1e18;
 	int32 Count = 0;
-	for (const TSharedPtr<FJsonValue>& V : Ents)
+	// ⛔ A FIELD-LESS ENTITY USED TO EXPORT AS A SUCCESS (fixed 2026-08-03).
+	// FJsonObject::GetStringField / GetNumberField DO NOT fail on a missing field - they log a
+	// LogJson warning and hand back ""/0.0 (UE 5.8 JsonObject.cpp:474/404 -> GetField:338 returns
+	// FJsonValueNull; JsonValue.cpp:26/13). So {"ue":{}} became <archetypeName></archetypeName> at
+	// (0,0,0), that origin was folded into streamingExtents, and the call returned ok:true with the
+	// bogus entity COUNTED. Measured on the 12-entity showcase scene: ONE such entity inflates the
+	// streaming box from 636x666 m to 828x1570 m - 3.1x the area - which changes when the whole
+	// resource streams in. <archetypeName> is never empty in the game's own data (0 of 136,786
+	// across 900 base-game ymaps). Three further paths dropped an entity with an uncounted
+	// `continue`, so an upstream producer bug silently shrank the map with nothing in the JSON
+	// saying so.
+	// An entity the caller asked us to place that cannot exist in game is a REFUSAL, not a default,
+	// and it is refused BEFORE it touches the extents fold.
+	for (int32 EntIdx = 0; EntIdx < Ents.Num(); ++EntIdx)
 	{
+		const TSharedPtr<FJsonValue>& V = Ents[EntIdx];
 		const TSharedPtr<FJsonObject>* E;
-		if (!V.IsValid() || !V->TryGetObject(E)) { continue; }
+		if (!V.IsValid() || !V->TryGetObject(E))
+		{
+			return Fail(FString::Printf(TEXT("entity %d is not a JSON object"), EntIdx));
+		}
 		const TSharedPtr<FJsonObject>* Ue;
-		if (!(*E)->TryGetObjectField(TEXT("ue"), Ue)) { continue; }
-		const FString Arch = (*E)->GetStringField(TEXT("archetype"));
-		const double X = (*Ue)->GetNumberField(TEXT("x")) / 100.0;
-		const double Y = -(*Ue)->GetNumberField(TEXT("y")) / 100.0;
-		const double Z = (*Ue)->GetNumberField(TEXT("z")) / 100.0;
+		if (!(*E)->TryGetObjectField(TEXT("ue"), Ue))
+		{
+			return Fail(FString::Printf(TEXT("entity %d has no 'ue' object (want {x,y,z} in UE cm)"), EntIdx));
+		}
+		FString Arch;
+		if (!(*E)->TryGetStringField(TEXT("archetype"), Arch) || Arch.TrimStartAndEnd().IsEmpty())
+		{
+			return Fail(FString::Printf(
+				TEXT("entity %d has no non-empty 'archetype'; an empty archetypeName resolves to no archetype in game"),
+				EntIdx));
+		}
+		// ExportYtyp lowercases the archetype name it emits (:3892) while this lane used to pass the
+		// caller's string through verbatim - the two halves of RUDE's own round trip could disagree
+		// on case, and the symptom would be "the prop just doesn't appear" with a ytyp and a ymap
+		// that both read correctly by eye. Every real archetype name in the sampled corpus is
+		// lowercase, so normalising here makes the question moot rather than betting on the
+		// downstream converter hashing case-insensitively.
+		Arch = Arch.TrimStartAndEnd().ToLower();
+		if (Arch.Contains(TEXT("<")) || Arch.Contains(TEXT(">")) || Arch.Contains(TEXT("&"))
+			|| Arch.Contains(TEXT("\"")) || Arch.Contains(TEXT("'")))
+		{
+			// this value is interpolated straight into XML with no escaping
+			return Fail(FString::Printf(
+				TEXT("entity %d archetype '%s' contains an XML-special character"), EntIdx, *Arch));
+		}
+		double Ux = 0, Uy = 0, Uz = 0;
+		if (!(*Ue)->TryGetNumberField(TEXT("x"), Ux) || !(*Ue)->TryGetNumberField(TEXT("y"), Uy)
+			|| !(*Ue)->TryGetNumberField(TEXT("z"), Uz))
+		{
+			return Fail(FString::Printf(TEXT("entity %d ('%s') is missing ue.x / ue.y / ue.z"), EntIdx, *Arch));
+		}
+		const double X = Ux / 100.0;
+		const double Y = -Uy / 100.0;
+		const double Z = Uz / 100.0;
 		double Qx = 0, Qy = 0, Qz = 0, Qw = 1;
 		const TSharedPtr<FJsonObject>* Q;
 		if ((*E)->TryGetObjectField(TEXT("ue_quat"), Q))
@@ -4034,14 +4158,36 @@ FString URudeToolset::ExportYmap(const FString& EntitiesJsonPath, const FString&
 			// ⚠ NOT a global rule: a phBound CompositeTransform stores a FORWARD matrix and keeps
 			// the pure mirror at :1480 (verified 4,031/4,031 real composite children). The
 			// distinction is "ymap entity = inverse-stored, phBound = forward-stored".
-			Qx = (*Q)->GetNumberField(TEXT("x"));
-			Qy = -(*Q)->GetNumberField(TEXT("y"));
-			Qz = (*Q)->GetNumberField(TEXT("z"));
-			Qw = (*Q)->GetNumberField(TEXT("w"));
+			// A PARTIAL ue_quat used to default silently: a missing "w" became 0, giving a
+			// zero-norm quaternion that no rotation can be recovered from, with ok:true.
+			double Rx = 0, Ry = 0, Rz = 0, Rw = 0;
+			if (!(*Q)->TryGetNumberField(TEXT("x"), Rx) || !(*Q)->TryGetNumberField(TEXT("y"), Ry)
+				|| !(*Q)->TryGetNumberField(TEXT("z"), Rz) || !(*Q)->TryGetNumberField(TEXT("w"), Rw))
+			{
+				return Fail(FString::Printf(
+					TEXT("entity %d ('%s') has a partial 'ue_quat'; x,y,z,w are all required "
+					     "(a missing w defaults to 0 = a zero-norm quaternion)"), EntIdx, *Arch));
+			}
+			const double N2 = Rx * Rx + Ry * Ry + Rz * Rz + Rw * Rw;
+			if (FMath::Abs(N2 - 1.0) > 1e-3)
+			{
+				return Fail(FString::Printf(
+					TEXT("entity %d ('%s') ue_quat is not unit-length (|q|^2 = %f)"), EntIdx, *Arch, N2));
+			}
+			// ⚠ the involution below is the conductor's 2026-08-03 rotation fix - (x, -y, z, w),
+			// the SAME one the import lane uses. Do not "restore" (-x, y, -z, w): that is the
+			// inverse, and it is what shipped every UE-authored entity facing the wrong way.
+			Qx = Rx;
+			Qy = -Ry;
+			Qz = Rz;
+			Qw = Rw;
 		}
 		MinX = FMath::Min(MinX, X); MinY = FMath::Min(MinY, Y); MinZ = FMath::Min(MinZ, Z);
 		MaxX = FMath::Max(MaxX, X); MaxY = FMath::Max(MaxY, Y); MaxZ = FMath::Max(MaxZ, Z);
-		const uint32 Guid = FCrc::StrCrc32(*FString::Printf(TEXT("%s:%s:%f:%f:%f"), *MapName, *Arch, X, Y, Z));
+		// EntIdx folded in 2026-08-03: the guid was a CRC over map:arch:x:y:z, so two entities of the
+		// same archetype within 1e-6 m collided, and an entity-dedup pass downstream would fold them
+		// to one. The index makes it unconditionally unique.
+		const uint32 Guid = FCrc::StrCrc32(*FString::Printf(TEXT("%s:%d:%s:%f:%f:%f"), *MapName, EntIdx, *Arch, X, Y, Z));
 		Rows += FString::Printf(TEXT(
 			"  <Item type=\"CEntityDef\">\n   <archetypeName>%s</archetypeName>\n"
 			"   <flags value=\"1572864\" />\n   <guid value=\"%u\" />\n"
@@ -5046,10 +5192,25 @@ namespace RudeYdrBin
 
 		// embedded bound: composite -> children -> per-child arrays -> BVH nodes/trees
 		int32 Comp = 0;
-		if (Deref(P(0xc8), 0x80, Comp))
+		// FIXED 2026-08-03 - this gate had NEVER run on the embedded bound. NCh was read from
+		// Comp+0x78, which is the CurrentMatrices POINTER (this file writes it at :6375 as
+		// PPTR(Comp,0x78,OXf), aliased to +0x80); NumChildren is the u16 at Comp+0xa0 (written
+		// at :6378, and read there by quarry's oracle-validated reader, ydr2xml.py:1011). So the
+		// U16 read returned the low 16 bits of a tagged pointer - measured 49,440 / 56,720 /
+		// 65,472 / 60,464 / 14,192 / 5,136 across the 14 emitted .ydr, where the true count is 1
+		// in 14/14. The Deref bounds check below then failed in 13/14 files and the composite
+		// branch was skipped entirely (0 children walked); in the 14th the garbage count was
+		// small enough to pass, and the walk fabricated 5 spurious shared-block reports.
+		// COST: the embedded phBound - poly array, vertex array, materials, per-poly material
+		// index, BVH header, node array, m_Trees, the largest and most crash-prone subgraph -
+		// was never checked for the double-ownership that causes the non-idempotent-fixup crash,
+		// while every export still printed "selfCheck: passed". The span also had to widen from
+		// 0x80 to 0xb0: the composite header this writer emits is 0xb0 bytes (:6364) and +0xa0
+		// must be inside the checked span or the read is unguarded.
+		if (Deref(P(0xc8), 0xb0, Comp))
 		{
 			Own(InDeg, V, P(Comp + 0x70), TEXT("composite children array"));
-			uint16 NCh = 0; U16(Sys, Comp + 0x78, NCh);
+			uint16 NCh = 0; U16(Sys, Comp + 0xa0, NCh);
 			int32 CArr = 0;
 			if (Deref(P(Comp + 0x70), (int32)NCh * 8, CArr))
 			{
@@ -5183,12 +5344,23 @@ namespace RudeYtd
 		{
 			for (int32 x = 0; x < NW; ++x)
 			{
+				// FIXED 2026-08-03 - the second tap of each pair was unclamped. NW/NH floor at 1
+				// (FMath::Max above), but the reads used 2*x+1 / 2*y+1 regardless, so at W==1 or
+				// H==1 this indexed one full row/column past the buffer - a TArray bounds fatal in
+				// the editor. It was unreachable only because the caller's loop guard bailed out
+				// before a dimension reached 1; that guard is the MaxDim bug fixed below, so
+				// making this total is what allows the guard to be corrected.
+				// NOT AN OUTPUT CHANGE: for W,H >= 2 we have 2*x+1 <= W-1 and 2*y+1 <= H-1 for
+				// every x < W/2, y < H/2 (true for odd dimensions too), so the clamp binds only
+				// in the 1-pixel case that previously read out of bounds.
+				const int32 sx0 = 2 * x, sx1 = FMath::Min(2 * x + 1, W - 1);
+				const int32 sy0 = 2 * y, sy1 = FMath::Min(2 * y + 1, H - 1);
 				for (int32 c = 0; c < 4; ++c)
 				{
-					const int32 s0 = P[((2 * y) * W + 2 * x) * 4 + c];
-					const int32 s1 = P[((2 * y) * W + 2 * x + 1) * 4 + c];
-					const int32 s2 = P[((2 * y + 1) * W + 2 * x) * 4 + c];
-					const int32 s3 = P[((2 * y + 1) * W + 2 * x + 1) * 4 + c];
+					const int32 s0 = P[(sy0 * W + sx0) * 4 + c];
+					const int32 s1 = P[(sy0 * W + sx1) * 4 + c];
+					const int32 s2 = P[(sy1 * W + sx0) * 4 + c];
+					const int32 s3 = P[(sy1 * W + sx1) * 4 + c];
 					Out[(y * NW + x) * 4 + c] = (uint8)((s0 + s1 + s2 + s3) / 4);
 				}
 			}
@@ -5237,9 +5409,27 @@ namespace RudeYtd
 	{
 		int v0 = v[0], v1 = v[0];
 		for (int i = 1; i < 16; ++i) { v0 = FMath::Max(v0, v[i]); v1 = FMath::Min(v1, v[i]); }
+		// FIXED 2026-08-03 - the palette was off by one index. It built
+		// pal[k] = ((7-k)*v0 + k*v1)/7 across k=0..7 and then STAMPED pal[0]=v0, pal[1]=v1
+		// over the first two entries. That left every interpolant one rung toward v1 of where
+		// the GPU puts it, and made pal[7] == v1 - a duplicate of index 1 that the first-wins
+		// tie-break below never selects, so index 7 was unreachable and 1 of the codec's 8
+		// slots was discarded on every block. This is the encoder for ATI2/BC5 (every normal
+		// map) and for the DXT5 alpha channel.
+		// COST, measured (encode here -> decode with a from-spec decoder that agrees with
+		// texture2ddecoder on 20,000/20,000 random blocks; source = the real 1024^2 normal map
+		// output/rude_rockwall_tex/tex/TX_Stone_01a_NRM_1k.png, 8,000 blocks/channel):
+		//   R meanAbsErr 3.748 -> 1.024, max 38 -> 12, PSNR 34.28 -> 44.62 dB
+		//   G meanAbsErr 4.561 -> 1.275, max 45 -> 15, PSNR 32.50 -> 42.69 dB
+		// ~10 dB of normal-map precision thrown away silently: the DDS was always structurally
+		// valid, so no load/parse/screenshot gate could see it. The identical bug was in the
+		// Python encoder tools/build_ytd.py, so the C++-vs-Python byte-identity gate agreed
+		// while both were wrong - both were fixed in the same change and now match 3000/3000.
+		// BC4/RGTC1, red0 > red1: indices 0 and 1 ARE the endpoints; the six interpolants
+		// red_2..red_7 walk 6/7..1/7 of the way from v0 to v1 and exclude the endpoints.
 		int pal[8];
-		for (int k = 0; k < 8; ++k) { pal[k] = ((7 - k) * v0 + k * v1) / 7; }
 		pal[0] = v0; pal[1] = v1;
+		for (int k = 2; k < 8; ++k) { pal[k] = ((8 - k) * v0 + (k - 1) * v1) / 7; }
 		uint64 packed = 0;
 		for (int i = 0; i < 16; ++i)
 		{
@@ -5325,20 +5515,50 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 		TArray64<uint8> Mip;
 		if (!Src.GetMipData(Mip, 0, 0, 0, nullptr)) { return Fail(FString::Printf(TEXT("GetMipData failed: %s"), *Path)); }
 
+		// HARDENING 2026-08-03, not a live-bug fix - stated precisely because the audit rated this
+		// "silent-wrong" and it is not reachable today. The old code did
+		// Memcpy(dst, src, Min(Mip.Num(), BGRA.Num())) into a SetNumUninitialized buffer, which
+		// READS as if a short source were expected and tolerated - and a short source would have
+		// left the tail uninitialised (not even zeroed) and encoded raw heap into the texture with
+		// ok:true. Checked before writing this: GetMipData returns MipImage.RawData sized exactly
+		// SizeX*SizeY*BytesPerPixel and the engine check()s it (UE 5.8 Texture.cpp:2980), and
+		// GetSizeX/GetSizeY are block-0's dimensions (Texture.h:412-418) while we ask for block 0
+		// layer 0 mip 0 - so for BGRA8/BGRE8/G8 the sizes always agree. The guard earns its place
+		// anyway: that engine check() is DO_CHECK-gated and compiles out, the G8 branch below
+		// indexes Mip[i] unchecked for tw*th bytes, and an explicit refusal beats a silent Min().
+		const int64 WantBytes = (int64)tw * th * ((SF == TSF_G8) ? 1 : 4);
+		if (SF != TSF_BGRA8 && SF != TSF_BGRE8 && SF != TSF_G8)
+		{
+			return Fail(FString::Printf(TEXT("unsupported source fmt %d (want BGRA8/G8): %s"), (int32)SF, *Path));
+		}
+		if ((int64)Mip.Num() != WantBytes)
+		{
+			return Fail(FString::Printf(TEXT("source mip is %lld bytes, expected %lld for %dx%d fmt %d: %s"),
+			                            (int64)Mip.Num(), WantBytes, tw, th, (int32)SF, *Path));
+		}
 		TArray<uint8> BGRA; BGRA.SetNumUninitialized(tw * th * 4);
 		if (SF == TSF_BGRA8 || SF == TSF_BGRE8)
 		{
-			FMemory::Memcpy(BGRA.GetData(), Mip.GetData(), FMath::Min<int64>(Mip.Num(), BGRA.Num()));
+			FMemory::Memcpy(BGRA.GetData(), Mip.GetData(), WantBytes);
 		}
 		else if (SF == TSF_G8)
 		{
 			for (int32 i = 0; i < tw * th; ++i)
 			{ const uint8 G = Mip[i]; BGRA[i * 4] = G; BGRA[i * 4 + 1] = G; BGRA[i * 4 + 2] = G; BGRA[i * 4 + 3] = 255; }
 		}
-		else { return Fail(FString::Printf(TEXT("unsupported source fmt %d (want BGRA8/G8): %s"), (int32)SF, *Path)); }
+		// (the unsupported-format else that used to sit here is now the explicit refusal above,
+		//  hoisted so the size guard can compute the right bytes-per-pixel for the format)
 
 		// optional downscale (mainly for RAW; DXT/BC keeps full-res small enough)
-		while (Cap > 0 && (tw > Cap || th > Cap) && tw > 1 && th > 1) { RudeYtd::HalveBGRA(BGRA, tw, th); }
+		// FIXED 2026-08-03 - MaxDim was not the upper bound it is documented to be. The guard was
+		// `tw > 1 && th > 1`, so the loop stopped as soon as EITHER dimension hit 1 and shipped the
+		// oversized texture with ok:true. Trace for 4096x2 with MaxDim=512: pass 1 halves to
+		// 2048x1, pass 2 fails `th > 1` and exits with tw = 2048, 4x over the requested cap. The
+		// caller asked for a VRAM bound and silently did not get one. `||` is correct and still
+		// terminates: whichever dimension is > 1 halves every pass, so both reach 1 and the loop
+		// ends (and at 1x1 the cap is satisfied for any Cap >= 1). Requires the HalveBGRA tap
+		// clamp above - relaxing this guard without it would read out of bounds instead.
+		while (Cap > 0 && (tw > Cap || th > Cap) && (tw > 1 || th > 1)) { RudeYtd::HalveBGRA(BGRA, tw, th); }
 
 		// resolve AUTO: NORMAL -> ATI2 (BC5); real alpha -> DXT5; else DXT1 (matches build_ytd)
 		if (FmtSel == TEXT("AUTO"))
@@ -5439,7 +5659,24 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 		RudeYtd::PutU32(Sys, b + 0x00, 0); RudeYtd::PutU32(Sys, b + 0x04, 1);  // VFT
 		RudeYtd::PutU32(Sys, b + 0x28, Sptr(NameOff[i]));                      // name*
 		RudeYtd::PutU32(Sys, b + 0x30, 1);
-		RudeYtd::PutU32(Sys, b + 0x40, T.U40);
+		// FIXED 2026-08-03 - this wrote the BARE usage code (0x14 / 0x16), zeroing the two other
+		// sub-fields the word carries. +0x40 packs: bits 0..4 usage, bits 8..27 allocated pixel
+		// bytes / 256, bits 28..31 a type/class nibble. Measured on 278 embedded grcTexture
+		// records from 400 real base-game .ydr: the high nibble is 2 in 278/278, and the allocated
+		// size is >= the texture's own mip-chain byte count in 278/278, never 0. RUDE emitted
+		// high nibble 0 and allocated 0 - i.e. "this texture allocates no memory" - on every
+		// texture it has ever written.
+		// COST: not proven to break in-game (these dictionaries load), but it is the texture's own
+		// memory-accounting record, so any downstream reader - a future ImportYtd, a third-party
+		// tool, the streamer's budget - reads zero, and it makes RUDE-authored .ytd trivially
+		// distinguishable from real ones, against the clean-room "indistinguishable output" goal.
+		// HONEST LIMIT: R*'s exact allocation rounding is NOT reproduced. Real words carry more
+		// than the payload (e.g. 128x128/6mip: allocated 23,040 vs 10,920 of pixels; 256x256/7mip:
+		// 45,056 vs 43,688) and no single rounding explains both. This writes the true payload
+		// size rounded up to 256, which satisfies the one invariant that held in 278/278
+		// (allocated >= mip-chain bytes) and is strictly closer to real data than 0.
+		const uint32 Alloc256 = (uint32)(((int64)T.Data.Num() + 255) / 256) & 0xFFFFFu;
+		RudeYtd::PutU32(Sys, b + 0x40, (2u << 28) | (Alloc256 << 8) | (T.U40 & 0x1Fu));
 		RudeYtd::PutU16(Sys, b + 0x50, (uint16)T.W); RudeYtd::PutU16(Sys, b + 0x52, (uint16)T.H);
 		RudeYtd::PutU16(Sys, b + 0x54, 1); RudeYtd::PutU16(Sys, b + 0x56, (uint16)T.Stride);   // depth, stride
 		RudeYtd::PutU32(Sys, b + 0x58, T.Fmt);                                 // D3DFMT enum (21=A8R8G8B8) or FourCC
@@ -5881,7 +6118,18 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 			}
 		}
 	}
-	if (CV.Num() > 65535) { return Fail(TEXT("collision verts exceed 65535")); }
+	// FIXED 2026-08-03 - this guard was 2x too permissive (it read > 65535). The bound polygon
+	// record's vertex index is 15 bits: bit 15 is the per-edge flag, so 32,768..65,535 verts
+	// passed the guard and emitted indices with bit 15 set, which the loader reads as
+	// (index & 0x7FFF) - a completely different vertex - plus a spurious edge flag. Measured over
+	// 60 real base-game .ybn (768,438 triangle vertex refs): bit 15 is SET in 12.48% of refs while
+	// the largest bound in the sample declares 13,023 verts and the largest index used is 11,706,
+	// so a set bit 15 cannot be index data. quarry's oracle-validated reader agrees independently
+	// (ydr2xml.py:975 masks with 0x7FFF and takes bit 15 as the flag). Nothing tested this: it
+	// passed the writer's own guards and the BVH coverage check (the indices ARE covered, just
+	// wrong), so a large export - an MLO shell, a terrain tile, a merged district - would have
+	// shipped silently wrong collision with ok:true.
+	if (CV.Num() > 32767) { return Fail(TEXT("collision verts exceed 32767 - the bound polygon vertex index is 15 bits (bit 15 is the edge flag) - split the mesh")); }
 	// u16 COUNT CEILINGS (pinned 2026-07-26). The vertex guard above is NOT sufficient: BVH leaf
 	// PolyStart and the m_Trees start/end node indices are u16 in the real format, and a closed
 	// mesh runs ~2 triangles per vertex - so a mesh can pass the vertex guard and still wrap the
@@ -6251,6 +6499,20 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 			RudeYbn::PU16(PolyB, k*16+4, (uint16)CI[j*3]);
 			RudeYbn::PU16(PolyB, k*16+6, (uint16)CI[j*3+1]);
 			RudeYbn::PU16(PolyB, k*16+8, (uint16)CI[j*3+2]);
+			// FIXED 2026-08-03 - PolyB is AddZeroed and only bytes 0..9 were written, so the three
+			// edge-neighbour slots shipped as 0 under a comment claiming "0 = none". 0 is not none,
+			// it is polygon 0: measured over 60 real base-game .ybn (256,146 triangles, 768,438
+			// slots) the no-neighbour sentinel is 0xFFFF (14.40%), a valid neighbour index appears
+			// in 85.57%, and 0 occurs in 0.03% as a GENUINE reference to polygon 0. Leaving 0 told
+			// the solver every edge of every RUDE triangle adjoins polygon 0.
+			// COST: phBoundGeometryBVH uses edge adjacency for contact-normal selection and
+			// internal-edge rejection, so this is wrong contact normals / catching on seams - not a
+			// crash, and invisible to load-succeeds and to the BVH coverage check (both pass).
+			// Real adjacency (matching triangles by shared edge) is still the proper follow-up;
+			// the sentinel is what the format means by "no neighbour".
+			RudeYbn::PU16(PolyB, k*16+10, 0xFFFF);
+			RudeYbn::PU16(PolyB, k*16+12, 0xFFFF);
+			RudeYbn::PU16(PolyB, k*16+14, 0xFFFF);
 		}
 		TArray<uint8> VertB; VertB.AddZeroed(NV * 6);
 		for (int32 i = 0; i < NV; ++i)
@@ -6464,7 +6726,34 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 		TArray<FString> C;
 		WorldOffset.ParseIntoArray(C, TEXT(","), true);
 		if (C.Num() != 3) { return Fail(TEXT("WorldOffset must be \"x,y,z\" (gta world metres)")); }
-		Offset = FVector3f(FCString::Atof(*C[0]), FCString::Atof(*C[1]), FCString::Atof(*C[2]));
+		// FIXED 2026-08-03 - the component COUNT was validated but the component VALUES were not.
+		// FCString::Atof returns 0.0f for unparseable text with no error channel, so
+		// "1500,-800,abc" exported successfully with Z = 0 and a plausible-looking
+		// vertices/triangles/bvhNodes report. Static map collision stores ABSOLUTE world coords
+		// (170 of 183 oracle .ybn have |root BoxCenter| > 100 m, 0 of 183 sit at the origin) and
+		// nothing downstream re-places a .ybn, so a silently-zeroed component drops that axis to
+		// the world origin - invisible until someone walks through a wall.
+		// LexTryParseString is used rather than FString::IsNumeric because IsNumeric rejects
+		// scientific notation (CString.h:148 allows only [+-], digits and one '.'), and a caller
+		// formatting floats from Python emits "1e-05" for small offsets; rejecting that would
+		// have been a new defect. Traced against UE 5.8 UnrealString.h.inl:2210 - it refuses "",
+		// "abc", "-" and "." and accepts "1e-05". The IsFinite check is separate and independent:
+		// Atof("inf")/"nan" parse non-zero, and a non-finite offset propagates into
+		// Quantum = Half/32767 and NaNs every stored vertex.
+		for (int32 i = 0; i < 3; ++i)
+		{
+			const FString Tok = C[i].TrimStartAndEnd();
+			float Val = 0.f;
+			if (!LexTryParseString(Val, *Tok))
+			{
+				return Fail(FString::Printf(TEXT("WorldOffset component %d ('%s') is not a number"), i, *Tok));
+			}
+			if (!FMath::IsFinite(Val))
+			{
+				return Fail(FString::Printf(TEXT("WorldOffset component %d ('%s') is not finite"), i, *Tok));
+			}
+			Offset[i] = Val;
+		}
 	}
 
 	// --- collision soup, welded by position, inverse RUDE transform (cm->m, Y mirror) ---
@@ -6486,7 +6775,15 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	}
 	const int32 NV = Verts.Num(), NP = Indices.Num() / 3;
 	if (NV == 0 || NP == 0) { return Fail(TEXT("no collision geometry")); }
-	if (NV > 65535) { return Fail(TEXT("vertex count exceeds 65535 (u16 poly indices) - split the mesh")); }
+	// FIXED 2026-08-03 - was > 65535, i.e. 2x too permissive. The bound polygon record's vertex
+	// index is 15 bits (bit 15 = the per-edge flag), so 32,768..65,535 verts passed and emitted
+	// indices whose bit 15 the loader strips: it reads (index & 0x7FFF), a different vertex, and
+	// takes a spurious edge flag. Measured over 60 real base-game .ybn (768,438 triangle vertex
+	// refs): bit 15 SET in 12.48%, while the largest bound declares 13,023 verts and the largest
+	// index used is 11,706 - a set bit 15 provably is not index data. quarry's reader agrees
+	// (ydr2xml.py:975: index & 0x7FFF, bit 15 -> f1/f2/f3). The NP > 65535 guard below stays:
+	// the BVH PolyStart really is a full u16.
+	if (NV > 32767) { return Fail(TEXT("vertex count exceeds 32767 - the bound polygon vertex index is 15 bits (bit 15 is the edge flag) - split the mesh")); }
 	// u16 COUNT CEILING (pinned 2026-07-26) - the vertex guard above is NOT sufficient. BVH leaf
 	// PolyStart (node+0x0c) and the m_Trees start/end node indices are u16 in the real format;
 	// a closed mesh runs ~2 triangles per vertex, so NP wraps at ~32.8k verts - INSIDE the range
@@ -6590,7 +6887,17 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 		RudeYbn::PU16(PolyBytes, k*16+4, (uint16)Indices[j*3]);
 		RudeYbn::PU16(PolyBytes, k*16+6, (uint16)Indices[j*3+1]);
 		RudeYbn::PU16(PolyBytes, k*16+8, (uint16)Indices[j*3+2]);
-		// +10/+12/+14 = edge-neighbour indices (0 = none; adjacency is a later refinement)
+		// +10/+12/+14 = edge-neighbour indices. FIXED 2026-08-03: these shipped as 0 (PolyBytes is
+		// AddZeroed and only bytes 0..9 were written) under a comment claiming "0 = none". 0 is not
+		// none, it is polygon 0. Measured over 60 real base-game .ybn (256,146 triangles, 768,438
+		// slots): 0xFFFF = 14.40% (the sentinel), a valid index < npolys = 85.57%, and 0 = 0.03%
+		// as a genuine reference to polygon 0. Cost: every RUDE collision triangle told RAGE's
+		// contact-normal / internal-edge-rejection pass that all three of its edges adjoin
+		// polygon 0 - bad contact normals and seam catching, not a crash, so nothing caught it.
+		// 0xFFFF = no neighbour; real adjacency is still a later refinement.
+		RudeYbn::PU16(PolyBytes, k*16+10, 0xFFFF);
+		RudeYbn::PU16(PolyBytes, k*16+12, 0xFFFF);
+		RudeYbn::PU16(PolyBytes, k*16+14, 0xFFFF);
 	}
 	TArray<uint8> VertBytes; VertBytes.AddZeroed(NV * 6);
 	for (int32 i = 0; i < NV; ++i)
@@ -6873,6 +7180,16 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 
 	int32 TotalGeo = 0, TotalVerts = 0, TotalTris = 0, BadIdx = 0;
 	int32 DeclOk = 0, DeclBad = 0, PosInAabb = 0, PosOutAabb = 0, NanVerts = 0, NoNormal = 0;
+	// ADDED 2026-08-03 - every `continue` below used to drop a model or a geometry with no counter,
+	// and the probe still reported ok:true with a short geometry count. A dropped MODEL was fully
+	// invisible: it emits no JSON entry at all and the declared model count was never reported.
+	// COST: this probe is the instrument used to prove the binary READ path and to round-trip
+	// ExportYdrBinary's output, so a silent drop lets a reader bug and a writer bug agree on a
+	// wrong-but-matching count - exactly the failure the round-trip exists to catch. It also
+	// under-reports coverage when pointed at real game files carrying declarations we do not
+	// support. A probe that drops anything must not be reportable as a clean parse.
+	int32 ModelsDeclared = 0, ModelsDropped = 0, GeosDropped = 0;
+	int32 IdxUnreadable = 0, IdxCountMismatch = 0, LodHeadersDropped = 0;
 	FString FirstDeclError;
 	TSet<FString> Decls;
 	FString ModelJson;
@@ -6884,12 +7201,14 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 	RudeYdrBin::U32(S, LodSlot[lod], PtrLod);
 	if (PtrLod == 0) { continue; }
 	int32 MH = 0;
-	if (!R.Resolve(PtrLod, 0x10, MH)) { continue; }
+	if (!R.Resolve(PtrLod, 0x10, MH)) { ++LodHeadersDropped; continue; }
 	uint32 PtrMArr = 0; uint16 NMod = 0;
 	RudeYdrBin::U32(S, MH + 0x00, PtrMArr);
 	RudeYdrBin::U16(S, MH + 0x08, NMod);
 	int32 MArr = 0;
-	if (NMod == 0 || !R.Resolve(PtrMArr, (int32)NMod * 8, MArr)) { continue; }
+	ModelsDeclared += (int32)NMod;
+	// a non-empty LOD whose model array will not resolve loses every model it declared
+	if (NMod == 0 || !R.Resolve(PtrMArr, (int32)NMod * 8, MArr)) { ModelsDropped += (int32)NMod; continue; }
 	bAnyModels = true;
 
 	for (int32 mi = 0; mi < NMod; ++mi)
@@ -6897,7 +7216,7 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 		uint32 PtrM = 0;
 		RudeYdrBin::U32(S, MArr + mi * 8, PtrM);
 		int32 M = 0;
-		if (!R.Resolve(PtrM, 0x30, M)) { continue; }
+		if (!R.Resolve(PtrM, 0x30, M)) { ++ModelsDropped; continue; }
 		uint32 PtrGArr = 0, PtrGB = 0, Rm = 0;
 		uint16 NGeo = 0, NGeo2e = 0;
 		RudeYdrBin::U32(S, M + 0x08, PtrGArr);
@@ -6906,7 +7225,9 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 		RudeYdrBin::U32(S, M + 0x2c, Rm);
 		RudeYdrBin::U16(S, M + 0x2e, NGeo2e);
 		int32 GArr = 0;
-		if (NGeo == 0 || !R.Resolve(PtrGArr, (int32)NGeo * 8, GArr)) { continue; }
+		// this `continue` skips BEFORE ModelJson is appended, so the model vanished entirely
+		if (NGeo == 0 || !R.Resolve(PtrGArr, (int32)NGeo * 8, GArr))
+		{ ++ModelsDropped; GeosDropped += (int32)NGeo; continue; }
 
 		// geoBounds is N+1 vec4-pairs when N>1 (union first), exactly 1 pair when N==1
 		const int32 Pairs = (NGeo > 1) ? (NGeo + 1) : 1;
@@ -6919,7 +7240,7 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 			uint32 PtrG = 0;
 			RudeYdrBin::U32(S, GArr + gi * 8, PtrG);
 			int32 G = 0;
-			if (!R.Resolve(PtrG, 0x80, G)) { continue; }
+			if (!R.Resolve(PtrG, 0x80, G)) { ++GeosDropped; continue; }
 			uint32 PtrVB = 0, PtrIB = 0, IdxCount = 0, TriCount = 0;
 			uint16 VCnt = 0, Stride16 = 0;
 			RudeYdrBin::U32(S, G + 0x18, PtrVB);
@@ -6997,15 +7318,20 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 			// index buffer: confirm u16 indices stay inside the vertex count
 			int32 MaxIdx = -1;
 			int32 IB = 0;
+			bool bIdxRead = false;
 			if (R.Resolve(PtrIB, 0x20, IB))
 			{
 				uint32 PtrIData = 0, IBCount = 0;
 				RudeYdrBin::U32(S, IB + 0x08, IBCount);
 				RudeYdrBin::U32(S, IB + 0x10, PtrIData);
 				int32 IData = 0;
+				// grmGeometry+0x58 and IndexBuffer+0x08 are two independent declarations of the
+				// same count; taking the Min silently papered over any disagreement, so count it.
+				if (IdxCount != IBCount) { ++IdxCountMismatch; }
 				const int32 NIdx = (int32)FMath::Min(IdxCount, IBCount);
 				if (NIdx > 0 && R.Resolve(PtrIData, NIdx * 2, IData))
 				{
+					bIdxRead = true;
 					for (int32 k = 0; k < NIdx; ++k)
 					{
 						uint16 V = 0; RudeYdrBin::U16(S, IData + k * 2, V);
@@ -7013,6 +7339,9 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 					}
 				}
 			}
+			// MaxIdx stays -1 when the index buffer does not resolve, so the range check below
+			// can never fire and an UNREADABLE index buffer used to count as clean.
+			if (!bIdxRead) { ++IdxUnreadable; }
 			if (MaxIdx >= (int32)VCnt) { ++BadIdx; }
 
 			GeoJson += FString::Printf(
@@ -7049,6 +7378,8 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 		TEXT("\"vertices\":%d,\"triangles\":%d,\"indicesOutOfRange\":%d,")
 		TEXT("\"declsDecoded\":%d,\"declsUnsupported\":%d,\"declError\":\"%s\",")
 		TEXT("\"posInAabb\":%d,\"posOutOfAabb\":%d,\"nanVerts\":%d,\"geosWithoutNormal\":%d,")
+		TEXT("\"modelsDeclared\":%d,\"modelsDropped\":%d,\"geometriesDropped\":%d,")
+		TEXT("\"lodHeadersDropped\":%d,\"indexBuffersUnreadable\":%d,\"indexCountMismatch\":%d,")
 		TEXT("\"declarations\":[%s],\"shaders\":[%s],\"detail\":[%s]}"),
 		*DrawName, R.Version, R.Sys.Num(), R.Gfx.Num(),
 		Vf.SharedBlocks, Vf.DeclBad, Vf.BoundsBad, *Vf.FirstProblem,
@@ -7056,5 +7387,7 @@ FString URudeToolset::ProbeYdrBinary(const FString& BinPath)
 		TotalVerts, TotalTris, BadIdx,
 		DeclOk, DeclBad, *FirstDeclError,
 		PosInAabb, PosOutAabb, NanVerts, NoNormal,
+		ModelsDeclared, ModelsDropped, GeosDropped,
+		LodHeadersDropped, IdxUnreadable, IdxCountMismatch,
 		*DeclJson, *ShaderJson, *ModelJson);
 }
