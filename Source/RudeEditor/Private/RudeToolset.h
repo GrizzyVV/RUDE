@@ -42,9 +42,19 @@ public:
 	// exactly whenever slotsWithoutMaterial == 0. It counts bind DECISIONS (per geometry),
 	// not distinct params in the file; the old spelling summed the whole shader table, which
 	// included 4.4% of params no geometry could ever reach.
-	// ambiguousTextures counts binds where the texture NAME exists in more than one imported
-	// dictionary and neither the drawable's own __embedded dictionary nor a supplied scope
-	// disambiguated it - the pick is deterministic (lexicographic) but not proven correct.
+	// TEXTURE PROVENANCE, split 2026-08-05 (open item #43) because 95.8% of a 400-drawable run's
+	// binds were an unproven lexicographic tie-break that missingTextures cannot see (a wrong pick
+	// still binds *a* texture):
+	//   texturesResolvedScoped - the name was ambiguous and a SCOPE picked the winner: the
+	//     drawable's own __embedded dictionary, or the archetype's declared <textureDictionary>
+	//     (plus its +hi/+hidr/+hidd siblings). Provenance, not luck.
+	//   texturesTieBroken - the name was ambiguous, nothing scoped it, lexicographically first
+	//     candidate taken. Deterministic but NOT proven correct; this is the residual to drive down.
+	//   texturesFromEmbedded - the __embedded SUBSET of texturesResolvedScoped (kept: it is exact
+	//     by construction, that dictionary was carved out of this very drawable).
+	//   ambiguousTextures - KEPT and unchanged in meaning (== texturesTieBroken) so the pre-fix
+	//     2,390/2,495 measurement stays directly comparable to any later run.
+	// A bind whose name exists in exactly ONE dictionary moves none of these: nothing had to choose.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring one GTA V model into Unreal as a Static Mesh you can edit."))
 	static FString ImportYdr(const FString& XmlPath, const FString& DestFolder);
 
@@ -84,9 +94,15 @@ public:
 	// hash-manifest resumability model, name-level) UNLESS Mode is "FORCE" - then every
 	// file reimports in place (rebinds MaterialInstances against currently-imported
 	// textures; the texture-pass re-bind flow). Progress goes to the log.
+	// CorpusRoot is OPTIONAL (added 2026-08-05, open item #43): the _resolved folder the list
+	// points into. Given one, the batch builds the archetype index and scopes each drawable's
+	// texture lookup to its archetype's declared <textureDictionary> instead of tie-breaking
+	// ambiguous names lexicographically; left empty the behaviour is unchanged. It is never
+	// inferred from the list paths - a guessed scope is a wrong texture.
 	// Returns JSON: {ok, imported, skipped, failed, geometriesDropped,
 	// filesWithGeometryErrors, geometriesWithoutUV, trianglesOutOfRange,
-	// trianglesDegenerate, boundTextures, texturesFromEmbedded, ambiguousTextures,
+	// trianglesDegenerate, boundTextures, texturesFromEmbedded, texturesResolvedScoped,
+	// texturesTieBroken, filesWithArchetypeTxd, ambiguousTextures,
 	// unsupportedByMaster, missingTextures, unmappedSamplers, slotsWithoutShaderDef,
 	// slotsWithoutMaterial, valueParamsSeen, valueParamsBound, valueParamsUnsupported,
 	// valueParamsDeduped, failedFiles:[...first 30]}.
@@ -94,7 +110,7 @@ public:
 	// geometriesDropped/geometryErrors - the lost-geometry ones.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring in many GTA V models at once from a list file. Skips anything already imported."))
 	static FString ImportYdrBatch(const FString& ListPath, const FString& DestFolder,
-	                              const FString& Mode);
+	                              const FString& Mode, const FString& CorpusRoot);
 
 	// Spawn a scene manifest (tools/ingest_ymap.py output: JSON array of
 	// {ymap, entities:[{archetype, drawable, ue_location, ue_quat, scaleXY, scaleZ,
@@ -108,6 +124,11 @@ public:
 	// unknownLodLevel, emptyLodLevel, malformedEntities, instances, proxies,
 	// uniqueMeshes, uniqueMeshLookups, missingMeshes, topMissing:[...first 20]}.
 	// entitiesInManifest == entities + filteredByLod + malformedEntities holds exactly.
+	// ok is COMPUTED (2026-08-05, open item #44) and false when malformedEntities > 0 (an entity
+	// the tool could not parse is dropped from the scene - refuse rather than default) or when the
+	// run did NO work (0 ymaps or 0 entities - presence is not coverage). missingMeshes
+	// deliberately does NOT gate: it is a corpus gap (#37), and a gate that fires on every honest
+	// run is a gate nobody reads. ImportMapArea forwards this ok, so it is the map lane's gate too.
 	// "entities" has always been the POST-filter count; the LOD filter drops 10.51% of a
 	// typical manifest (measured, 1,500 resolved ymap / 239,662 entities) and used to do
 	// it with no counter. uniqueMeshes now counts meshes that LOADED - it used to report
@@ -122,7 +143,12 @@ public:
 	// from bound RUDE MaterialInstances where present.
 	// AssetPath: content path of the StaticMesh (e.g. "/Game/RUDE/Meshes/Props/prop_x").
 	// OutXmlPath: absolute file path for the emitted *.ydr.xml.
-	// Returns JSON: {ok, xmlPath, geometries, vertices, triangles} or {ok:false, error}.
+	// Returns JSON: {ok, xmlPath, geometries, vertices, triangles, renderBucketUnrecovered,
+	// collisionPrimitives, collisionFromRenderMesh} or {ok:false, error}.
+	// collisionFromRenderMesh 1 = the mesh had NO AggGeom, so the embedded bound was re-derived
+	// from the render mesh (a whole-mesh BVH). Counted 2026-08-05 (#40): RUDE has no collision
+	// IMPORTER, so an imported asset always takes that branch, and it used to be silent under
+	// ok:true. Declared gap, not a gate.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save a Static Mesh back out as a GTA V model, in the editable text form."))
 	static FString ExportYdr(const FString& AssetPath, const FString& OutXmlPath);
 
@@ -387,7 +413,13 @@ public:
 	// (same serialization as ExportYbnBinary - whole-mesh GeometryBVH). All-in-system
 	// (gfx=0), page-aware layout. Struct map: docs/ENGINEERING_LOG "ydr binary format".
 	// AssetPath: content path of the StaticMesh. OutYdrPath: absolute *.ydr path.
-	// Returns JSON: {ok, ydrPath, geometries, vertices, triangles, bytes, sysFlags}.
+	// ⛔ DECLARED GAP (#40, counted 2026-08-05): this writer builds the embedded bound from the
+	// RENDER MESH, unconditionally - it never reads UBodySetup, so collisionFromRenderMesh is
+	// always 1, and boundsIgnored counts UE collision primitives (box/sphere/capsule/convex) the
+	// user authored and this export threw away. Neither gates ok; they exist so a run cannot read
+	// as complete while substituting. Honouring AggGeom here is registered as expansion.
+	// Returns JSON: {ok, ydrPath, geometries, vertices, triangles, bytes, sysFlags,
+	// collisionFromRenderMesh, boundsIgnored}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save a Static Mesh as a finished GTA V model the game loads directly, with its collision included."))
 	static FString ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath);
 
@@ -398,7 +430,10 @@ public:
 	// ⭐ Exists because export was per-asset while import was per-AREA: the continuity principle
 	// (BENCHMARK_ADDON_CITY §5) says the difference between a trash can and a district must be batch
 	// size, not a different workflow.
-	// Returns JSON: {ok, considered, exported, failed, bytes, outDir, failedAssets:[...first 30]}.
+	// Returns JSON: {ok, considered, exported, failed, bytes, collisionFromRenderMesh,
+	// boundsIgnored, outDir, failedAssets:[...first 30]} - the two collision fields are the unit's
+	// declared gap (#40) summed, so a whole-district export cannot read as complete while every
+	// asset in it shipped collision re-derived from its render mesh.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save many Static Meshes out as GTA V models at once, into one folder.", RudeAudience="agent"))
 	static FString ExportYdrBinaryBatch(const FString& AssetFolder, const FString& OutDir,
 	                                    const FString& Filter);

@@ -1687,6 +1687,20 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 			++NumChildren;
 		}
 	}
+	// ⛔ THE SUBSTITUTION IS NOW COUNTED (2026-08-05, open item #40). This fallback is not a bug -
+	// a whole-mesh BVH is the rock-wall's in-game-proven structure - but it was SILENT, and the
+	// thing that makes it silent is a gap one lane earlier: RUDE has no ImportYbn/ImportBound/
+	// ImportCollision at all (grep, re-measured 08-05: zero hits plugin-wide), so an imported
+	// asset's AggGeom is ALWAYS empty and this branch ALWAYS taken. The corpus now ships 13,926
+	// .ybn files with no consumer. So every export of an imported prop re-derives its collision
+	// from the RENDER mesh - a different shape from the one Rockstar authored, at a different
+	// triangle budget - and reported ok:true with no number anywhere saying so.
+	// ⇒ collisionFromRenderMesh is a DECLARED GAP, not a failure: it does NOT gate ok, because the
+	// substitution is the tool's honest current capability and a gate that fires on every run is a
+	// gate nobody reads. What it MUST do is stop a run reading as complete while substituting.
+	// Wiring <Bounds> into AggGeom stays registered as expansion (#40); this is its repair half.
+	const int32 CollisionFromRenderMesh = (NumChildren == 0) ? 1 : 0;
+	const int32 CollisionPrimitives = NumChildren;
 	if (NumChildren == 0)
 	{
 		Children += EmitBVHChild(CVerts, CIdx);   // no simple collision -> exact whole-mesh BVH
@@ -1708,10 +1722,15 @@ FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlP
 	// is the old behaviour for EVERY slot; reporting the count is what stops a lossy export from
 	// looking identical to a lossless one. A non-zero value here means the round trip is not yet
 	// lossless for this mesh.
+	// collisionFromRenderMesh 1 = this asset shipped collision RE-DERIVED FROM ITS RENDER MESH
+	// because it had no AggGeom (see the block above; open item #40). collisionPrimitives is the
+	// count that came from real UE collision primitives instead - the two are exclusive.
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"xmlPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,")
-		TEXT("\"renderBucketUnrecovered\":%d}"),
-		*OutXmlPath, OutGeos.Num(), TotalVerts, TotalTris, BucketUnrecovered);
+		TEXT("\"renderBucketUnrecovered\":%d,\"collisionPrimitives\":%d,")
+		TEXT("\"collisionFromRenderMesh\":%d}"),
+		*OutXmlPath, OutGeos.Num(), TotalVerts, TotalTris, BucketUnrecovered,
+		CollisionPrimitives, CollisionFromRenderMesh);
 }
 
 FString URudeToolset::Ping()
@@ -1724,13 +1743,20 @@ FString URudeToolset::Ping()
 // root or a <Fragment>'s inner <Drawable> (both via ImportYdr), or a <DrawableDictionary>
 // <Item> (ImportYddEntry) - anything carrying ShaderGroup + DrawableModelsHigh children.
 // MeshName is the ASSET name, decided by the CALLER (file stem, <Name>, or dictionary entry).
-// TextureScope ◑ = the archetype's <textureDictionary>, if the caller knows it. Empty means
-// "no scope", which is what both public entry points pass today - see the TexturesByName block
-// for the measurement that says wiring it is worth doing (exact scoping 20.07% -> 68.54%).
+// TextureScope = the archetype's <textureDictionary>, when the caller knows it. ✅ WIRED
+// 2026-08-05 (#43): BuildCorpusArchetypeIndex now carries it and ImportIndexedDrawable /
+// ImportYdrBatch pass it. Empty still means "no scope" - the two BlueprintCallable entry points
+// ImportYdr/ImportYddEntry keep their signatures and pass empty, because a single-file call has no
+// archetype to read one off. See the TexturesByName block for the measurement.
 static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName,
                                   const FString& DestFolder, const FString& TextureScope = FString());
 
-FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolder)
+// The body of ImportYdr, plus the texture SCOPE the public UFUNCTION has no parameter for.
+// Callers that hold an archetype (the map/MLO lane, and ImportYdrBatch when given a CorpusRoot)
+// come through here; URudeToolset::ImportYdr forwards with an empty scope, which is exactly the
+// pre-2026-08-05 behaviour, so the single-file tool is byte-identical to what it was.
+static FString RudeImportYdrScoped(const FString& XmlPath, const FString& DestFolder,
+                                   const FString& TextureScope)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -1778,7 +1804,12 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 		}
 	}
 
-	return ImportDrawableNode(Root, Name, DestFolder);
+	return ImportDrawableNode(Root, Name, DestFolder, TextureScope);
+}
+
+FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolder)
+{
+	return RudeImportYdrScoped(XmlPath, DestFolder, FString());
 }
 
 static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName,
@@ -2053,18 +2084,34 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	//      of all references exactly, and it is exact BY CONSTRUCTION - that dictionary was carved
 	//      out of this very drawable.
 	//   2. otherwise, if the name exists in exactly one dictionary, take it (8.63% of references).
-	//   3. otherwise take the lexicographically first candidate and ++AmbiguousTextures. Not
+	//   3. otherwise take the lexicographically first candidate and ++TexturesTieBroken. Not
 	//      correct - DETERMINISTIC, which is the property a screenshot needs. The counter is what
 	//      makes the residual sayable instead of assumed.
-	// ◑ THE REAL FIX NEEDS ONE PIECE OF DATA THIS FUNCTION IS NOT GIVEN: the archetype's
-	// <textureDictionary>. MEASURED against 1,500 drawables that have an archetype (16,827
-	// references): the archetype txd + its +hi/+hidr variants resolve 48.47% of references, so
-	// embedded-first + archetype-scope would take EXACT scoping from 20.07% to 68.54%, leaving
-	// 31.46% for RAGE's parent-txd chain. TextureScope below is the hook: BuildCorpusArchetypeIndex
-	// already parses <textureDictionary> off every archetype it walks, and ImportIndexedDrawable
-	// already holds the archetype - wiring it is one field on FRudeArchetypeIndex and one argument.
-	// Deliberately NOT done here because this function has no caller that can supply it yet, and a
-	// parameter nothing sets is honest only if it is labelled.
+	// ✅ STEP 2b IS NOW WIRED (2026-08-05, open item #43). WHAT WAS WRONG, MEASURED: the 08-05
+	// 400-drawable run bound 2,495 textures of which 2,390 (95.8%) fell to step 3 - the project
+	// holds 22,405 distinct texture names with 8,791 present in more than one dictionary, so nearly
+	// every bind on nearly every asset was a lexicographic guess nothing had proven right. And it
+	// was INVISIBLE to the counter everyone reads: a wrong pick still binds *a* texture, so
+	// missingTextures stays 0. That is the "wrong property tested" shape - missingTextures 0 says a
+	// texture was FOUND, never that it was the RIGHT one.
+	// The fix is scope, not refusal (refusing at this scale would drop 76.5% of all binds and
+	// render the city untextured - see the warning above). BuildCorpusArchetypeIndex already walked
+	// every archetype; it now also records <textureDictionary>, ImportIndexedDrawable and
+	// ImportYdrBatch pass it as TextureScope, and the lookup below prefers a candidate from that
+	// dictionary (and its +hi/+hidr/+hidd variants) BEFORE the tie-break. This is the hook the
+	// previous comment described, taken rather than invented - the __embedded lane is the same
+	// idea one dictionary earlier. PREDICTED from the corpus: archetype txd + variants satisfy
+	// 48.47% of references on drawables that have an archetype, so embedded-first + archetype-scope
+	// should take exact scoping from 20.07% toward ~68.5%, leaving RAGE's parent-txd chain.
+	// ⛔ THE COUNTER IS SPLIT so the residual stays measurable and cannot be optimised away:
+	//   texturesResolvedScoped - the name was ambiguous and a SCOPE (own __embedded txd, or the
+	//                            archetype's declared txd) chose the winner. Provenance, not luck.
+	//   texturesTieBroken      - the name was ambiguous, no scope matched, lexicographic pick.
+	//                            THIS is #43's residual; it is the number to drive to zero.
+	// Their sum is every ambiguous bind. texturesFromEmbedded stays as the __embedded SUBSET of
+	// scoped, and ambiguousTextures is KEPT, unchanged in meaning (== texturesTieBroken), purely so
+	// the pre-fix 2,390 stays directly comparable to a post-fix run. Two spellings of one number is
+	// a smell; silently redefining a figure the register quotes is worse.
 	TMap<FString, TArray<FAssetData>> TexturesByName;
 	{
 		FAssetRegistryModule& ARM =
@@ -2180,16 +2227,20 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		return Path.FindLastChar(TEXT('/'), Slash) ? Path.RightChop(Slash + 1).ToLower() : Path.ToLower();
 	};
 	const FString EmbeddedDict = (MeshName + TEXT("__embedded")).ToLower();
-	// ◑ Wired to nothing yet - see the block comment on TexturesByName. When ImportIndexedDrawable
-	// can pass the archetype's <textureDictionary>, these four spellings are the scope to try.
+	// ✅ FED 2026-08-05 (#43). The four spellings are the archetype's declared <textureDictionary>
+	// and RAGE's high-detail siblings: a prop's textures routinely live in "<txd>+hi" while the
+	// archetype names the base, so scoping to the bare name alone would miss the very dictionary
+	// the asset ships with. Order is deliberate - base first, then +hi/+hidr/+hidd - so the scope
+	// is still a total order and the pick stays reproducible run to run.
 	TArray<FString> ScopeDicts;
 	if (!TextureScope.IsEmpty())
 	{
 		const FString S = TextureScope.ToLower();
 		ScopeDicts = { S, S + TEXT("+hi"), S + TEXT("+hidr"), S + TEXT("+hidd") };
 	}
-	int32 AmbiguousTextures = 0;
-	int32 TexturesFromEmbedded = 0;
+	int32 TexturesTieBroken = 0;      // ambiguous, NO scope matched -> lexicographic. #43's residual.
+	int32 TexturesResolvedScoped = 0; // ambiguous, resolved BY SCOPE (embedded or archetype txd)
+	int32 TexturesFromEmbedded = 0;   // the __embedded SUBSET of TexturesResolvedScoped
 	auto FindTexture = [&](const FString& TexName) -> UTexture2D*
 	{
 		if (TexName.IsEmpty())
@@ -2203,6 +2254,9 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		}
 		if (Cands->Num() == 1)
 		{
+			// Not ambiguous at all: one dictionary in the whole project holds this name, so no rule
+			// had to choose and neither counter moves. Counting this as "scoped" would inflate the
+			// fix with binds it had nothing to do with.
 			return Cast<UTexture2D>((*Cands)[0].GetAsset());
 		}
 		for (const FAssetData& AD : *Cands)
@@ -2210,6 +2264,7 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 			if (DictOf(AD) == EmbeddedDict)
 			{
 				++TexturesFromEmbedded;
+				++TexturesResolvedScoped;
 				return Cast<UTexture2D>(AD.GetAsset());
 			}
 		}
@@ -2217,12 +2272,16 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		{
 			for (const FAssetData& AD : *Cands)
 			{
-				if (DictOf(AD) == S) { return Cast<UTexture2D>(AD.GetAsset()); }
+				if (DictOf(AD) == S)
+				{
+					++TexturesResolvedScoped;
+					return Cast<UTexture2D>(AD.GetAsset());
+				}
 			}
 		}
 		// Deterministic, not correct. The counter is the whole point: without it an
 		// import-order-dependent bind was indistinguishable from an exact one.
-		++AmbiguousTextures;
+		++TexturesTieBroken;
 		return Cast<UTexture2D>((*Cands)[0].GetAsset());
 	};
 
@@ -2552,7 +2611,8 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		TEXT("{\"ok\":%s,\"assetPath\":\"%s\",\"geometries\":%d,\"geometriesDropped\":%d,")
 		TEXT("\"geometryErrors\":[%s],\"geometriesWithoutUV\":%d,\"vertices\":%d,\"triangles\":%d,")
 		TEXT("\"trianglesOutOfRange\":%d,\"trianglesDegenerate\":%d,")
-		TEXT("\"boundTextures\":%d,\"texturesFromEmbedded\":%d,\"ambiguousTextures\":%d,")
+		TEXT("\"boundTextures\":%d,\"texturesFromEmbedded\":%d,\"texturesResolvedScoped\":%d,")
+		TEXT("\"texturesTieBroken\":%d,\"ambiguousTextures\":%d,")
 		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
 		TEXT("\"unmappedSamplers\":%d,\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
 		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,")
@@ -2560,7 +2620,8 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		bMeshOk ? TEXT("true") : TEXT("false"),
 		*PackageName, Geos.Num(), GeosFailed, *GeoErrors, GeometriesWithoutUV, TotalVerts, TotalTris,
 		TrisOutOfRange, TrisDegenerate,
-		BoundTextures, TexturesFromEmbedded, AmbiguousTextures,
+		BoundTextures, TexturesFromEmbedded, TexturesResolvedScoped,
+		TexturesTieBroken, TexturesTieBroken,
 		UnsupportedByMaster, MissingTextures, UnmappedSamplers,
 		SlotsWithoutShaderDef, SlotsWithoutMaterial,
 		ValueParamsSeen, ValueParamsBound, ValueParamsUnsupported, ValueParamsDeduped, *SlotsJson);
@@ -2598,8 +2659,11 @@ static uint32 RudeJoaat(const FString& Name)
 	return H;
 }
 
-FString URudeToolset::ImportYddEntry(const FString& XmlPath, const FString& EntryName,
-                                     const FString& DestFolder)
+// ImportYddEntry's body plus the texture scope, mirroring RudeImportYdrScoped - the dictionary
+// lane resolves its archetype the same way the drawable lane does, and letting the two diverge is
+// how one of them silently keeps guessing (2026-08-05, #43).
+static FString RudeImportYddEntryScoped(const FString& XmlPath, const FString& EntryName,
+                                        const FString& DestFolder, const FString& TextureScope)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -2668,7 +2732,13 @@ FString URudeToolset::ImportYddEntry(const FString& XmlPath, const FString& Entr
 	}
 	// The ENTRY name becomes the asset name - it is the archetype-facing identity; the item's
 	// own <Name> is usually an unresolvable hash_ spelling of the same thing.
-	return ImportDrawableNode(Found, Entry, DestFolder);
+	return ImportDrawableNode(Found, Entry, DestFolder, TextureScope);
+}
+
+FString URudeToolset::ImportYddEntry(const FString& XmlPath, const FString& EntryName,
+                                     const FString& DestFolder)
+{
+	return RudeImportYddEntryScoped(XmlPath, EntryName, DestFolder, FString());
 }
 
 // Translucent sea material - a reference surface, deliberately simple (no waves/refraction;
@@ -3184,6 +3254,13 @@ struct FRudeArchetypeIndex
 	// is how the game shows lit windows after dusk - by swapping which archetype is visible, not by
 	// changing a material. Captured so the behaviour can be driven in UE and still round-trip.
 	TMap<FString, uint32> ArchTimeFlags;  // lowercase archetype name -> hour mask
+	// ⭐ 2026-08-05 (#43): the archetype's declared <textureDictionary>, keyed by the DRAWABLE ASSET
+	// the archetype resolves to - which is the key ImportIndexedDrawable and ImportYdrBatch have in
+	// hand. This is the ONLY place the shared-txd scope exists: a .ydr.xml declares its EMBEDDED
+	// dictionary and nothing else, so without walking the ytyp there is no way for the importer to
+	// know which of 8,791 multi-dictionary names it is supposed to want. The walk already parses
+	// every archetype once; this is one more FindChildNode on data already in memory.
+	TMap<FString, FString> AssetTxd;      // lowercase drawable asset -> lowercase texture dictionary
 };
 
 // Optional MLO lookup riding the index walk: the walk already parses every ytyp once, and a
@@ -3206,6 +3283,25 @@ struct FRudeMloSearch
 static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeIndex& Out,
                                       FString& Error, FRudeMloSearch* MloSearch)
 {
+	// One archetype's texture dictionary, recorded against the asset it resolves to. Two archetypes
+	// CAN name the same asset with different dictionaries (a DLC re-texturing a base prop is the
+	// common case), so the tie is broken lexicographically rather than by which ytyp the file
+	// enumerator happened to reach first - the same determinism law the sorted candidate list in
+	// ImportDrawableNode exists for. A machine-dependent scope would be worse than no scope: it
+	// would make a material screenshot non-reproducible again.
+	auto NoteTxd = [&Out](const FString& Key, const FXmlNode* Item)
+	{
+		const FXmlNode* TxdN = Item->FindChildNode(TEXT("textureDictionary"));
+		if (!TxdN) { return; }
+		const FString Txd = TxdN->GetContent().TrimStartAndEnd().ToLower();
+		if (Txd.IsEmpty()) { return; }
+		if (FString* Existing = Out.AssetTxd.Find(Key))
+		{
+			if (Txd < *Existing) { *Existing = Txd; }
+			return;
+		}
+		Out.AssetTxd.Add(Key, Txd);
+	};
 	TArray<FString> YtypFiles;
 	IFileManager::Get().FindFiles(YtypFiles, *(CorpusRoot / TEXT("ytyp") / TEXT("*.xml")), true, false);
 	for (const FString& F : YtypFiles)
@@ -3276,10 +3372,12 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 				// name-based mesh lookup works unchanged
 				Out.ArchToAsset.Add(ArchLower, ArchLower);
 				Out.DictEntries.Add(ArchLower, Dict);
+				NoteTxd(ArchLower, Item);   // dictionary lane keys on the ENTRY name
 				continue;
 			}
 			const FString AssetLower = AssetN->GetContent().TrimStartAndEnd().ToLower();
 			Out.ArchToAsset.Add(ArchLower, AssetLower);
+			NoteTxd(AssetLower, Item);
 			if (bFragmentArch) { Out.FragmentAssets.Add(AssetLower); }
 		}
 	}
@@ -3288,9 +3386,12 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 		Error = TEXT("no archetypes indexed - check CorpusRoot/ytyp");
 		return false;
 	}
+	// The texture-scope count is reported because an index that silently carried ZERO dictionaries
+	// would make the #43 scoping a no-op that still looks wired - the exact shape of a gate that
+	// cannot fail. A number here is what tells the next reader the scope actually arrived.
 	UE_LOG(LogTemp, Display,
-		TEXT("[RUDE] archetype index: %d (fragment %d, dictionary-entry %d)"),
-		Out.ArchToAsset.Num(), Out.FragmentAssets.Num(), Out.DictEntries.Num());
+		TEXT("[RUDE] archetype index: %d (fragment %d, dictionary-entry %d, with textureDictionary %d)"),
+		Out.ArchToAsset.Num(), Out.FragmentAssets.Num(), Out.DictEntries.Num(), Out.AssetTxd.Num());
 	return true;
 }
 
@@ -3307,6 +3408,7 @@ struct FRudeImportTally
 {
 	int32 GeosDropped = 0, GeosNoUV = 0, TrisOutOfRange = 0, TrisDegenerate = 0;
 	int32 Bound = 0, FromEmbedded = 0, Ambiguous = 0, Unsupported = 0, MissingTex = 0;
+	int32 Scoped = 0, TieBroken = 0;   // #43 split: provenance vs lexicographic guess
 	int32 UnmappedSamp = 0, NoShaderDef = 0, NoMaterial = 0;
 	int32 ValSeen = 0, ValBound = 0, ValUnsupported = 0, ValDeduped = 0;
 
@@ -3319,6 +3421,8 @@ struct FRudeImportTally
 		Bound          += RudeSumField(R, TEXT("boundTextures"));
 		FromEmbedded   += RudeSumField(R, TEXT("texturesFromEmbedded"));
 		Ambiguous      += RudeSumField(R, TEXT("ambiguousTextures"));
+		Scoped         += RudeSumField(R, TEXT("texturesResolvedScoped"));
+		TieBroken      += RudeSumField(R, TEXT("texturesTieBroken"));
 		Unsupported    += RudeSumField(R, TEXT("unsupportedByMaster"));
 		MissingTex     += RudeSumField(R, TEXT("missingTextures"));
 		UnmappedSamp   += RudeSumField(R, TEXT("unmappedSamplers"));
@@ -3335,11 +3439,13 @@ struct FRudeImportTally
 		return FString::Printf(
 			TEXT("\"geometriesDropped\":%d,\"geometriesWithoutUV\":%d,\"trianglesOutOfRange\":%d,")
 			TEXT("\"trianglesDegenerate\":%d,\"boundTextures\":%d,\"texturesFromEmbedded\":%d,")
+			TEXT("\"texturesResolvedScoped\":%d,\"texturesTieBroken\":%d,")
 			TEXT("\"ambiguousTextures\":%d,\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
 			TEXT("\"unmappedSamplers\":%d,\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
 			TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,\"valueParamsUnsupported\":%d,")
 			TEXT("\"valueParamsDeduped\":%d"),
-			GeosDropped, GeosNoUV, TrisOutOfRange, TrisDegenerate, Bound, FromEmbedded, Ambiguous,
+			GeosDropped, GeosNoUV, TrisOutOfRange, TrisDegenerate, Bound, FromEmbedded,
+			Scoped, TieBroken, Ambiguous,
 			Unsupported, MissingTex, UnmappedSamp, NoShaderDef, NoMaterial,
 			ValSeen, ValBound, ValUnsupported, ValDeduped);
 	}
@@ -3373,8 +3479,13 @@ static void ImportIndexedDrawable(const FString& CorpusRoot, const FRudeArchetyp
 		++MeshSkip;
 		return;
 	}
-	const FString R = Dict ? URudeToolset::ImportYddEntry(XmlPath, Drawable, DestMeshFolder)
-	                       : URudeToolset::ImportYdr(XmlPath, DestMeshFolder);
+	// ✅ #43: hand the unit the archetype's declared <textureDictionary>. Empty when this asset has
+	// no archetype txd in the corpus, which is the old behaviour - the counters below say how often
+	// that happens instead of leaving it to be assumed.
+	const FString* ScopeTxd = Index.AssetTxd.Find(Drawable);
+	const FString Scope = ScopeTxd ? *ScopeTxd : FString();
+	const FString R = Dict ? RudeImportYddEntryScoped(XmlPath, Drawable, DestMeshFolder, Scope)
+	                       : RudeImportYdrScoped(XmlPath, DestMeshFolder, Scope);
 	// Accumulate on BOTH paths: a mesh that came back ok:false because every slot fell to
 	// WorldGridMaterial still reports the counters that say WHY, and throwing them away because
 	// of the boolean is how this got lost the first time.
@@ -4642,7 +4753,7 @@ FString URudeToolset::ExportYmap(const FString& EntitiesJsonPath, const FString&
 }
 
 FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& DestFolder,
-                                     const FString& Mode)
+                                     const FString& Mode, const FString& CorpusRoot)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -4654,6 +4765,30 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		return Fail(TEXT("cannot read list file"));
 	}
 	const bool bForce = Mode.TrimStartAndEnd().Equals(TEXT("FORCE"), ESearchCase::IgnoreCase);
+	// ⭐ CorpusRoot is OPTIONAL and NEW (2026-08-05, #43). This batch takes a list of absolute XML
+	// paths and has no archetype - which is exactly why the 08-05 400-drawable run tie-broke 95.8%
+	// of its texture binds. Given a corpus root it builds the SAME archetype index the map lane
+	// builds and scopes each file's textures by its archetype's declared <textureDictionary>.
+	// Left empty it behaves exactly as before, so no existing 3-argument caller changes meaning:
+	// FRudeInvoke::Call performs no arity check and pads a missing trailing argument with an empty
+	// FString (the same property that let ImportMapArea gain Mode).
+	// ⛔ Deliberately NOT derived from the list paths. Guessing "..\..\" off the first line would
+	// silently point at whatever happened to be two directories up and produce a scope nobody
+	// asked for - and a wrong scope is a wrong texture, which is the defect this fixes.
+	FRudeArchetypeIndex ScopeIndex;
+	bool bHaveScope = false;
+	if (!CorpusRoot.TrimStartAndEnd().IsEmpty())
+	{
+		FString IndexErr;
+		if (!BuildCorpusArchetypeIndex(CorpusRoot, ScopeIndex, IndexErr, /*MloSearch*/ nullptr))
+		{
+			// REFUSE, do not carry on unscoped. A CorpusRoot was passed on purpose; silently
+			// ignoring it would report the pre-fix numbers under a post-fix command line.
+			return Fail(FString::Printf(TEXT("CorpusRoot given but the archetype index failed: %s"),
+				*IndexErr));
+		}
+		bHaveScope = true;
+	}
 	int32 Imported = 0, Skipped = 0, Failed = 0;
 	// ⛔ THE BATCH USED TO THROW THESE AWAY, and that is why "did the rebind work?" was
 	// unanswerable after 4,956 files ran with ok:true (2026-07-29). Every file reported its own
@@ -4672,6 +4807,8 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	int32 GeosDropped = 0, GeoErrors = 0, GeosNoUV = 0;
 	int32 TrisOOR = 0, TrisDegen = 0;
 	int32 FromEmbedded = 0, Ambiguous = 0, NoShaderDef = 0, NoMaterial = 0;
+	int32 Scoped = 0, TieBroken = 0;      // #43 split
+	int32 FilesWithScope = 0;             // files whose archetype named a textureDictionary
 	FString FailedFiles;
 	for (int32 i = 0; i < Lines.Num(); ++i)
 	{
@@ -4687,7 +4824,19 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 			++Skipped;
 			continue;
 		}
-		const FString R = ImportYdr(Path, DestFolder);
+		// The list names <drawable>.ydr.xml, and the archetype index is keyed on the drawable
+		// assetName - the same join ImportIndexedDrawable makes, so the two lanes cannot disagree
+		// about which dictionary a mesh belongs to.
+		FString Scope;
+		if (bHaveScope)
+		{
+			if (const FString* Txd = ScopeIndex.AssetTxd.Find(Base.ToLower()))
+			{
+				Scope = *Txd;
+				++FilesWithScope;
+			}
+		}
+		const FString R = RudeImportYdrScoped(Path, DestFolder, Scope);
 		// ⚠ Counters are read on BOTH paths, matching FRudeImportTally. Since ImportYdr's ok is now
 		// computed (slotsWithoutMaterial), a mesh can come back ok:false while still carrying the
 		// counters that explain WHY - and a hard failure carries none of them, so they read 0.
@@ -4706,6 +4855,8 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		TrisDegen      += RudeSumField(R, TEXT("trianglesDegenerate"));
 		FromEmbedded   += RudeSumField(R, TEXT("texturesFromEmbedded"));
 		Ambiguous      += RudeSumField(R, TEXT("ambiguousTextures"));
+		Scoped         += RudeSumField(R, TEXT("texturesResolvedScoped"));
+		TieBroken      += RudeSumField(R, TEXT("texturesTieBroken"));
 		NoShaderDef    += RudeSumField(R, TEXT("slotsWithoutShaderDef"));
 		NoMaterial     += RudeSumField(R, TEXT("slotsWithoutMaterial"));
 		// geometryErrors is a JSON ARRAY, so it cannot be summed - count the FILES that carry a
@@ -4742,12 +4893,13 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	UE_LOG(LogTemp, Display,
 		TEXT("[RUDE] ImportYdrBatch DONE: %d imported, %d skipped, %d failed | geometries dropped %d "
 		     "(%d files explained), no-UV %d | triangles out-of-range %d, degenerate %d | textures "
-		     "bound %d (embedded-scoped %d, ambiguous %d), unsupportedByMaster %d, missing %d, "
-		     "unmappedSamplers %d | slots without shader def %d, without material %d | value params "
+		     "bound %d (embedded-scoped %d, scope-resolved %d, tie-broken %d), unsupportedByMaster "
+		     "%d, missing %d, unmappedSamplers %d | %d files carried an archetype textureDictionary "
+		     "| slots without shader def %d, without material %d | value params "
 		     "seen %d = bound %d + unsupported %d + deduped %d"),
 		Imported, Skipped, Failed, GeosDropped, GeoErrors, GeosNoUV, TrisOOR, TrisDegen,
-		Bound, FromEmbedded, Ambiguous, Unsupported, MissingTex, UnmappedSamp,
-		NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped);
+		Bound, FromEmbedded, Scoped, TieBroken, Unsupported, MissingTex, UnmappedSamp,
+		FilesWithScope, NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped);
 	// ⛔ `ok` IS COMPUTED, NEVER HARDCODED (fixed 2026-08-05). It used to be the literal `true`, so a
 	// batch in which EVERY file failed returned `"ok":true,"failed":400` and the commandlet exited 0.
 	// Measured, not theorised: a shell-quoting bug produced 400 non-existent paths, and no automated
@@ -4764,14 +4916,16 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		TEXT("{\"ok\":%s,\"imported\":%d,\"skipped\":%d,\"failed\":%d,")
 		TEXT("\"geometriesDropped\":%d,\"filesWithGeometryErrors\":%d,\"geometriesWithoutUV\":%d,")
 		TEXT("\"trianglesOutOfRange\":%d,\"trianglesDegenerate\":%d,\"boundTextures\":%d,")
-		TEXT("\"texturesFromEmbedded\":%d,\"ambiguousTextures\":%d,")
+		TEXT("\"texturesFromEmbedded\":%d,\"texturesResolvedScoped\":%d,\"texturesTieBroken\":%d,")
+		TEXT("\"filesWithArchetypeTxd\":%d,\"ambiguousTextures\":%d,")
 		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,\"unmappedSamplers\":%d,")
 		TEXT("\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
 		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,\"valueParamsUnsupported\":%d,")
 		TEXT("\"valueParamsDeduped\":%d,\"failedFiles\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"),
 		Imported, Skipped, Failed, GeosDropped, GeoErrors, GeosNoUV, TrisOOR, TrisDegen,
-		Bound, FromEmbedded, Ambiguous, Unsupported, MissingTex, UnmappedSamp,
+		Bound, FromEmbedded, Scoped, TieBroken, FilesWithScope, Ambiguous,
+		Unsupported, MissingTex, UnmappedSamp,
 		NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped, *FailedFiles);
 }
 
@@ -5394,11 +5548,48 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 	// unknownLodLevel is a FLAG, not a partition: an entity with an unrecognisable tier is also
 	// counted in filteredByLod (it is not HD, so the default filter drops it). The partition that
 	// closes is entitiesInManifest == entities + filteredByLod + malformedEntities.
+	// ⛔ `ok` IS COMPUTED, NEVER HARDCODED (fixed 2026-08-05, open item #44 - the same class as
+	// ImportYdrBatch/ImportYtdBatch/ExportYdrBinaryBatch in 65248c2, but this one needed a SEMANTICS
+	// decision first because it counts two failures that mean opposite things. #42's rule was
+	// deliberately NOT copied here; what follows is that decision, and it is MINE - the agent's -
+	// not Matt's. He was never asked and never ruled on it.
+	//
+	// This function is the SPAWN. ImportMapArea forwards its verdict through
+	// `bSpawnOk = !Spawn.Contains("\"ok\":false")`, so whatever is decided here is also the map
+	// lane's gate; getting it wrong reddens or greens the whole import tool.
+	//
+	//   malformedEntities > 0  ->  FALSE. An entity the tool could not parse - not a JSON object at
+	//     all, or missing/short ue_location or ue_quat - is the tool meeting input it does not
+	//     understand, and this codebase REFUSES rather than defaults (the same rule that made
+	//     ExportYmap reject an empty <archetypeName> instead of placing it at the origin, #23).
+	//     The entity is DROPPED: it is in entitiesInManifest and in nothing else, so the scene is
+	//     silently short by exactly that many placements. MEASURED shape of the risk: 0 of 33,973
+	//     entities in the emitted corpus are malformed today (INTERCHANGE_CONTRACT re-census,
+	//     2026-08-05), so this gate costs nothing on healthy data and fires only when the ymap
+	//     emitter or the manifest writer has actually broken - which is precisely when a headless
+	//     run must stop instead of scoring 0.
+	//
+	//   missingMeshes  ->  DOES NOT GATE. It is a CORPUS gap, not a tool failure: the drawable was
+	//     never converted, or its lane was never extracted. #37 measures corpus texture/mesh
+	//     availability at 41.4% overall and wildly per lane (ydr 14.2% unavailable, ydd 63.3%,
+	//     yft 74.6%), so gating on it would make EVERY honest run red, and a gate that fires on
+	//     every run is a gate nobody reads - the same reasoning that keeps missingPixels out of
+	//     ImportYtdBatch's ok and meshesMissingFromCorpus out of ImportMapArea's. The number stays
+	//     loud (missingMeshes + topMissing), which is where a corpus gap belongs.
+	//
+	//   ZERO WORK  ->  FALSE. `ymaps` counts ymaps that actually produced an actor and `entities`
+	//     the placements that survived the LOD filter; if either is 0 nothing was placed, and a
+	//     manifest that spawned an empty level must not report success. PRESENCE IS NOT COVERAGE -
+	//     a gate that cannot fail is worse than no gate (ENGINEERING_LOG "MEASUREMENT LAWS").
+	//     Note this also catches the case a filter typo produces: every entity filtered out by LOD,
+	//     nothing spawned, previously ok:true.
+	const bool bOk = (MalformedEntities == 0) && (NumYmaps > 0) && (NumEntities > 0);
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"ymaps\":%d,\"entitiesInManifest\":%d,\"entities\":%d,")
+		TEXT("{\"ok\":%s,\"ymaps\":%d,\"entitiesInManifest\":%d,\"entities\":%d,")
 		TEXT("\"filteredByLod\":%d,\"unknownLodLevel\":%d,\"emptyLodLevel\":%d,")
 		TEXT("\"malformedEntities\":%d,\"instances\":%d,\"proxies\":%d,")
 		TEXT("\"uniqueMeshes\":%d,\"uniqueMeshLookups\":%d,\"missingMeshes\":%d,\"topMissing\":[%s]}"),
+		bOk ? TEXT("true") : TEXT("false"),
 		NumYmaps, EntitiesInManifest, NumEntities, FilteredByLod, UnknownLodLevel, EmptyLodLevel,
 		MalformedEntities, NumInstances, NumProxies,
 		UniqueMeshes, UniqueMeshLookups, Missing.Num(), *TopMissing);
@@ -6480,6 +6671,10 @@ FString URudeToolset::ExportYdrBinaryBatch(const FString& AssetFolder, const FSt
 	IFileManager::Get().MakeDirectory(*OutDir, true);
 
 	int32 Exported = 0, Failed = 0;
+	// #40: the batch must carry the unit's declared collision gap, or a 400-asset export reads as
+	// complete while every one of them shipped collision re-derived from its render mesh. A skip
+	// with no counter is indistinguishable from "nothing to do" (standing trap 4).
+	int32 CollisionFromRenderMesh = 0, BoundsIgnored = 0;
 	int64 Bytes = 0;
 	FString FailedList;
 	for (int32 i = 0; i < AssetPaths.Num(); ++i)
@@ -6488,6 +6683,8 @@ FString URudeToolset::ExportYdrBinaryBatch(const FString& AssetFolder, const FSt
 		const FString Name = FPaths::GetBaseFilename(A);
 		const FString Out = OutDir / (Name + TEXT(".ydr"));
 		const FString R = ExportYdrBinary(A, Out);
+		CollisionFromRenderMesh += RudeSumField(R, TEXT("collisionFromRenderMesh"));
+		BoundsIgnored           += RudeSumField(R, TEXT("boundsIgnored"));
 		if (R.Contains(TEXT("\"ok\":true")))
 		{
 			++Exported;
@@ -6509,16 +6706,24 @@ FString URudeToolset::ExportYdrBinaryBatch(const FString& AssetFolder, const FSt
 		}
 	}
 	UE_LOG(LogTemp, Display,
-		TEXT("[RUDE] ExportYdrBinaryBatch DONE: %d exported, %d failed, %.1f MB"),
-		Exported, Failed, Bytes / 1048576.0);
+		TEXT("[RUDE] ExportYdrBinaryBatch DONE: %d exported, %d failed, %.1f MB | collision "
+		     "re-derived from the render mesh on %d of them, %d authored UE collision primitives "
+		     "ignored"),
+		Exported, Failed, Bytes / 1048576.0, CollisionFromRenderMesh, BoundsIgnored);
 	// ⛔ Computed, not hardcoded - same class as ImportYdrBatch (fixed 2026-08-05). A batch that
 	// exported nothing and failed everything must not report success to a headless caller.
+	// collisionFromRenderMesh / boundsIgnored deliberately do NOT gate ok - they are the DECLARED
+	// GAP of #40 (there is no collision importer, so this is the writer's honest capability), and
+	// a gate that fires on every run is a gate nobody reads. They are here so no run can read as
+	// complete while substituting.
 	const bool bOk = (Failed == 0) && (Exported > 0);
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"considered\":%d,\"exported\":%d,\"failed\":%d,\"bytes\":%lld,")
+		TEXT("\"collisionFromRenderMesh\":%d,\"boundsIgnored\":%d,")
 		TEXT("\"outDir\":\"%s\",\"failedAssets\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"),
-		AssetPaths.Num(), Exported, Failed, Bytes, *OutDir, *FailedList);
+		AssetPaths.Num(), Exported, Failed, Bytes, CollisionFromRenderMesh, BoundsIgnored,
+		*OutDir, *FailedList);
 }
 
 FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath)
@@ -6623,6 +6828,25 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 
 	// --- collision soup (welded across all geometries) computed EARLY so the page plan
 	// can account for every block size before anything is emitted ---
+	// ⛔⛔ THE BINARY LANE RE-DERIVES COLLISION FROM THE RENDER MESH, ALWAYS - AND IT IS WORSE THAN
+	// THE XML LANE (measured by reading it, 2026-08-05, open item #40). The XML lane at least mirrors
+	// UE's AggGeom when there is one and only falls back on NumChildren == 0; the embedded
+	// phBoundComposite written below is built unconditionally from CV/CI, this render-mesh soup.
+	// It never reads UBodySetup at all. So a user who hand-authored box/sphere/capsule/convex
+	// collision in UE and exported a binary .ydr had that collision SILENTLY DISCARDED, with
+	// ok:true and no counter - the register described this as "NumChildren == 0 falls back", which
+	// is the XML lane's shape; here there is no condition to fall back FROM.
+	// ⇒ Counted, not gated: collisionFromRenderMesh is always 1 for this writer, and boundsIgnored
+	// says how many real UE collision primitives were thrown away. boundsIgnored > 0 means the
+	// export is lossy against the USER's own authoring, not just against Rockstar's - the number
+	// exists so that can never again be invisible. Honouring AggGeom here is expansion (#40).
+	int32 BoundsIgnored = 0;
+	if (const UBodySetup* BS = Mesh->GetBodySetup())
+	{
+		const FKAggregateGeom& Agg = BS->AggGeom;
+		BoundsIgnored = Agg.BoxElems.Num() + Agg.SphereElems.Num() + Agg.SphylElems.Num()
+		              + Agg.ConvexElems.Num();
+	}
 	TArray<FVector3f> CV; TArray<int32> CI;
 	{
 		TMap<FString, int32> W2;
@@ -7218,8 +7442,10 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"ydrPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"bytes\":%d,")
 		TEXT("\"segSize\":%d,\"sysFlags\":\"0x%08x\",\"selfCheck\":\"passed (single-ownership + ")
-		TEXT("geoBounds/count + declarations)\",\"presetsSubstitutedToNormalSpec\":[%s]}"),
-		*OutYdrPath, Geos.Num(), TotalVerts, TotalTris, Out.Num(), Seg.Num(), SysFlag, *SubList);
+		TEXT("geoBounds/count + declarations)\",\"collisionFromRenderMesh\":1,\"boundsIgnored\":%d,")
+		TEXT("\"presetsSubstitutedToNormalSpec\":[%s]}"),
+		*OutYdrPath, Geos.Num(), TotalVerts, TotalTris, Out.Num(), Seg.Num(), SysFlag,
+		BoundsIgnored, *SubList);
 #else
 	return Fail(TEXT("editor-only"));
 #endif
