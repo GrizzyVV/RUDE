@@ -242,9 +242,15 @@ triangle winding: passed through as-is (under the Y mirror, RAGE winding already
   faces outward in Unreal). The OBJ lane is the exception — reverse it there, because
   Unreal's OBJ importer adds its own flip.
 UVs: raw, both engines are V-down.
-rotations — TWO lanes, deliberately not unified, both pinned by in-game experiment:
-  EXPORT  (authoring for FiveM):  gta_quat = (-ue_x,  ue_y, -ue_z, ue_w)
-  IMPORT  (reading placement XML): ue_quat = ( gta_x, -gta_y, gta_z, gta_w)
+rotations — ONE map, both directions. A ymap <rotation> stores the entity's INVERSE
+  orientation, and the map is its own inverse:
+  EXPORT  (authoring for FiveM):  gta_quat = ( ue_x, -ue_y,  ue_z,  ue_w)
+  IMPORT  (reading placement XML): ue_quat = (gta_x, -gta_y, gta_z, gta_w)
+  (Corrected 2026-08-04: this described two DIFFERENT maps, so a UE→GTA→UE round trip
+   conjugated every rotation. Adjudicated over all 8,016 ymap against Rockstar's own
+   <entitiesExtents> with a no-rotation control: inverse reproduces them to 0.0002 m,
+   forward is 1.09 m out. A phBound CompositeTransform is the exception — it stores a
+   FORWARD matrix and keeps the pure mirror.)
 ```
 
 Details, and the reasoning behind each, live in [AGENTS.md](AGENTS.md).
