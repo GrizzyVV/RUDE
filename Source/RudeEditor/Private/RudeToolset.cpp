@@ -4748,8 +4748,20 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		Imported, Skipped, Failed, GeosDropped, GeoErrors, GeosNoUV, TrisOOR, TrisDegen,
 		Bound, FromEmbedded, Ambiguous, Unsupported, MissingTex, UnmappedSamp,
 		NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped);
+	// ⛔ `ok` IS COMPUTED, NEVER HARDCODED (fixed 2026-08-05). It used to be the literal `true`, so a
+	// batch in which EVERY file failed returned `"ok":true,"failed":400` and the commandlet exited 0.
+	// Measured, not theorised: a shell-quoting bug produced 400 non-existent paths, and no automated
+	// check could tell that run from a clean one - the CLI exit code is derived from `ok`, so the one
+	// gate a headless caller has was blind to total failure. Two conditions, both load-bearing:
+	//   Failed == 0            - any failure is a failure; `failedFiles` already names them.
+	//   Imported + Skipped > 0 - a run that did NOTHING is not a success. An all-skipped batch
+	//                            (nothing to re-import outside Mode=FORCE) IS legitimate, which is
+	//                            why Skipped counts as work done and Imported alone does not.
+	// Same law as `quarry regress --strict`: a gate that cannot fail is worse than no gate.
+	// See ENGINEERING_LOG "MEASUREMENT LAWS".
+	const bool bOk = (Failed == 0) && (Imported + Skipped > 0);
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"imported\":%d,\"skipped\":%d,\"failed\":%d,")
+		TEXT("{\"ok\":%s,\"imported\":%d,\"skipped\":%d,\"failed\":%d,")
 		TEXT("\"geometriesDropped\":%d,\"filesWithGeometryErrors\":%d,\"geometriesWithoutUV\":%d,")
 		TEXT("\"trianglesOutOfRange\":%d,\"trianglesDegenerate\":%d,\"boundTextures\":%d,")
 		TEXT("\"texturesFromEmbedded\":%d,\"ambiguousTextures\":%d,")
@@ -4757,6 +4769,7 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		TEXT("\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
 		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,\"valueParamsUnsupported\":%d,")
 		TEXT("\"valueParamsDeduped\":%d,\"failedFiles\":[%s]}"),
+		bOk ? TEXT("true") : TEXT("false"),
 		Imported, Skipped, Failed, GeosDropped, GeoErrors, GeosNoUV, TrisOOR, TrisDegen,
 		Bound, FromEmbedded, Ambiguous, Unsupported, MissingTex, UnmappedSamp,
 		NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped, *FailedFiles);
@@ -5148,11 +5161,17 @@ FString URudeToolset::ImportYtdBatch(const FString& ListPath, const FString& Des
 		     "usage outside DIFFUSE/NORMAL/SPECULAR %d, nameless items %d"),
 		Imported, Skipped, Failed, Declared, Textures, InvalidNames, MissingPixels,
 		UsageDefaulted, UsageUnknown, ItemsWithoutName);
+	// ⛔ Computed, not hardcoded - same class as ImportYdrBatch (fixed 2026-08-05).
+	// `missingPixels` deliberately does NOT gate `ok`: it is a CORPUS gap (a manifest whose PNGs were
+	// pruned), not a tool failure, and #37 measures it as 41.4% availability corpus-wide - failing on
+	// it would make every honest run red. `Failed` is the tool's own failure and does gate.
+	const bool bOk = (Failed == 0) && (Imported + Skipped > 0);
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"imported\":%d,\"texturesImported\":%d,\"texturesDeclared\":%d,")
+		TEXT("{\"ok\":%s,\"imported\":%d,\"texturesImported\":%d,\"texturesDeclared\":%d,")
 		TEXT("\"skipped\":%d,\"failed\":%d,\"invalidNames\":%d,\"missingPixels\":%d,")
 		TEXT("\"usageDefaulted\":%d,\"usageUnknown\":%d,\"itemsWithoutName\":%d,")
 		TEXT("\"failedFiles\":[%s]}"),
+		bOk ? TEXT("true") : TEXT("false"),
 		Imported, Textures, Declared, Skipped, Failed, InvalidNames, MissingPixels,
 		UsageDefaulted, UsageUnknown, ItemsWithoutName, *FailedFiles);
 }
@@ -6492,9 +6511,13 @@ FString URudeToolset::ExportYdrBinaryBatch(const FString& AssetFolder, const FSt
 	UE_LOG(LogTemp, Display,
 		TEXT("[RUDE] ExportYdrBinaryBatch DONE: %d exported, %d failed, %.1f MB"),
 		Exported, Failed, Bytes / 1048576.0);
+	// ⛔ Computed, not hardcoded - same class as ImportYdrBatch (fixed 2026-08-05). A batch that
+	// exported nothing and failed everything must not report success to a headless caller.
+	const bool bOk = (Failed == 0) && (Exported > 0);
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"considered\":%d,\"exported\":%d,\"failed\":%d,\"bytes\":%lld,")
+		TEXT("{\"ok\":%s,\"considered\":%d,\"exported\":%d,\"failed\":%d,\"bytes\":%lld,")
 		TEXT("\"outDir\":\"%s\",\"failedAssets\":[%s]}"),
+		bOk ? TEXT("true") : TEXT("false"),
 		AssetPaths.Num(), Exported, Failed, Bytes, *OutDir, *FailedList);
 }
 
