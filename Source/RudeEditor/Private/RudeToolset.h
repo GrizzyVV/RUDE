@@ -42,19 +42,41 @@ public:
 	// exactly whenever slotsWithoutMaterial == 0. It counts bind DECISIONS (per geometry),
 	// not distinct params in the file; the old spelling summed the whole shader table, which
 	// included 4.4% of params no geometry could ever reach.
-	// TEXTURE PROVENANCE, split 2026-08-05 (open item #43) because 95.8% of a 400-drawable run's
-	// binds were an unproven lexicographic tie-break that missingTextures cannot see (a wrong pick
-	// still binds *a* texture):
-	//   texturesResolvedScoped - the name was ambiguous and a SCOPE picked the winner: the
-	//     drawable's own __embedded dictionary, or the archetype's declared <textureDictionary>
-	//     (plus its +hi/+hidr/+hidd siblings). Provenance, not luck.
-	//   texturesTieBroken - the name was ambiguous, nothing scoped it, lexicographically first
-	//     candidate taken. Deterministic but NOT proven correct; this is the residual to drive down.
-	//   texturesFromEmbedded - the __embedded SUBSET of texturesResolvedScoped (kept: it is exact
-	//     by construction, that dictionary was carved out of this very drawable).
+	// TEXTURE PROVENANCE, split 2026-08-05 (open items #43 + #21b) because 95.8% of a 400-drawable
+	// run's binds were an unproven lexicographic tie-break that missingTextures cannot see (a wrong
+	// pick still binds *a* texture). The precedence and its rationale live on FRudeTextureScope in
+	// RudeToolset.cpp; the counters it produces are:
+	//   texturesAmbiguousTotal - every bind whose name had more than one candidate dictionary.
+	//     texturesResolvedScoped + texturesTieBroken == this, exactly. A checkable identity.
+	//   texturesFromEmbedded      (tier 1) the drawable's own __embedded dictionary - exact by
+	//     construction, that dictionary was carved out of this very drawable.
+	//   texturesFromArchetypeTxd  (tier 2) the archetype's declared <textureDictionary> (+ its
+	//     +hi/+hidr/+hidd siblings).
+	//   texturesFromParentTxd     (tier 3) RAGE's own fallback - the gtxd CMapParentTxds chain,
+	//     nearest ancestor first.
+	//   texturesFromYtypNeighbour (tier 4) a dictionary declared by another archetype in the SAME
+	//     ytyp, accepted ONLY when it narrows the candidates to exactly one.
+	//   texturesFromSameSlot      (tier 5) a candidate won from the SAME build slot as this asset
+	//     (_RESOLVED.json), again ONLY when unique.
+	//   texturesScopedAuthoritative = tiers 1-3, the engine's own lookup order. THE STRICT NUMBER.
+	//   texturesScopedProvenance    = tiers 4-5, corpus provenance rather than a RAGE rule.
+	//   texturesResolvedScoped      = the sum of all five. DERIVED, never a primitive.
+	//   texturesTieBroken - nothing scoped it; the narrowest available candidate list was taken
+	//     lexicographically. Deterministic but NOT proven correct: the residual to drive down.
+	//     Split by CAUSE, and the six sum to it exactly: tieBreakEmbeddedNotImported (the drawable
+	//     SHIPS this texture and its __embedded dictionary is not imported here - a corpus gap, not
+	//     an ambiguity), tieBreakNoScope (the caller had nothing to scope with - the control path),
+	//     tieBreakSlotAmbiguous / tieBreakYtypAmbiguous (that tier matched more than one candidate,
+	//     so it narrowed without selecting), tieBreakScopeDictAbsent (every dictionary the scope
+	//     names is absent from this project), tieBreakNameNotInScope (the scope is here and
+	//     genuinely does not hold this name).
 	//   ambiguousTextures - KEPT and unchanged in meaning (== texturesTieBroken) so the pre-fix
 	//     2,390/2,495 measurement stays directly comparable to any later run.
 	// A bind whose name exists in exactly ONE dictionary moves none of these: nothing had to choose.
+	// ⛔ Tiers 4-5 require UNIQUENESS on purpose. On the 400-drawable list the slot matches more
+	// than one candidate 350 times against 24 unique; accepting the non-unique hit would have moved
+	// 350 guesses into "scoped" without resolving one of them. Do not relax that to lower the
+	// tie-break count - that is scoring your own exam.
 	// ⭐ COLLISION IMPORT, added 2026-08-05 (open item #40). A drawable's embedded <Bounds> is now
 	// read into the asset's UBodySetup instead of being ignored:
 	//   Box / Sphere / Capsule -> FKBoxElem / FKSphereElem / FKSphylElem (simple collision)
@@ -120,18 +142,27 @@ public:
 	// hash-manifest resumability model, name-level) UNLESS Mode is "FORCE" - then every
 	// file reimports in place (rebinds MaterialInstances against currently-imported
 	// textures; the texture-pass re-bind flow). Progress goes to the log.
-	// CorpusRoot is OPTIONAL (added 2026-08-05, open item #43): the _resolved folder the list
-	// points into. Given one, the batch builds the archetype index and scopes each drawable's
-	// texture lookup to its archetype's declared <textureDictionary> instead of tie-breaking
-	// ambiguous names lexicographically; left empty the behaviour is unchanged. It is never
-	// inferred from the list paths - a guessed scope is a wrong texture.
+	// CorpusRoot is OPTIONAL (added 2026-08-05, open items #43 + #21b): the _resolved folder the
+	// list points into. Given one, the batch builds the archetype index - archetype
+	// <textureDictionary>, the gtxd CMapParentTxds chain, per-ytyp dictionary neighbourhoods and
+	// _RESOLVED.json's winning slot per file - and scopes each drawable's texture lookup with it
+	// instead of tie-breaking ambiguous names lexicographically. Left empty the behaviour is
+	// unchanged, which is also the do-nothing CONTROL any measurement of the scoping is scored
+	// against. It is never inferred from the list paths - a guessed scope is a wrong texture.
 	// Returns JSON: {ok, imported, skipped, failed, geometriesDropped,
 	// filesWithGeometryErrors, geometriesWithoutUV, trianglesOutOfRange,
 	// trianglesDegenerate, boundTextures, texturesFromEmbedded, texturesResolvedScoped,
-	// texturesTieBroken, filesWithArchetypeTxd, ambiguousTextures,
+	// texturesTieBroken, filesWithArchetypeTxd, ambiguousTextures, texturesAmbiguousTotal,
+	// texturesFromArchetypeTxd, texturesFromParentTxd, texturesFromYtypNeighbour,
+	// texturesFromSameSlot, texturesScopedAuthoritative, texturesScopedProvenance,
+	// tieBreakEmbeddedNotImported, tieBreakNoScope, tieBreakSlotAmbiguous, tieBreakYtypAmbiguous,
+	// tieBreakScopeDictAbsent, tieBreakNameNotInScope, filesWithParentChain, filesWithHashTxd,
+	// filesWithYtypSet, filesWithSlot, gtxdFiles, gtxdRelationships, gtxdRefused, resolvedEntries,
 	// unsupportedByMaster, missingTextures, unmappedSamplers, slotsWithoutShaderDef,
 	// slotsWithoutMaterial, valueParamsSeen, valueParamsBound, valueParamsUnsupported,
 	// valueParamsDeduped, failedFiles:[...first 30]}.
+	// gtxdRefused is load-bearing: a parent table that was MET and could not be parsed must never
+	// read the same as one that was never there.
 	// The batch now sums EVERY counter its unit reports; it used to sum seven and drop
 	// geometriesDropped/geometryErrors - the lost-geometry ones.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring in many GTA V models at once from a list file. Skips anything already imported."))
