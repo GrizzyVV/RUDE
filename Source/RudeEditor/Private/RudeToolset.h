@@ -55,8 +55,34 @@ public:
 	//   ambiguousTextures - KEPT and unchanged in meaning (== texturesTieBroken) so the pre-fix
 	//     2,390/2,495 measurement stays directly comparable to any later run.
 	// A bind whose name exists in exactly ONE dictionary moves none of these: nothing had to choose.
+	// ⭐ COLLISION IMPORT, added 2026-08-05 (open item #40). A drawable's embedded <Bounds> is now
+	// read into the asset's UBodySetup instead of being ignored:
+	//   Box / Sphere / Capsule -> FKBoxElem / FKSphereElem / FKSphylElem (simple collision)
+	//   Geometry / GeometryBVH -> a separate <name>_col UStaticMesh wired as ComplexCollisionMesh
+	//   Cylinder               -> REFUSED and counted (UE FKAggregateGeom has no cylinder)
+	//   anything else          -> counted as MALFORMED, which reddens ok
+	// Verdict gains: collisionBoundsSeen, collisionPrimitivesImported, collisionMeshesImported,
+	// collisionBoundsUnmapped, collisionBoundsMalformed, collisionPolysDropped, collisionTriangles,
+	// collisionTrisOutOfRange, collisionTrisDegenerate, collisionMeshAsset, collisionReasons[].
+	// collisionBoundsSeen == primitivesImported + meshesImported + unmapped + malformed, exactly.
+	// ⛔ ONLY collisionBoundsMalformed gates ok. Unmapped is a capability gap on VALID data (240 of
+	// ~3,900 sampled child bounds are cylinders) and gating it would fire on every honest run - the
+	// same call that keeps missingMeshes and missingPixels out of their batches' ok.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring one GTA V model into Unreal as a Static Mesh you can edit."))
 	static FString ImportYdr(const FString& XmlPath, const FString& DestFolder);
+
+	// Read back the collision an asset ACTUALLY has, straight off its UBodySetup.
+	// ⛔ This is deliberately NOT a reader of RUDE's own verdict JSON: proving the importer worked by
+	// re-reading the counter the importer wrote is circular. It queries FKAggregateGeom element
+	// counts and calls UStaticMesh::GetPhysicsTriMeshData (the physics cooker's own call, which
+	// follows ComplexCollisionMesh) for the triangle count, and prints one representative primitive
+	// with its numbers so a size or mirror error is visible, not just a non-zero count.
+	// Returns JSON: {ok, assetPath, boxElems, sphereElems, sphylElems, convexElems, aggGeomTotal,
+	// traceFlag, complexCollisionMesh, complexTriangles, complexVertices, firstBox, firstSphere,
+	// firstCapsule}. ok:false means the QUERY failed - an empty AggGeom is a legitimate answer and
+	// stays ok:true, or this instrument could not score the do-nothing control.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what collision an imported model actually ended up with."))
+	static FString InspectCollision(const FString& AssetPath);
 
 	// Import ONE named entry of a ydd XML dictionary (.ydd.xml) as a UStaticMesh asset.
 	// A <DrawableDictionary> holds MANY drawables; EntryName picks one, matched against each

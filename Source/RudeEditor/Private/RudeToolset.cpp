@@ -17,8 +17,10 @@
 #include "Misc/PackageName.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "PhysicsEngine/AggregateGeom.h"
+#include "Interfaces/Interface_CollisionDataProvider.h"
 #include "Modules/ModuleManager.h"
 #include "StaticMeshAttributes.h"
+#include "StaticMeshCompiler.h"
 #include "UObject/Package.h"
 #include "XmlFile.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -879,6 +881,480 @@ namespace RudeYdr
 			return false;
 		}
 		return true;
+	}
+}
+
+// ============================================================================================
+// RudeBound - RAGE phBound  ->  UE UBodySetup (open item #40, the IMPORT half)
+// ============================================================================================
+// ⛔ WHAT WAS WRONG: RUDE had NO collision importer at all. Grep for ImportYbn / ImportBound /
+// ImportCollision returned zero hits plugin-wide (re-measured 2026-08-05), so every imported asset's
+// AggGeom was empty and every export re-derived collision from the RENDER mesh. 13,926 .ybn files
+// and the <Bounds> block embedded in 17.3% of every ydr (432 of a 2,500-file sample) had no consumer.
+//
+// ✅ EVERY CONVENTION BELOW IS MEASURED AGAINST THE EMITTED CORPUS, NOT TAKEN FROM DOCS.
+//   * CompositeTransform is ROW-VECTOR (p' = p*M, translation in the LAST ROW) - the same layout
+//     ExportYdr's XformRows already writes. Adjudicated WITH A CONTROL over the 900-file ydr sample,
+//     scored on composites that have a genuinely ROTATED child (an identity-rotation child cannot
+//     testify), by transforming each child's own BoxMin/BoxMax and unioning them against the parent
+//     composite's declared BoxMin/BoxMax - a DERIVED FIELD, so it settles the convention with no
+//     external reference:  row 62/62 pass  ·  column 37/62  ·  translation-only 9/62.
+//   * A child transform is a pure rotation+translation: worst |rowLength-1| = 5.0e-7 and worst
+//     |row dot row| = 9.9e-4 over 1,829 child transforms, zero negative determinants. There is
+//     therefore no scale to carry - and FKBoxElem has nowhere to put one, so a scaled transform is
+//     REFUSED rather than silently flattened.
+//   * <Vertices> in a Geometry/GeometryBVH bound are stored RELATIVE TO <GeometryCenter>. Proven by
+//     the same kind of derived-field oracle: GeometryCenter + vertex reproduces the bound's own
+//     BoxMin/BoxMax on 224 of 226 triangle-only bounds once <Margin> is allowed for, worst residual
+//     0.0116 (float32 noise on world-scale coordinates).
+//   * Sphere: BoxMin/BoxMax == SphereCenter +- SphereRadius EXACTLY, 16 of 16.
+//   * Capsule: the long axis is Y in 82 of 82 sampled bounds, halfLong == SphereRadius and the two
+//     short half-extents == <Margin> == the radius. The axis is nevertheless DERIVED from the
+//     dominant extent rather than hardcoded to Y - a catalogue is a lower bound, and deriving it
+//     also makes the importer agree with ExportYdr, which writes its capsules Z-dominant.
+//
+// ⛔ THE REFUSAL POLICY, split by CAUSE because the two are diagnosed differently:
+//   Unmapped  = a bound RUDE understands and has no faithful UE target for. Today that is Cylinder:
+//               UE's FKAggregateGeom has no cylinder, and a convex N-gon prism would be a silent
+//               geometric substitution of exactly the class this project keeps paying for. It fires
+//               on healthy shipped data (240 of ~3,900 sampled child bounds), so it must NOT gate.
+//   Malformed = a type RUDE DOES support whose fields could not be read or failed their own
+//               cross-check, OR a <Bounds type=""> string never seen before. Both mean the TOOL
+//               failed, not the data. Measured cost on healthy corpus data: zero. It GATES.
+namespace RudeBound
+{
+	// Every counter the import verdict reports, plus the geometry itself.
+	struct FResult
+	{
+		int32 BoundsSeen = 0;          // leaf bounds visited (a Composite that recursed is not a leaf)
+		int32 PrimitivesImported = 0;  // Box/Sphere/Capsule -> FKAggregateGeom
+		int32 MeshesImported = 0;      // Geometry/GeometryBVH that contributed >= 1 triangle
+		int32 BoundsUnmapped = 0;      // no UE target - counted, named, does NOT gate
+		int32 BoundsMalformed = 0;     // could not parse / unknown type - GATES ok
+		int32 PolysDropped = 0;        // non-triangle polygons inside a mesh bound
+		int32 TrisOutOfRange = 0;
+		int32 TrisDegenerate = 0;
+		FKAggregateGeom Agg;
+		TArray<FVector3f> Verts;       // UE-space (cm, Y-mirrored) collision triangle soup
+		TArray<int32> Indices;
+		TSet<FString> Reasons;         // distinct named reasons, so a refusal is never anonymous
+
+		void Refuse(bool bMalformed, const FString& Why)
+		{
+			if (bMalformed) { ++BoundsMalformed; } else { ++BoundsUnmapped; }
+			Reasons.Add(Why);
+		}
+	};
+
+	// gta metres -> UE cm with the pinned Y mirror (ENGINEERING_LOG "Coordinate & geometry
+	// conventions"). The same map ImportYdr applies to render positions, so collision and render
+	// geometry cannot land in different spaces.
+	static FVector ToUePos(const FVector& G) { return FVector(G.X * 100.0, -G.Y * 100.0, G.Z * 100.0); }
+	static FVector ToUeDir(const FVector& G) { return FVector(G.X, -G.Y, G.Z); }
+
+	static bool ReadVec(const FXmlNode* Parent, const TCHAR* Tag, FVector& Out)
+	{
+		const FXmlNode* N = Parent ? Parent->FindChildNode(Tag) : nullptr;
+		if (!N) { return false; }
+		Out = FVector(FCString::Atod(*N->GetAttribute(TEXT("x"))),
+		              FCString::Atod(*N->GetAttribute(TEXT("y"))),
+		              FCString::Atod(*N->GetAttribute(TEXT("z"))));
+		return true;
+	}
+
+	static bool ReadVal(const FXmlNode* Parent, const TCHAR* Tag, double& Out)
+	{
+		const FXmlNode* N = Parent ? Parent->FindChildNode(Tag) : nullptr;
+		if (!N) { return false; }
+		Out = FCString::Atod(*N->GetAttribute(TEXT("value")));
+		return true;
+	}
+
+	// <CompositeTransform> -> the child's local-to-parent transform, already mirrored into UE space.
+	// ABSENT is legal and means identity: the root <Bounds> carries no transform at all.
+	// Returns false (with Why) only when a transform is PRESENT and unusable - the refusing case.
+	static bool ReadTransform(const FXmlNode* Node, FTransform& Out, FString& Why)
+	{
+		Out = FTransform::Identity;
+		const FXmlNode* CT = Node->FindChildNode(TEXT("CompositeTransform"));
+		if (!CT) { return true; }
+		TArray<FString> Toks;
+		CT->GetContent().ParseIntoArrayWS(Toks);
+		if (Toks.Num() != 16)
+		{
+			Why = FString::Printf(TEXT("compositeTransform:%dTokens"), Toks.Num());
+			return false;
+		}
+		double M[16];
+		for (int32 i = 0; i < 16; ++i) { M[i] = FCString::Atod(*Toks[i]); }
+		// Rows 0..2 are the rotated basis vectors. Refuse anything carrying scale or shear: an
+		// FKBoxElem is Center+Rotation+extents with nowhere to put a scale, so flattening one would
+		// silently resize the collider. Measured worst deviation on the corpus is 5e-7, so a 1e-2
+		// tolerance cannot fire on healthy data.
+		const FVector RX(M[0], M[1], M[2]), RY(M[4], M[5], M[6]), RZ(M[8], M[9], M[10]);
+		if (FMath::Abs(RX.Size() - 1.0) > 1e-2 || FMath::Abs(RY.Size() - 1.0) > 1e-2
+			|| FMath::Abs(RZ.Size() - 1.0) > 1e-2)
+		{
+			Why = TEXT("compositeTransform:scaled");
+			return false;
+		}
+		// gta rotation -> UE rotation is the mirror conjugation M*R*M with M = diag(1,-1,1), which in
+		// quaternion form is the involution (-x, y, -z, w) - the SAME map ExportYdr uses in the other
+		// direction (ToGtaQuat), which is what makes import and export inverses of each other.
+		const FQuat Qg = FMatrix(RX, RY, RZ, FVector::ZeroVector).ToQuat();
+		const FQuat Que(-Qg.X, Qg.Y, -Qg.Z, Qg.W);
+		Out = FTransform(Que, ToUePos(FVector(M[12], M[13], M[14])));
+		return true;
+	}
+
+	static void ParseBound(const FXmlNode* Node, const FTransform& Parent, int32 Depth, FResult& R);
+
+	// Geometry / GeometryBVH -> a triangle soup in UE space, for complex-as-simple collision.
+	static void ParseGeometryBound(const FXmlNode* Node, const FTransform& World,
+	                               const FString& TypeName, FResult& R)
+	{
+		FVector GC;
+		if (!ReadVec(Node, TEXT("GeometryCenter"), GC))
+		{
+			// Every sampled Geometry/GeometryBVH carries one, and the vertices are meaningless
+			// without it - a missing centre would place the whole collider at the origin.
+			R.Refuse(true, FString::Printf(TEXT("%s:noGeometryCenter"), *TypeName));
+			return;
+		}
+		const FXmlNode* VN = Node->FindChildNode(TEXT("Vertices"));
+		const FXmlNode* PN = Node->FindChildNode(TEXT("Polygons"));
+		if (!VN || !PN)
+		{
+			R.Refuse(true, FString::Printf(TEXT("%s:noVerticesOrPolygons"), *TypeName));
+			return;
+		}
+		TArray<FString> Toks;
+		VN->GetContent().ParseIntoArrayWS(Toks);
+		if (Toks.Num() == 0 || (Toks.Num() % 3) != 0)
+		{
+			R.Refuse(true, FString::Printf(TEXT("%s:vertexTokens%%3"), *TypeName));
+			return;
+		}
+		const int32 NumV = Toks.Num() / 3;
+		const int32 Base = R.Verts.Num();
+		R.Verts.Reserve(Base + NumV);
+		for (int32 i = 0; i < NumV; ++i)
+		{
+			// tokens are "x, y, z" - Atod stops at the trailing comma
+			const FVector Local(FCString::Atod(*Toks[i * 3 + 0]),
+			                    FCString::Atod(*Toks[i * 3 + 1]),
+			                    FCString::Atod(*Toks[i * 3 + 2]));
+			const FVector W = World.TransformPosition(ToUePos(GC + Local));
+			R.Verts.Add(FVector3f((float)W.X, (float)W.Y, (float)W.Z));
+		}
+		int32 TrisHere = 0;
+		for (const FXmlNode* P : PN->GetChildrenNodes())
+		{
+			if (P->GetTag() != TEXT("Triangle"))
+			{
+				// ⛔ A BVH also carries POLY-primitives (Box/Sphere/Capsule/Cylinder), measured at
+				// 5.7% of all polygons (46,627 of 828,501 across 120 ybn). polySphere and polyCapsule
+				// are exactly mappable and polyBox's 4-index encoding is not derived here; rather
+				// than invent any of them, every one is counted and NAMED. Registered as the next
+				// slice of #40 - a marker beats an invented shape.
+				++R.PolysDropped;
+				R.Reasons.Add(FString::Printf(TEXT("poly:%s"), *P->GetTag()));
+				continue;
+			}
+			const int32 I0 = FCString::Atoi(*P->GetAttribute(TEXT("v1")));
+			const int32 I1 = FCString::Atoi(*P->GetAttribute(TEXT("v2")));
+			const int32 I2 = FCString::Atoi(*P->GetAttribute(TEXT("v3")));
+			// Lower bound matters as much as upper: these come from Atoi on untrusted XML and a
+			// negative index passed an upper-bound-only check straight into TArray's fatal RangeCheck
+			// on the render lane once already.
+			if (I0 < 0 || I1 < 0 || I2 < 0 || I0 >= NumV || I1 >= NumV || I2 >= NumV)
+			{
+				++R.TrisOutOfRange;
+				continue;
+			}
+			if (I0 == I1 || I1 == I2 || I0 == I2) { ++R.TrisDegenerate; continue; }
+			// Winding passes through as-is, the same rule ImportYdr's render lane is pinned to: with
+			// the Y-mirror applied to positions, RAGE winding already faces outward in UE.
+			R.Indices.Add(Base + I0);
+			R.Indices.Add(Base + I1);
+			R.Indices.Add(Base + I2);
+			++TrisHere;
+		}
+		if (TrisHere > 0)
+		{
+			++R.MeshesImported;
+		}
+		else
+		{
+			// A bound made entirely of poly-primitives contributes NOTHING to the collision mesh.
+			// Counting it as an imported mesh would be the "presence is not coverage" defect.
+			R.Verts.SetNum(Base);
+			R.Refuse(false, FString::Printf(TEXT("%s:noTriangles"), *TypeName));
+		}
+	}
+
+	static void ParseBound(const FXmlNode* Node, const FTransform& Parent, int32 Depth, FResult& R)
+	{
+		if (Depth > 8)
+		{
+			++R.BoundsSeen;
+			R.Refuse(true, TEXT("depthExceeded"));
+			return;
+		}
+		FTransform Local;
+		FString Why;
+		if (!ReadTransform(Node, Local, Why))
+		{
+			++R.BoundsSeen;
+			R.Refuse(true, Why);
+			return;
+		}
+		const FTransform World = Local * Parent;
+		const FString Type = Node->GetAttribute(TEXT("type"));
+
+		if (Type == TEXT("Composite"))
+		{
+			const FXmlNode* Children = Node->FindChildNode(TEXT("Children"));
+			if (!Children)
+			{
+				++R.BoundsSeen;
+				R.Refuse(true, TEXT("Composite:noChildren"));
+				return;
+			}
+			for (const FXmlNode* Item : Children->GetChildrenNodes())
+			{
+				ParseBound(Item, World, Depth + 1, R);
+			}
+			return;   // a container is not a leaf - it is not counted in BoundsSeen
+		}
+
+		++R.BoundsSeen;
+
+		FVector BMin, BMax;
+		const bool bHaveBox = ReadVec(Node, TEXT("BoxMin"), BMin) && ReadVec(Node, TEXT("BoxMax"), BMax);
+
+		if (Type == TEXT("Box"))
+		{
+			if (!bHaveBox) { R.Refuse(true, TEXT("Box:noBoxMinMax")); return; }
+			const FVector Dim = BMax - BMin;
+			if (Dim.X <= 0.0 || Dim.Y <= 0.0 || Dim.Z <= 0.0)
+			{
+				R.Refuse(true, TEXT("Box:nonPositiveExtent"));
+				return;
+			}
+			FKBoxElem E;
+			E.Center = World.TransformPosition(ToUePos((BMin + BMax) * 0.5));
+			E.Rotation = World.Rotator();
+			// FKBoxElem X/Y/Z are FULL extents in cm - the same reading ExportYdr encodes when it
+			// divides by 200 to get half-extents in metres.
+			E.X = (float)(Dim.X * 100.0);
+			E.Y = (float)(Dim.Y * 100.0);
+			E.Z = (float)(Dim.Z * 100.0);
+			R.Agg.BoxElems.Add(E);
+			++R.PrimitivesImported;
+			return;
+		}
+
+		if (Type == TEXT("Sphere"))
+		{
+			double Rad = 0.0;
+			if (!ReadVal(Node, TEXT("SphereRadius"), Rad) || Rad <= 0.0)
+			{
+				R.Refuse(true, TEXT("Sphere:noRadius"));
+				return;
+			}
+			FVector SC(ForceInitToZero);
+			ReadVec(Node, TEXT("SphereCenter"), SC);
+			// Cross-check the radius against the bound's own bbox, which is a DERIVED field. If the
+			// two ever disagree the format assumption has moved and a silent wrong-sized collider is
+			// the worst possible outcome; refuse instead. Measured agreement: 16 of 16, error 0.0.
+			if (bHaveBox)
+			{
+				const double H = ((BMax - BMin) * 0.5).GetMax();
+				if (FMath::Abs(H - Rad) > FMath::Max(1e-3, 0.01 * Rad))
+				{
+					R.Refuse(true, TEXT("Sphere:radiusBboxMismatch"));
+					return;
+				}
+			}
+			FKSphereElem E;
+			E.Center = World.TransformPosition(ToUePos(SC));
+			E.Radius = (float)(Rad * 100.0);
+			R.Agg.SphereElems.Add(E);
+			++R.PrimitivesImported;
+			return;
+		}
+
+		if (Type == TEXT("Capsule"))
+		{
+			if (!bHaveBox) { R.Refuse(true, TEXT("Capsule:noBoxMinMax")); return; }
+			const FVector Half = (BMax - BMin) * 0.5;
+			// DERIVE the long axis from the dominant extent instead of hardcoding it. Rockstar's
+			// capsules are Y-dominant in 82 of 82 sampled bounds and ExportYdr writes Z-dominant, so
+			// a hardcoded axis would be wrong for one of the two lanes; the data says which it is.
+			int32 Axis = 0;
+			if (Half.Y > Half[Axis]) { Axis = 1; }
+			if (Half.Z > Half[Axis]) { Axis = 2; }
+			const double A = Half[(Axis + 1) % 3];
+			const double B = Half[(Axis + 2) % 3];
+			if (A <= 0.0 || B <= 0.0 || FMath::Abs(A - B) > FMath::Max(1e-3, 0.01 * FMath::Max(A, B)))
+			{
+				// A capsule's cross-section is a circle by definition. Two different short extents
+				// mean this is not the shape the type claims, and picking one of them would invent a
+				// radius.
+				R.Refuse(true, TEXT("Capsule:nonCircularCrossSection"));
+				return;
+			}
+			const double Rad = (A + B) * 0.5;
+			const double HalfLong = Half[Axis];
+			if (HalfLong + 1e-4 < Rad)
+			{
+				R.Refuse(true, TEXT("Capsule:shorterThanRadius"));
+				return;
+			}
+			FVector AxisLocal(ForceInitToZero);
+			AxisLocal[Axis] = 1.0;
+			const FVector AxisWorld = World.TransformVectorNoScale(ToUeDir(AxisLocal)).GetSafeNormal();
+			FKSphylElem E;
+			E.Center = World.TransformPosition(ToUePos((BMin + BMax) * 0.5));
+			// FKSphylElem is Z-aligned; rotate its Z onto the capsule's actual axis.
+			E.Rotation = FQuat::FindBetweenNormals(FVector::ZAxisVector, AxisWorld).Rotator();
+			E.Radius = (float)(Rad * 100.0);
+			// Length is the LINE SEGMENT only - UE adds Radius at each end.
+			E.Length = (float)(FMath::Max(0.0, HalfLong - Rad) * 2.0 * 100.0);
+			R.Agg.SphylElems.Add(E);
+			++R.PrimitivesImported;
+			return;
+		}
+
+		if (Type == TEXT("Geometry") || Type == TEXT("GeometryBVH"))
+		{
+			ParseGeometryBound(Node, World, Type, R);
+			return;
+		}
+
+		if (Type == TEXT("Cylinder"))
+		{
+			// UE's FKAggregateGeom has box, sphere, sphyl, convex, tapered capsule and level set -
+			// no cylinder. The nearest shapes all change contact behaviour: a sphyl rounds the caps,
+			// a convex N-gon facets the barrel. Both would be a SILENT substitution of a shape the
+			// user never authored, so this refuses and says so. 240 of ~3,900 sampled child bounds
+			// are cylinders, which is why it does not gate.
+			R.Refuse(false, TEXT("Cylinder:noUeEquivalent"));
+			return;
+		}
+
+		// ⛔ A CATALOGUE IS A LOWER BOUND. The seven types above are what a 900-ydr + 800-ybn census
+		// happened to contain; "never observed" describes that sample, not the format. An unseen type
+		// string is the format moving underneath the tool, it costs ZERO on today's corpus, and it is
+		// exactly what a gate is for - so it counts as MALFORMED and reddens the verdict.
+		R.Refuse(true, FString::Printf(TEXT("unknownType:%s"),
+			Type.IsEmpty() ? TEXT("<none>") : *Type));
+	}
+
+	// Entry point: read a <Bounds> node into R. Returns false if there was no <Bounds> at all,
+	// which is the ordinary case for 82.7% of the corpus's drawables and is NOT an error.
+	static bool ImportBounds(const FXmlNode* DrawableRoot, FResult& R)
+	{
+		const FXmlNode* B = DrawableRoot ? DrawableRoot->FindChildNode(TEXT("Bounds")) : nullptr;
+		if (!B) { return false; }
+		ParseBound(B, FTransform::Identity, 0, R);
+		return true;
+	}
+
+	// Build the separate UStaticMesh that carries the RAGE collision triangles. UE routes complex
+	// collision through UStaticMesh::ComplexCollisionMesh, so the triangles cannot live on the render
+	// mesh itself without overwriting the geometry the user sees.
+	static UStaticMesh* BuildCollisionMesh(const FResult& R, const FString& DestFolder,
+	                                       const FString& MeshName, FString& Why)
+	{
+		if (R.Indices.Num() < 3) { Why = TEXT("no triangles"); return nullptr; }
+		const FString ColName = MeshName + TEXT("_col");
+		const FString PackageName = DestFolder / ColName;
+		if (!FPackageName::IsValidLongPackageName(PackageName)) { Why = TEXT("bad package name"); return nullptr; }
+		UPackage* Pkg = CreatePackage(*PackageName);
+		if (!Pkg) { Why = TEXT("CreatePackage failed"); return nullptr; }
+		UStaticMesh* Col = NewObject<UStaticMesh>(Pkg, FName(*ColName), RF_Public | RF_Standalone);
+		if (!Col) { Why = TEXT("NewObject failed"); return nullptr; }
+		Col->SetNumSourceModels(0);
+		Col->GetStaticMaterials().Empty();
+		Col->AddSourceModel();
+		FStaticMeshSourceModel& SM = Col->GetSourceModel(0);
+		SM.BuildSettings.bRecomputeNormals = true;
+		SM.BuildSettings.bRecomputeTangents = false;
+		SM.BuildSettings.bGenerateLightmapUVs = false;
+		FMeshDescription* MD = Col->CreateMeshDescription(0);
+		if (!MD) { Why = TEXT("CreateMeshDescription failed"); return nullptr; }
+		FStaticMeshAttributes Attr(*MD);
+		Attr.Register();
+		TVertexAttributesRef<FVector3f> Pos = Attr.GetVertexPositions();
+		TPolygonGroupAttributesRef<FName> Slots = Attr.GetPolygonGroupMaterialSlotNames();
+		const FPolygonGroupID Group = MD->CreatePolygonGroup();
+		Slots[Group] = FName(TEXT("collision"));
+		TArray<FVertexID> VIDs;
+		VIDs.Reserve(R.Verts.Num());
+		for (const FVector3f& P : R.Verts)
+		{
+			const FVertexID V = MD->CreateVertex();
+			Pos[V] = P;
+			VIDs.Add(V);
+		}
+		int32 Made = 0;
+		for (int32 k = 0; k + 2 < R.Indices.Num(); k += 3)
+		{
+			TArray<FVertexInstanceID> Inst;
+			for (int32 j = 0; j < 3; ++j)
+			{
+				Inst.Add(MD->CreateVertexInstance(VIDs[R.Indices[k + j]]));
+			}
+			MD->CreatePolygon(Group, Inst);
+			++Made;
+		}
+		if (Made == 0) { Why = TEXT("no polygons created"); return nullptr; }
+		Col->CommitMeshDescription(0);
+		Col->GetStaticMaterials().Add(
+			FStaticMaterial(UMaterial::GetDefaultMaterial(MD_Surface), FName(TEXT("collision"))));
+		Col->Build(true);
+		Col->PostEditChange();
+		// ⛔ BLOCK ON THE ASYNC BUILD BEFORE HANDING THIS MESH BACK, AND DO IT *AFTER*
+		// PostEditChange. Build() only QUEUES the compile; the caller then assigns this mesh as
+		// ComplexCollisionMesh and cooks the render mesh's physics, which calls
+		// ContainsPhysicsTriMeshData -> SectionHasCollisionEnabled -> SectionInfoMap on THIS mesh
+		// while it is still compiling. Measured, not theorised: the trimesh case printed
+		// `"ok":true` and still exited 1, on `Handled ensure ... Accessing property SectionInfoMap of
+		// the StaticMesh while it is still being built asynchronously` (StaticMesh.cpp:4790) - the
+		// verdict and the exit code disagreeing, which is the one thing a verdict must never do.
+		// ⛔ AND THE FIRST FIX WAS ONE LINE TOO EARLY: flushing before PostEditChange still ensured,
+		// because PostEditChange RE-QUEUES the build. Order is load-bearing here.
+		// Targeted rather than FinishAllCompilation: this path runs on ~17% of a batch's files and
+		// flushing every pending asset each time would be a large avoidable stall.
+		FStaticMeshCompilingManager::Get().FinishCompilation({ Col });
+		Pkg->MarkPackageDirty();
+		FAssetRegistryModule::AssetCreated(Col);
+		return Col;
+	}
+
+	// The JSON fragment every import lane appends. Kept in ONE place so the drawable lane and any
+	// future .ybn lane cannot drift into reporting the same numbers under different names.
+	static FString VerdictJson(const FResult& R, const FString& ColAssetPath)
+	{
+		FString Reasons;
+		TArray<FString> Sorted = R.Reasons.Array();
+		Sorted.Sort();
+		for (int32 i = 0; i < Sorted.Num(); ++i)
+		{
+			Reasons += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(",") : TEXT(""), *Sorted[i]);
+		}
+		return FString::Printf(
+			TEXT("\"collisionBoundsSeen\":%d,\"collisionPrimitivesImported\":%d,")
+			TEXT("\"collisionMeshesImported\":%d,\"collisionBoundsUnmapped\":%d,")
+			TEXT("\"collisionBoundsMalformed\":%d,\"collisionPolysDropped\":%d,")
+			TEXT("\"collisionTriangles\":%d,\"collisionTrisOutOfRange\":%d,")
+			TEXT("\"collisionTrisDegenerate\":%d,\"collisionMeshAsset\":\"%s\",")
+			TEXT("\"collisionReasons\":[%s]"),
+			R.BoundsSeen, R.PrimitivesImported, R.MeshesImported, R.BoundsUnmapped,
+			R.BoundsMalformed, R.PolysDropped, R.Indices.Num() / 3, R.TrisOutOfRange,
+			R.TrisDegenerate, *ColAssetPath, *Reasons);
 	}
 }
 
@@ -1812,6 +2288,92 @@ FString URudeToolset::ImportYdr(const FString& XmlPath, const FString& DestFolde
 	return RudeImportYdrScoped(XmlPath, DestFolder, FString());
 }
 
+// ⛔⛔ THIS TOOL EXISTS BECAUSE A COUNTER CANNOT VERIFY ITSELF (2026-08-05, open item #40).
+// ImportYdr now reports collisionPrimitivesImported / collisionMeshesImported, but reading those
+// back to prove collision landed is circular - they are incremented by the very code under test. So
+// this tool LOADS the finished asset and asks the ENGINE what its UBodySetup actually contains:
+// FKAggregateGeom element counts straight off the body setup, and the complex triangle count via
+// UStaticMesh::GetPhysicsTriMeshData, which is the same call the physics cooker makes and which
+// follows ComplexCollisionMesh itself. Nothing here reads RUDE's own JSON.
+FString URudeToolset::InspectCollision(const FString& AssetPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *AssetPath);
+	if (!Mesh)
+	{
+		return Fail(FString::Printf(TEXT("StaticMesh not found: %s"), *AssetPath));
+	}
+	// GetPhysicsTriMeshData check()s HasValidRenderData(), so an async-compiling mesh would take the
+	// whole editor down rather than report anything.
+	FAssetCompilingManager::Get().FinishAllCompilation();
+	UBodySetup* BS = Mesh->GetBodySetup();
+	if (!BS)
+	{
+		return Fail(TEXT("mesh has no BodySetup"));
+	}
+	const FKAggregateGeom& Agg = BS->AggGeom;
+	FString ComplexPath = TEXT("");
+#if WITH_EDITORONLY_DATA
+	if (Mesh->ComplexCollisionMesh)
+	{
+		ComplexPath = Mesh->ComplexCollisionMesh->GetPackage()->GetName();
+	}
+#endif
+	// bInUseAllTriData=true, and the CheckComplex overload follows ComplexCollisionMesh. Without a
+	// ComplexCollisionMesh this returns the RENDER mesh's own triangles, which is the honest reading:
+	// that is literally what the asset would collide with.
+	int32 ComplexTris = 0, ComplexVerts = 0;
+	FTriMeshCollisionData TriData;
+	if (Mesh->ContainsPhysicsTriMeshData(/*bInUseAllTriData*/ true)
+		&& Mesh->GetPhysicsTriMeshData(&TriData, /*bInUseAllTriData*/ true))
+	{
+		ComplexTris = TriData.Indices.Num();     // FTriIndices, so this IS the triangle count
+		ComplexVerts = TriData.Vertices.Num();
+	}
+	// One representative box, printed so the NUMBERS can be checked against the source XML by hand -
+	// an element count proves something was added, not that it is the right size or in the right
+	// place. This is the field that catches a unit or mirror error.
+	FString FirstBox = TEXT("null");
+	if (Agg.BoxElems.Num() > 0)
+	{
+		const FKBoxElem& B = Agg.BoxElems[0];
+		FirstBox = FString::Printf(
+			TEXT("{\"center\":[%.4f,%.4f,%.4f],\"extent\":[%.4f,%.4f,%.4f],\"yaw\":%.3f,\"pitch\":%.3f,\"roll\":%.3f}"),
+			B.Center.X, B.Center.Y, B.Center.Z, B.X, B.Y, B.Z,
+			B.Rotation.Yaw, B.Rotation.Pitch, B.Rotation.Roll);
+	}
+	FString FirstCapsule = TEXT("null");
+	if (Agg.SphylElems.Num() > 0)
+	{
+		const FKSphylElem& C = Agg.SphylElems[0];
+		FirstCapsule = FString::Printf(
+			TEXT("{\"center\":[%.4f,%.4f,%.4f],\"radius\":%.4f,\"length\":%.4f,\"yaw\":%.3f,\"pitch\":%.3f,\"roll\":%.3f}"),
+			C.Center.X, C.Center.Y, C.Center.Z, C.Radius, C.Length,
+			C.Rotation.Yaw, C.Rotation.Pitch, C.Rotation.Roll);
+	}
+	FString FirstSphere = TEXT("null");
+	if (Agg.SphereElems.Num() > 0)
+	{
+		const FKSphereElem& S = Agg.SphereElems[0];
+		FirstSphere = FString::Printf(TEXT("{\"center\":[%.4f,%.4f,%.4f],\"radius\":%.4f}"),
+			S.Center.X, S.Center.Y, S.Center.Z, S.Radius);
+	}
+	// ⛔ ok is COMPUTED, and it is deliberately NOT "has collision". A mesh with no bounds in its
+	// source legitimately has an empty AggGeom, and failing that would make this instrument useless
+	// for the control case it exists to score. ok:false means the QUERY failed.
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"assetPath\":\"%s\",\"boxElems\":%d,\"sphereElems\":%d,")
+		TEXT("\"sphylElems\":%d,\"convexElems\":%d,\"aggGeomTotal\":%d,\"traceFlag\":%d,")
+		TEXT("\"complexCollisionMesh\":\"%s\",\"complexTriangles\":%d,\"complexVertices\":%d,")
+		TEXT("\"firstBox\":%s,\"firstSphere\":%s,\"firstCapsule\":%s}"),
+		*AssetPath, Agg.BoxElems.Num(), Agg.SphereElems.Num(), Agg.SphylElems.Num(),
+		Agg.ConvexElems.Num(), Agg.GetElementCount(), (int32)BS->CollisionTraceFlag.GetValue(),
+		*ComplexPath, ComplexTris, ComplexVerts, *FirstBox, *FirstSphere, *FirstCapsule);
+}
+
 static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName,
                                   const FString& DestFolder, const FString& TextureScope)
 {
@@ -2568,13 +3130,68 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		Mesh->GetStaticMaterials().Add(Mat);
 	}
 
+	// ⭐ COLLISION IMPORT (open item #40, 2026-08-05). A drawable's <Bounds> is the phBound Rockstar
+	// authored; 17.3% of the corpus's ydr carry one (432 of a 2,500-file sample). Until now RUDE read
+	// none of them and every imported asset walked on its own RENDER triangles instead.
+	// Parsed BEFORE Build() because ComplexCollisionMesh has to be in place when the physics data is
+	// cooked, and the collision mesh is a SEPARATE asset - the render mesh cannot hold both.
+	RudeBound::FResult Col;
+	RudeBound::ImportBounds(DrawableRoot, Col);
+	FString ColAssetPath;
+	UStaticMesh* ColMeshBuilt = nullptr;
+	if (Col.Indices.Num() >= 3)
+	{
+		FString ColWhy;
+		UStaticMesh* ColMesh = RudeBound::BuildCollisionMesh(Col, DestFolder, MeshName, ColWhy);
+#if !WITH_EDITORONLY_DATA
+		// ComplexCollisionMesh is editor-only. RudeEditor is an editor module, so this branch is
+		// unreachable in practice - it exists so the file cannot silently compile into a build where
+		// the collision mesh is created and then thrown away.
+		if (ColMesh) { ColWhy = TEXT("ComplexCollisionMesh unavailable (non-editor build)"); }
+		ColMesh = nullptr;
+#endif
+		if (ColMesh)
+		{
+#if WITH_EDITORONLY_DATA
+			Mesh->ComplexCollisionMesh = ColMesh;
+#endif
+			ColMeshBuilt = ColMesh;
+			ColAssetPath = ColMesh->GetPackage()->GetName();
+		}
+		else
+		{
+			// The triangles were parsed and then LOST. That is a tool failure, not a data gap, so it
+			// takes the gating counter rather than disappearing into a log line.
+			++Col.BoundsMalformed;
+			Col.Reasons.Add(FString::Printf(TEXT("collisionMesh:%s"), *ColWhy));
+			Col.MeshesImported = 0;
+			Col.Indices.Reset();
+		}
+	}
+
 	Mesh->Build(true);
-	// PIE-walkable collision: map meshes use their render triangles as collision
-	// (complex-as-simple) - RAGE collision stays a separate lane (ybn/embedded bounds).
+	if (ColMeshBuilt)
+	{
+		// The physics cook below reads BOTH meshes (the render mesh for its own sections, the
+		// collision mesh through ComplexCollisionMesh), so both must be finished compiling first.
+		// Gated on ColMeshBuilt so the 82.7%-of-drawables no-bounds path pays nothing new.
+		FStaticMeshCompilingManager::Get().FinishCompilation({ Mesh, ColMeshBuilt });
+	}
 	if (!Mesh->GetBodySetup()) { Mesh->CreateBodySetup(); }
 	if (UBodySetup* BS = Mesh->GetBodySetup())
 	{
-		BS->CollisionTraceFlag = CTF_UseComplexAsSimple;
+		BS->AggGeom = Col.Agg;
+		// Three cases, and the flag differs in each:
+		//  - RAGE primitives present: they ARE the simple collision, so simple must stay live.
+		//    Complex falls through to ComplexCollisionMesh when there is one, else to the render mesh
+		//    (unchanged from the old behaviour).
+		//  - only a triangle bound: AggGeom is empty, so simple has to come from complex or the asset
+		//    would have no simple collision at all.
+		//  - neither (82.7% of drawables, and every ydd entry): EXACTLY the old behaviour, render
+		//    triangles as complex-as-simple. ExportYdr's existing collisionFromRenderMesh counter
+		//    still describes this case correctly.
+		BS->CollisionTraceFlag = (Col.PrimitivesImported > 0) ? CTF_UseSimpleAndComplex
+		                                                      : CTF_UseComplexAsSimple;
 		BS->InvalidatePhysicsData();
 		BS->CreatePhysicsMeshes();
 	}
@@ -2606,7 +3223,17 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 	// WorldGridMaterial, and the pathological case (masters unmounted) makes that EVERY slot of
 	// EVERY mesh while every other counter reads 0. A tool whose ok cannot express its own
 	// worst-case failure is not reporting, it is decorating.
-	const bool bMeshOk = (SlotsWithoutMaterial == 0);
+	// ⛔ THE COLLISION GATE, decided deliberately and split by CAUSE (2026-08-05, #40).
+	// collisionBoundsMalformed GATES. It means a bound RUDE claims to support could not be read, or
+	// carried a <Bounds type=""> string this build has never seen. Either way the TOOL failed - the
+	// collider is silently absent while every other counter reads healthy - and its measured cost on
+	// the corpus is zero, so it can never become the gate nobody reads.
+	// collisionBoundsUnmapped does NOT gate. It means RUDE understood the bound and UE has no
+	// faithful target for it (Cylinder today). That is a capability gap on VALID data, the same class
+	// as missingMeshes and missingPixels, and it fires on healthy shipped assets.
+	// collisionPolysDropped does NOT gate, for the same reason: 5.7% of BVH polygons are
+	// poly-primitives on perfectly healthy data.
+	const bool bMeshOk = (SlotsWithoutMaterial == 0) && (Col.BoundsMalformed == 0);
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"assetPath\":\"%s\",\"geometries\":%d,\"geometriesDropped\":%d,")
 		TEXT("\"geometryErrors\":[%s],\"geometriesWithoutUV\":%d,\"vertices\":%d,\"triangles\":%d,")
@@ -2616,7 +3243,7 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
 		TEXT("\"unmappedSamplers\":%d,\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
 		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,")
-		TEXT("\"valueParamsUnsupported\":%d,\"valueParamsDeduped\":%d,\"slots\":[%s]}"),
+		TEXT("\"valueParamsUnsupported\":%d,\"valueParamsDeduped\":%d,%s,\"slots\":[%s]}"),
 		bMeshOk ? TEXT("true") : TEXT("false"),
 		*PackageName, Geos.Num(), GeosFailed, *GeoErrors, GeometriesWithoutUV, TotalVerts, TotalTris,
 		TrisOutOfRange, TrisDegenerate,
@@ -2624,7 +3251,8 @@ static FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& M
 		TexturesTieBroken, TexturesTieBroken,
 		UnsupportedByMaster, MissingTextures, UnmappedSamplers,
 		SlotsWithoutShaderDef, SlotsWithoutMaterial,
-		ValueParamsSeen, ValueParamsBound, ValueParamsUnsupported, ValueParamsDeduped, *SlotsJson);
+		ValueParamsSeen, ValueParamsBound, ValueParamsUnsupported, ValueParamsDeduped,
+		*RudeBound::VerdictJson(Col, ColAssetPath), *SlotsJson);
 }
 
 // Read one integer field out of a tool's JSON verdict. Lifted to file scope from ImportYdrBatch's
@@ -3411,6 +4039,10 @@ struct FRudeImportTally
 	int32 Scoped = 0, TieBroken = 0;   // #43 split: provenance vs lexicographic guess
 	int32 UnmappedSamp = 0, NoShaderDef = 0, NoMaterial = 0;
 	int32 ValSeen = 0, ValBound = 0, ValUnsupported = 0, ValDeduped = 0;
+	// #40 collision, 2026-08-05: the map/MLO lane must surface these too, or a whole-city import
+	// would once again report the geometry it moved and stay silent about the collision it did not.
+	int32 ColSeen = 0, ColPrims = 0, ColMeshes = 0, ColUnmapped = 0, ColMalformed = 0;
+	int32 ColPolysDropped = 0, ColTris = 0;
 
 	void Accumulate(const FString& R)
 	{
@@ -3432,6 +4064,13 @@ struct FRudeImportTally
 		ValBound       += RudeSumField(R, TEXT("valueParamsBound"));
 		ValUnsupported += RudeSumField(R, TEXT("valueParamsUnsupported"));
 		ValDeduped     += RudeSumField(R, TEXT("valueParamsDeduped"));
+		ColSeen        += RudeSumField(R, TEXT("collisionBoundsSeen"));
+		ColPrims       += RudeSumField(R, TEXT("collisionPrimitivesImported"));
+		ColMeshes      += RudeSumField(R, TEXT("collisionMeshesImported"));
+		ColUnmapped    += RudeSumField(R, TEXT("collisionBoundsUnmapped"));
+		ColMalformed   += RudeSumField(R, TEXT("collisionBoundsMalformed"));
+		ColPolysDropped+= RudeSumField(R, TEXT("collisionPolysDropped"));
+		ColTris        += RudeSumField(R, TEXT("collisionTriangles"));
 	}
 
 	FString ToJson() const
@@ -3443,11 +4082,15 @@ struct FRudeImportTally
 			TEXT("\"ambiguousTextures\":%d,\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
 			TEXT("\"unmappedSamplers\":%d,\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
 			TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,\"valueParamsUnsupported\":%d,")
-			TEXT("\"valueParamsDeduped\":%d"),
+			TEXT("\"valueParamsDeduped\":%d,\"collisionBoundsSeen\":%d,")
+			TEXT("\"collisionPrimitivesImported\":%d,\"collisionMeshesImported\":%d,")
+			TEXT("\"collisionBoundsUnmapped\":%d,\"collisionBoundsMalformed\":%d,")
+			TEXT("\"collisionPolysDropped\":%d,\"collisionTriangles\":%d"),
 			GeosDropped, GeosNoUV, TrisOutOfRange, TrisDegenerate, Bound, FromEmbedded,
 			Scoped, TieBroken, Ambiguous,
 			Unsupported, MissingTex, UnmappedSamp, NoShaderDef, NoMaterial,
-			ValSeen, ValBound, ValUnsupported, ValDeduped);
+			ValSeen, ValBound, ValUnsupported, ValDeduped,
+			ColSeen, ColPrims, ColMeshes, ColUnmapped, ColMalformed, ColPolysDropped, ColTris);
 	}
 };
 
@@ -4809,6 +5452,11 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	int32 FromEmbedded = 0, Ambiguous = 0, NoShaderDef = 0, NoMaterial = 0;
 	int32 Scoped = 0, TieBroken = 0;      // #43 split
 	int32 FilesWithScope = 0;             // files whose archetype named a textureDictionary
+	// #40: the batch sums EVERY counter its unit reports, including the new collision ones. A batch
+	// that summed geometry but not collision would be the same blind spot this batch has now been
+	// fixed for twice (textures 2026-07-29, geometry 2026-07-31).
+	int32 ColSeen = 0, ColPrims = 0, ColMeshes = 0, ColUnmapped = 0, ColMalformed = 0;
+	int32 ColPolysDropped = 0, ColTris = 0, FilesWithCollision = 0;
 	FString FailedFiles;
 	for (int32 i = 0; i < Lines.Num(); ++i)
 	{
@@ -4859,6 +5507,15 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		TieBroken      += RudeSumField(R, TEXT("texturesTieBroken"));
 		NoShaderDef    += RudeSumField(R, TEXT("slotsWithoutShaderDef"));
 		NoMaterial     += RudeSumField(R, TEXT("slotsWithoutMaterial"));
+		const int32 SeenHere = RudeSumField(R, TEXT("collisionBoundsSeen"));
+		ColSeen        += SeenHere;
+		ColPrims       += RudeSumField(R, TEXT("collisionPrimitivesImported"));
+		ColMeshes      += RudeSumField(R, TEXT("collisionMeshesImported"));
+		ColUnmapped    += RudeSumField(R, TEXT("collisionBoundsUnmapped"));
+		ColMalformed   += RudeSumField(R, TEXT("collisionBoundsMalformed"));
+		ColPolysDropped+= RudeSumField(R, TEXT("collisionPolysDropped"));
+		ColTris        += RudeSumField(R, TEXT("collisionTriangles"));
+		if (SeenHere > 0) { ++FilesWithCollision; }
 		// geometryErrors is a JSON ARRAY, so it cannot be summed - count the FILES that carry a
 		// non-empty one. Zero here alongside a non-zero geometriesDropped would mean every dropped
 		// geometry is unexplained, which is itself a defect worth seeing.
@@ -4896,10 +5553,14 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		     "bound %d (embedded-scoped %d, scope-resolved %d, tie-broken %d), unsupportedByMaster "
 		     "%d, missing %d, unmappedSamplers %d | %d files carried an archetype textureDictionary "
 		     "| slots without shader def %d, without material %d | value params "
-		     "seen %d = bound %d + unsupported %d + deduped %d"),
+		     "seen %d = bound %d + unsupported %d + deduped %d | collision: %d files carried bounds, "
+		     "%d seen = %d primitives + %d meshes + %d unmapped + %d malformed, %d tris, "
+		     "%d polys dropped"),
 		Imported, Skipped, Failed, GeosDropped, GeoErrors, GeosNoUV, TrisOOR, TrisDegen,
 		Bound, FromEmbedded, Scoped, TieBroken, Unsupported, MissingTex, UnmappedSamp,
-		FilesWithScope, NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped);
+		FilesWithScope, NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped,
+		FilesWithCollision, ColSeen, ColPrims, ColMeshes, ColUnmapped, ColMalformed, ColTris,
+		ColPolysDropped);
 	// ⛔ `ok` IS COMPUTED, NEVER HARDCODED (fixed 2026-08-05). It used to be the literal `true`, so a
 	// batch in which EVERY file failed returned `"ok":true,"failed":400` and the commandlet exited 0.
 	// Measured, not theorised: a shell-quoting bug produced 400 non-existent paths, and no automated
@@ -4921,12 +5582,17 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,\"unmappedSamplers\":%d,")
 		TEXT("\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
 		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,\"valueParamsUnsupported\":%d,")
-		TEXT("\"valueParamsDeduped\":%d,\"failedFiles\":[%s]}"),
+		TEXT("\"valueParamsDeduped\":%d,\"filesWithCollision\":%d,\"collisionBoundsSeen\":%d,")
+		TEXT("\"collisionPrimitivesImported\":%d,\"collisionMeshesImported\":%d,")
+		TEXT("\"collisionBoundsUnmapped\":%d,\"collisionBoundsMalformed\":%d,")
+		TEXT("\"collisionPolysDropped\":%d,\"collisionTriangles\":%d,\"failedFiles\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"),
 		Imported, Skipped, Failed, GeosDropped, GeoErrors, GeosNoUV, TrisOOR, TrisDegen,
 		Bound, FromEmbedded, Scoped, TieBroken, FilesWithScope, Ambiguous,
 		Unsupported, MissingTex, UnmappedSamp,
-		NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped, *FailedFiles);
+		NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped,
+		FilesWithCollision, ColSeen, ColPrims, ColMeshes, ColUnmapped, ColMalformed,
+		ColPolysDropped, ColTris, *FailedFiles);
 }
 
 // ⛔⛔ WHY THIS WRAPPER EXISTS — `-unattended` SILENTLY CANCELS EVERY SAVE (measured 2026-07-31,
