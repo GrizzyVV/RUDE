@@ -318,13 +318,34 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 	const FString Name = Spec.Key();
 	const FString PkgName = FString::Printf(TEXT("/RUDE/Masters/Gen/%s"), *Name);
 	const FString Full = FString::Printf(TEXT("%s.%s"), *PkgName, *Name);
+	UMaterial* M = nullptr;
 	if (UMaterialInterface* Existing = LoadObject<UMaterialInterface>(nullptr, *Full))
 	{
-		return Existing;
+		// Bucket-1 (glass, alpha-blended) masters generated before 2026-09-05 used UE's default
+		// volumetric translucency with no surface lighting: glass drew as a flat colour slab (the
+		// blue tower). The new version carries an OpacityScale parameter; an old one is regenerated
+		// IN PLACE so every material instance parented to it updates without a re-import.
+		UMaterial* Old = Cast<UMaterial>(Existing);
+		bool bStale = false;
+		if (Old && Spec.Bucket == 1)
+		{
+			TArray<FMaterialParameterInfo> Infos;
+			TArray<FGuid> Ids;
+			Old->GetAllScalarParameterInfo(Infos, Ids);
+			bStale = true;
+			for (const FMaterialParameterInfo& I : Infos) { if (I.Name == FName(TEXT("OpacityScale"))) { bStale = false; break; } }
+		}
+		if (!bStale) { return Existing; }
+		M = Old;
+		M->GetExpressionCollection().Empty();
+		UE_LOG(LogTemp, Display, TEXT("[RUDE] regenerating stale glass master %s"), *Name);
 	}
-	UPackage* P = CreatePackage(*PkgName);
-	if (!P) { return nullptr; }
-	UMaterial* M = NewObject<UMaterial>(P, *Name, RF_Public | RF_Standalone);
+	if (!M)
+	{
+		UPackage* P = CreatePackage(*PkgName);
+		if (!P) { return nullptr; }
+		M = NewObject<UMaterial>(P, *Name, RF_Public | RF_Standalone);
+	}
 
 	UTexture* DefWhite  = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
 	UTexture* DefNormal = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineMaterials/FlatNormal.FlatNormal"));
@@ -476,9 +497,16 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 	}
 	else if (Spec.Bucket == 1)
 	{
-		EO->Opacity.Expression = DiffuseTex;
-		EO->Opacity.MaskA = 1; EO->Opacity.Mask = 1;
-		EO->Opacity.MaskR = 0; EO->Opacity.MaskG = 0; EO->Opacity.MaskB = 0;
+		// Glass that reads right: surface-lit translucency (specular + reflections, not the volumetric
+		// default), opacity = diffuse alpha x OpacityScale (glass alphas are often 1.0), low roughness.
+		M->TranslucencyLightingMode = TLM_SurfacePerPixelLighting;
+		UMaterialExpressionScalarParameter* OpScale = MakeScalar(TEXT("OpacityScale"), 0.55f, 1300);
+		UMaterialExpressionMultiply* Op = NewObject<UMaterialExpressionMultiply>(M);
+		Op->A.Expression = DiffuseTex; Op->A.Mask = 1; Op->A.MaskA = 1; Op->A.MaskR = 0; Op->A.MaskG = 0; Op->A.MaskB = 0;
+		Op->B.Expression = OpScale; Add(Op, -700, 1300);
+		EO->Opacity.Expression = Op;
+		UMaterialExpressionScalarParameter* Rough = MakeScalar(TEXT("Roughness"), 0.12f, 1400);
+		EO->Roughness.Expression = Rough;
 	}
 	M->PostEditChange();
 	M->MarkPackageDirty();
@@ -7630,6 +7658,51 @@ FString URudeToolset::PlaceArchetype(const FString& PaletteFolder, const FString
 	Actor->MarkPackageDirty();
 	return FString::Printf(TEXT("{\"ok\":true,\"archetype\":\"%s\",\"targetYmap\":\"%s\",\"mesh\":%s,\"actor\":\"%s\",\"lodDist\":%g}"),
 		*RudeJsonEscape(Name), *RudeJsonEscape(Ymap), Mesh ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Actor->GetActorLabel()), A->LodDist);
+}
+
+// ---- RegenerateMasters (agent) ------------------------------------------------------------
+// Walk the generated master library (/RUDE/Masters/Gen/M_RUDE_<sig>_b<bucket>) and run each through
+// the generator, which regenerates a stale one in place. Verdict: names touched.
+FString URudeToolset::RegenerateMasters()
+{
+	FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+	ARM.Get().ScanPathsSynchronous({ TEXT("/RUDE/Masters/Gen") }, true);
+	TArray<FAssetData> Assets;
+	ARM.Get().GetAssetsByPath(FName(TEXT("/RUDE/Masters/Gen")), Assets, false);
+	int32 Seen = 0, Regenerated = 0, Unparsed = 0;
+	FString Names;
+	for (const FAssetData& AD : Assets)
+	{
+		const FString N = AD.AssetName.ToString();
+		if (!N.StartsWith(TEXT("M_RUDE_"))) { continue; }
+		++Seen;
+		// parse "M_RUDE_<D[N][S][Dt][T][E]>_b<N>"
+		FString Sig, BucketStr;
+		if (!N.Mid(7).Split(TEXT("_b"), &Sig, &BucketStr) || !Sig.StartsWith(TEXT("D"))) { ++Unparsed; continue; }
+		FRudeMasterSpec Spec;
+		Spec.Bucket = FCString::Atoi(*BucketStr);
+		FString Rest = Sig.Mid(1);
+		while (!Rest.IsEmpty())
+		{
+			if (Rest.StartsWith(TEXT("Dt"))) { Spec.bDetail = true; Rest = Rest.Mid(2); }
+			else if (Rest.StartsWith(TEXT("N"))) { Spec.bNormal = true; Rest = Rest.Mid(1); }
+			else if (Rest.StartsWith(TEXT("S"))) { Spec.bSpec = true; Rest = Rest.Mid(1); }
+			else if (Rest.StartsWith(TEXT("T"))) { Spec.bTint = true; Rest = Rest.Mid(1); }
+			else if (Rest.StartsWith(TEXT("E"))) { Spec.bEmissive = true; Rest = Rest.Mid(1); }
+			else { break; }
+		}
+		if (!Rest.IsEmpty() || Spec.Key() != N) { ++Unparsed; continue; }
+		UMaterialInterface* Before = LoadObject<UMaterialInterface>(nullptr, *(AD.PackageName.ToString() + TEXT(".") + N));
+		const bool bWasDirty = Before && Before->GetOutermost()->IsDirty();
+		UMaterialInterface* After = EnsureGeneratedMaster(Spec);
+		if (After && After->GetOutermost()->IsDirty() && !bWasDirty)
+		{
+			++Regenerated;
+			Names += FString::Printf(TEXT("%s\"%s\""), Names.IsEmpty() ? TEXT("") : TEXT(","), *N);
+		}
+	}
+	return FString::Printf(TEXT("{\"ok\":%s,\"masters\":%d,\"regenerated\":%d,\"unparsed\":%d,\"names\":[%s]}"),
+		Seen > 0 ? TEXT("true") : TEXT("false"), Seen, Regenerated, Unparsed, *Names);
 }
 
 // ---- XmlShapeRoundTrip -------------------------------------------------------------------

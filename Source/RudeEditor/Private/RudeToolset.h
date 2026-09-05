@@ -263,6 +263,10 @@ public:
 	static FString PlaceArchetype(const FString& PaletteFolder, const FString& ArchetypeName,
 	                              const FString& LocationCm, const FString& RotationDeg, const FString& TargetYmap);
 
+	// Regenerate stale generated masters in place (the glass fix of 2026-09-05); instances update.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Rebuild RUDE's generated master materials that are out of date, so every material using them updates.", RudeAudience="agent"))
+	static FString RegenerateMasters();
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);
