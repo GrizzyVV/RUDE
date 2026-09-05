@@ -4425,6 +4425,7 @@ struct FRudeArchetypeIndex
 	// is how the game shows lit windows after dusk - by swapping which archetype is visible, not by
 	// changing a material. Captured so the behaviour can be driven in UE and still round-trip.
 	TMap<FString, uint32> ArchTimeFlags;  // lowercase archetype name -> hour mask
+	TMap<FString, float> ArchRadius;      // lowercase archetype name -> bsRadius (m), the size the definition claims
 	// ⭐ 2026-08-05 (#43): the archetype's declared <textureDictionary>, keyed by the DRAWABLE ASSET
 	// the archetype resolves to - which is the key ImportIndexedDrawable and ImportYdrBatch have in
 	// hand. This is the ONLY place the shared-txd scope exists: a .ydr.xml declares its EMBEDDED
@@ -4590,6 +4591,10 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 				const uint32 Mask = (uint32)FCString::Strtoui64(
 					*TimeN->GetAttribute(TEXT("value")), nullptr, 10);
 				if (Mask != 0) { Out.ArchTimeFlags.Add(ArchLower, Mask); }
+			}
+			if (const FXmlNode* RadN = Item->FindChildNode(TEXT("bsRadius")))
+			{
+				Out.ArchRadius.Add(ArchLower, (float)FCString::Atod(*RadN->GetAttribute(TEXT("value"))));
 			}
 			if (bDictArch)
 			{
@@ -4985,7 +4990,7 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 				"\"numChildren\":%.0f,\"parentIndex\":%.0f,\"priorityLevel\":\"%s\","
 				"\"aoMultiplier\":%f,\"artificialAo\":%f,\"tintValue\":%.0f,"
 				"\"extensions\":\"%s\",\"srcYmap\":\"%s\",\"srcSlot\":\"%s\",\"srcIndex\":%d,"
-				"\"xml\":\"%s\",\"itemType\":\"%s\"}"),
+				"\"xml\":\"%s\",\"itemType\":\"%s\",\"bsRadius\":%g}"),
 				SceneEnts > 1 ? TEXT(",") : TEXT(""), *Arch,
 				Asset ? *FString::Printf(TEXT("\"%s\""), **Asset) : TEXT("null"), *Lod,
 				Px * 100.0, -Py * 100.0, Pz * 100.0,
@@ -4996,7 +5001,8 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 				Val(TEXT("numChildren"), 0.0), Val(TEXT("parentIndex"), -1.0), *RudeJsonEscape(Text(TEXT("priorityLevel"))),
 				Val(TEXT("ambientOcclusionMultiplier"), 255.0), Val(TEXT("artificialAmbientOcclusion"), 255.0), Val(TEXT("tintValue"), 0.0),
 				*RudeJsonEscape(ExtXml), *RudeJsonEscape(SrcYmapName), *RudeJsonEscape(SrcSlot), EntOrdinal,
-				*RudeJsonEscape(ItemXml), *RudeJsonEscape(E->GetAttribute(TEXT("type"))));
+				*RudeJsonEscape(ItemXml), *RudeJsonEscape(E->GetAttribute(TEXT("type"))),
+				Index.ArchRadius.Contains(Arch) ? Index.ArchRadius[Arch] : 0.f);
 		}
 		if (SceneEnts == 0) { continue; }
 		++YmapsWithEntities;
@@ -7006,7 +7012,7 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 
 	TMap<FString, UStaticMesh*> MeshCache;
 	int32 NumYmaps = 0, NumLayers = 0, NumActors = 0, NumProxies = 0, NumFiltered = 0, NumMalformed = 0, LayerFailures = 0;
-	int32 NumScriptYmaps = 0, NumScriptActors = 0;
+	int32 NumScriptYmaps = 0, NumScriptActors = 0, NumSuspect = 0;
 	TMap<FString, int32> Missing;
 	for (const TSharedPtr<FJsonValue>& SceneVal : Scenes)
 	{
@@ -7079,6 +7085,7 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 			{
 				++NumActors;
 				if (!Mesh) { ++NumProxies; }
+				if (A->Tags.Contains(FName(TEXT("RUDE_SUSPECT_BOUNDS")))) { ++NumSuspect; }
 				if (bScriptYmap)
 				{
 					// placed, tagged, hidden: visible again through SetYmapVisible (the IPL toggle)
@@ -7119,11 +7126,11 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 		TEXT("{\"ok\":%s,\"level\":\"%s\",\"worldPartition\":true,\"ymaps\":%d,\"layers\":%d,\"layerFailures\":%d,")
 		TEXT("\"actors\":%d,\"proxies\":%d,\"filteredByLod\":%d,\"malformedEntities\":%d,\"missingMeshes\":%d,")
 		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"previousFilesCleared\":%d,")
-		TEXT("\"scriptYmaps\":%d,\"scriptActorsHidden\":%d,\"topMissing\":[%s]}"),
+		TEXT("\"scriptYmaps\":%d,\"scriptActorsHidden\":%d,\"suspectBounds\":%d,\"topMissing\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Path), NumYmaps, NumLayers, LayerFailures,
 		NumActors, NumProxies, NumFiltered, NumMalformed, Missing.Num(),
 		bSaved ? TEXT("true") : TEXT("false"), FPaths::FileExists(MapFile) ? TEXT("true") : TEXT("false"),
-		GRudeLastSaved, GRudeLastSaveFailed, Cleared, NumScriptYmaps, NumScriptActors, *TopMissing);
+		GRudeLastSaved, GRudeLastSaveFailed, Cleared, NumScriptYmaps, NumScriptActors, NumSuspect, *TopMissing);
 }
 
 // Raw item slices: the text of each "  <Item ...>" ... "  </Item>" (indent 2) inside the named
@@ -7761,6 +7768,122 @@ FString URudeToolset::SetYmapVisible(const FString& YmapName, const FString& Vis
 		Touched > 0 ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Want), bShow ? TEXT("true") : TEXT("false"), Touched, SkippedLod);
 }
 
+// ---- PickAt (agent) -----------------------------------------------------------------------
+// What is under a pixel of a CaptureView frame? CamSpec = "x,y,z,pitch,yaw" (';' accepted) as
+// CaptureView; U,V = 0..1 across the frame (aspect = the capture's, default 2103x1230, HFOV 90).
+// Traces every hit along the ray and reports the first VISIBLE one plus what it passed through.
+FString URudeToolset::PickAt(const FString& CamSpec, const FString& U, const FString& V, const FString& Aspect)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	TArray<FString> P;
+	CamSpec.Replace(TEXT(";"), TEXT(",")).ParseIntoArray(P, TEXT(","), true);
+	if (P.Num() != 5) { return Fail(TEXT("CamSpec must be x,y,z,pitch,yaw")); }
+	const FVector Cam(FCString::Atod(*P[0]), FCString::Atod(*P[1]), FCString::Atod(*P[2]));
+	const FRotator Rot(FCString::Atod(*P[3]), FCString::Atod(*P[4]), 0.0);
+	const double u = FCString::Atod(*U), v = FCString::Atod(*V);
+	const double A = Aspect.TrimStartAndEnd().IsEmpty() ? (2103.0 / 1230.0) : FCString::Atod(*Aspect);
+	const double TanH = FMath::Tan(FMath::DegreesToRadians(45.0));   // HFOV 90
+	const FVector Local(1.0, TanH * (2.0 * u - 1.0), -(TanH / A) * (2.0 * v - 1.0));
+	const FVector Dir = Rot.RotateVector(Local.GetSafeNormal());
+	// No physics needed (a commandlet's World Partition actors may carry no collision state): a
+	// ray-vs-bounds test over every placed entity, nearest visible first.
+	struct FPick { double Dist; AActor* Actor; const UStaticMeshComponent* SMC; bool bVisible; };
+	TArray<FPick> Picks;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		const UStaticMeshComponent* SMC = It->FindComponentByClass<UStaticMeshComponent>();
+		if (!SMC || !SMC->GetStaticMesh()) { continue; }
+		const FBox Box = SMC->Bounds.GetBox();
+		if (!Box.IsValid) { continue; }
+		FVector HitLoc, HitNormal; float HitTime;
+		if (!FMath::LineExtentBoxIntersection(Box, Cam, Cam + Dir * 200000.0, FVector::ZeroVector, HitLoc, HitNormal, HitTime)) { continue; }
+		FPick Pk; Pk.Dist = FVector::Dist(Cam, HitLoc); Pk.Actor = *It; Pk.SMC = SMC;
+		Pk.bVisible = SMC->IsVisible() && !SMC->bHiddenInGame;
+		Picks.Add(Pk);
+	}
+	Picks.Sort([](const FPick& A, const FPick& B) { return A.Dist < B.Dist; });
+	FString Rows;
+	int32 N = 0;
+	FString FirstVisible;
+	for (const FPick& Pk : Picks)
+	{
+		AActor* Actor = Pk.Actor;
+		const URudeEntityComponent* R = Actor->FindComponentByClass<URudeEntityComponent>();
+		FString Lod, Mats;
+		for (const FName& T : Actor->Tags) { const FString S = T.ToString(); if (S.StartsWith(TEXT("RUDE_LOD:"))) { Lod = S.Mid(9 + 15); } }
+		for (int32 i = 0; i < Pk.SMC->GetNumMaterials() && i < 6; ++i)
+		{
+			UMaterialInterface* M = Pk.SMC->GetMaterial(i);
+			UMaterialInterface* Parent = M;
+			if (UMaterialInstance* MI = Cast<UMaterialInstance>(M)) { Parent = MI->Parent; }
+			Mats += FString::Printf(TEXT("%s%s"), Mats.IsEmpty() ? TEXT("") : TEXT("|"), Parent ? *Parent->GetName() : TEXT("none"));
+		}
+		const FBox Box = Pk.SMC->Bounds.GetBox();
+		const FString Row = FString::Printf(TEXT("{\"actor\":\"%s\",\"archetype\":\"%s\",\"ymap\":\"%s\",\"lod\":\"%s\",\"itemType\":\"%s\",\"visible\":%s,\"distanceM\":%.1f,\"boundsM\":\"%.0fx%.0fx%.0f\",\"mesh\":\"%s\",\"masters\":\"%s\"}"),
+			*RudeJsonEscape(Actor->GetActorLabel()), R ? *RudeJsonEscape(R->ArchetypeName) : TEXT(""), R ? *RudeJsonEscape(R->SourceYmap) : TEXT(""),
+			*Lod, R ? *R->ItemType : TEXT(""), Pk.bVisible ? TEXT("true") : TEXT("false"), Pk.Dist / 100.0,
+			Box.GetSize().X / 100.0, Box.GetSize().Y / 100.0, Box.GetSize().Z / 100.0,
+			*RudeJsonEscape(Pk.SMC->GetStaticMesh()->GetName()), *RudeJsonEscape(Mats));
+		if (Pk.bVisible && FirstVisible.IsEmpty()) { FirstVisible = Row; }
+		if (N++ < 8) { Rows += (Rows.IsEmpty() ? TEXT("") : TEXT(",")) + Row; }
+	}
+	return FString::Printf(TEXT("{\"ok\":%s,\"u\":%g,\"v\":%g,\"hits\":%d,\"firstVisible\":%s,\"alongRay\":[%s]}"),
+		Picks.Num() > 0 ? TEXT("true") : TEXT("false"), u, v, Picks.Num(), FirstVisible.IsEmpty() ? TEXT("null") : *FirstVisible, *Rows);
+}
+
+// ---- InspectMesh (agent) --------------------------------------------------------------------
+// The numbers behind an imported mesh: render bounds, vertex/triangle counts, the ACTUAL vertex
+// extents of LOD0 (from the mesh description), collision primitive counts + the farthest primitive.
+FString URudeToolset::InspectMesh(const FString& AssetPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	const FString Path = AssetPath.TrimStartAndEnd();
+	const FString Obj = Path.Contains(TEXT(".")) ? Path : Path + TEXT(".") + FPackageName::GetShortName(Path);
+	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *Obj);
+	if (!Mesh) { return Fail(FString::Printf(TEXT("no static mesh at %s"), *Obj)); }
+	const FBox B = Mesh->GetBoundingBox();
+	FVector VMin(DBL_MAX), VMax(-DBL_MAX);
+	int32 Verts = 0, Tris = 0;
+	if (const FMeshDescription* MD = Mesh->GetMeshDescription(0))
+	{
+		FStaticMeshConstAttributes Attr(*MD);
+		TVertexAttributesConstRef<FVector3f> Pos = Attr.GetVertexPositions();
+		for (const FVertexID VID : MD->Vertices().GetElementIDs())
+		{
+			const FVector P(Pos[VID]);
+			VMin = VMin.ComponentMin(P); VMax = VMax.ComponentMax(P); ++Verts;
+		}
+		Tris = MD->Triangles().Num();
+	}
+	int32 Spheres = 0, Boxes = 0, Capsules = 0, Convex = 0;
+	double FarthestPrimM = 0;
+	if (UBodySetup* BS = Mesh->GetBodySetup())
+	{
+		Spheres = BS->AggGeom.SphereElems.Num(); Boxes = BS->AggGeom.BoxElems.Num();
+		Capsules = BS->AggGeom.SphylElems.Num(); Convex = BS->AggGeom.ConvexElems.Num();
+		for (const FKSphereElem& E : BS->AggGeom.SphereElems) { FarthestPrimM = FMath::Max(FarthestPrimM, E.Center.Size() / 100.0); }
+		for (const FKBoxElem& E : BS->AggGeom.BoxElems) { FarthestPrimM = FMath::Max(FarthestPrimM, E.Center.Size() / 100.0); }
+		for (const FKSphylElem& E : BS->AggGeom.SphylElems) { FarthestPrimM = FMath::Max(FarthestPrimM, E.Center.Size() / 100.0); }
+		for (const FKConvexElem& E : BS->AggGeom.ConvexElems) { FarthestPrimM = FMath::Max(FarthestPrimM, E.GetTransform().GetLocation().Size() / 100.0); }
+	}
+	return FString::Printf(TEXT("{\"ok\":true,\"mesh\":\"%s\",\"renderBoundsM\":\"%.1fx%.1fx%.1f\",\"boundsCenterM\":\"%.1f,%.1f,%.1f\",")
+		TEXT("\"lod0Verts\":%d,\"lod0Tris\":%d,\"vertexMinM\":\"%.1f,%.1f,%.1f\",\"vertexMaxM\":\"%.1f,%.1f,%.1f\",")
+		TEXT("\"collision\":{\"spheres\":%d,\"boxes\":%d,\"capsules\":%d,\"convex\":%d,\"farthestPrimM\":%.1f},\"positiveBoundsExtM\":\"%.1f,%.1f,%.1f\"}"),
+		*RudeJsonEscape(Mesh->GetName()), B.GetSize().X / 100.0, B.GetSize().Y / 100.0, B.GetSize().Z / 100.0,
+		B.GetCenter().X / 100.0, B.GetCenter().Y / 100.0, B.GetCenter().Z / 100.0,
+		Verts, Tris, VMin.X / 100.0, VMin.Y / 100.0, VMin.Z / 100.0, VMax.X / 100.0, VMax.Y / 100.0, VMax.Z / 100.0,
+		Spheres, Boxes, Capsules, Convex, FarthestPrimM,
+		Mesh->GetPositiveBoundsExtension().X / 100.0, Mesh->GetPositiveBoundsExtension().Y / 100.0, Mesh->GetPositiveBoundsExtension().Z / 100.0);
+}
+
 // ---- XmlShapeRoundTrip -------------------------------------------------------------------
 // Walk a parsed tree into (path -> [attr=value...] + leaf text) rows, order-preserving by path
 // with sibling ordinals, so two parses compare exactly and a mismatch names its path.
@@ -8254,7 +8377,19 @@ static AActor* RudeSpawnEntityActor(UWorld* World, const FString& YmapName, cons
 		Ent->TryGetNumberField(TEXT("flags"), FlagsD);
 		const bool bReflectionOnly = (((uint32)FlagsD) & 0x02000000u) != 0;   // ONLY_RENDER_IN_REFLECTIONS
 		if (bReflectionOnly) { A->Tags.Add(FName(TEXT("RUDE_REFLECTION_ONLY"))); }
-		if (!bHd || bReflectionOnly)
+		// Sanity: a mesh far bigger than its own definition claims is a mis-import (2026-09-05: a
+		// 7 m cloth tarp came in as a 260 m sheet). Placed, tagged, hidden, counted - never shown as fact.
+		bool bSuspect = false;
+		{
+			double BsR = 0.0;
+			Ent->TryGetNumberField(TEXT("bsRadius"), BsR);
+			if (!bProxy && BsR > 0.0 && Mesh)
+			{
+				const double MeshR = Mesh->GetBoundingBox().GetExtent().Size() / 100.0;   // metres
+				if (MeshR > 3.0 * BsR + 5.0) { bSuspect = true; A->Tags.Add(FName(TEXT("RUDE_SUSPECT_BOUNDS"))); }
+			}
+		}
+		if (!bHd || bReflectionOnly || bSuspect)
 		{
 			SMC->SetVisibility(false, true);
 			SMC->SetHiddenInGame(true, true);

@@ -272,6 +272,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show or hide everything one map file places - the way a script turns a map on or off in game. Mission and variant maps start hidden."))
 	static FString SetYmapVisible(const FString& YmapName, const FString& Visible);
 
+	// What is under a pixel of a CaptureView frame (same CamSpec; U,V 0..1; Aspect optional). Names the
+	// first visible hit (actor, archetype, ymap, LOD level, mesh, master materials) and what the ray passed.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Ask what object is under a point of a screenshot: give the same camera as the capture and where in the frame (0-1 across, 0-1 down).", RudeAudience="agent"))
+	static FString PickAt(const FString& CamSpec, const FString& U, const FString& V, const FString& Aspect);
+
+	// The numbers behind an imported mesh: bounds, LOD0 vertex extents, collision primitive counts.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show the size numbers of an imported model: bounds, real vertex extents, collision pieces.", RudeAudience="agent"))
+	static FString InspectMesh(const FString& AssetPath);
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);
