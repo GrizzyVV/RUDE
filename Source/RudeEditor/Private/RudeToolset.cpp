@@ -5002,8 +5002,12 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 		++YmapsWithEntities;
 		FString YmapName = FPaths::GetBaseFilename(F);
 		YmapName.RemoveFromEnd(TEXT(".ymap"));
-		ScenesJson += FString::Printf(TEXT("%s{\"ymap\":\"%s\",\"entities\":[%s]}"),
-			ScenesJson.IsEmpty() ? TEXT("") : TEXT(","), *YmapName, *EntJson);
+		// CMapData/flags: bit 0 = script-controlled (mission/variant content the game loads on
+		// demand), bit 1 = LOD container - measured over downtown's 158 ymaps 2026-09-05.
+		uint32 YmapFlags = 0;
+		if (const FXmlNode* FN = Root->FindChildNode(TEXT("flags"))) { YmapFlags = (uint32)FCString::Strtoui64(*FN->GetAttribute(TEXT("value")), nullptr, 10); }
+		ScenesJson += FString::Printf(TEXT("%s{\"ymap\":\"%s\",\"ymapFlags\":%u,\"entities\":[%s]}"),
+			ScenesJson.IsEmpty() ? TEXT("") : TEXT(","), *YmapName, YmapFlags, *EntJson);
 	}
 	const FString ManifestPath = FPaths::ProjectSavedDir() / TEXT("RUDE") /
 		FString::Printf(TEXT("area_%s_manifest.json"),
@@ -7002,6 +7006,7 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 
 	TMap<FString, UStaticMesh*> MeshCache;
 	int32 NumYmaps = 0, NumLayers = 0, NumActors = 0, NumProxies = 0, NumFiltered = 0, NumMalformed = 0, LayerFailures = 0;
+	int32 NumScriptYmaps = 0, NumScriptActors = 0;
 	TMap<FString, int32> Missing;
 	for (const TSharedPtr<FJsonValue>& SceneVal : Scenes)
 	{
@@ -7011,6 +7016,10 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 		if (!(*SceneObj)->TryGetArrayField(TEXT("entities"), Entities) || Entities->Num() == 0) { continue; }
 		const FString YmapName = (*SceneObj)->GetStringField(TEXT("ymap"));
 		++NumYmaps;
+		double YmapFlagsD = 0.0;
+		(*SceneObj)->TryGetNumberField(TEXT("ymapFlags"), YmapFlagsD);
+		const bool bScriptYmap = (((uint32)YmapFlagsD) & 1u) != 0;   // CMapData flags bit 0 (measured)
+		if (bScriptYmap) { ++NumScriptYmaps; }
 		// one Data Layer per ymap: asset DL_<ymap> beside the level, Runtime, loaded in editor
 		UDataLayerInstance* Layer = nullptr;
 		{
@@ -7023,7 +7032,13 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 			P.DataLayerAsset = Asset;
 			P.WorldDataLayers = World->GetWorldDataLayers();
 			Layer = DlSub->CreateDataLayerInstance(P);
-			if (Layer) { ++NumLayers; DlSub->SetDataLayerIsLoadedInEditor(Layer, true, false); }
+			if (Layer)
+			{
+				++NumLayers;
+				DlSub->SetDataLayerIsLoadedInEditor(Layer, true, false);   // always loaded: the export needs every actor
+				// a script-controlled ymap starts UNLOADED at runtime (the game loads it on demand)
+				if (bScriptYmap) { Layer->SetInitialRuntimeState(EDataLayerRuntimeState::Unloaded); }
+			}
 			else { ++LayerFailures; }
 		}
 		TArray<AActor*> LayerActors;
@@ -7064,6 +7079,13 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 			{
 				++NumActors;
 				if (!Mesh) { ++NumProxies; }
+				if (bScriptYmap)
+				{
+					// placed, tagged, hidden: visible again through SetYmapVisible (the IPL toggle)
+					A->Tags.Add(FName(TEXT("RUDE_SCRIPT_YMAP")));
+					if (UStaticMeshComponent* SMC = A->FindComponentByClass<UStaticMeshComponent>()) { SMC->SetVisibility(false, true); SMC->SetHiddenInGame(true, true); }
+					++NumScriptActors;
+				}
 				LayerActors.Add(A);
 			}
 		}
@@ -7096,11 +7118,12 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"level\":\"%s\",\"worldPartition\":true,\"ymaps\":%d,\"layers\":%d,\"layerFailures\":%d,")
 		TEXT("\"actors\":%d,\"proxies\":%d,\"filteredByLod\":%d,\"malformedEntities\":%d,\"missingMeshes\":%d,")
-		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"previousFilesCleared\":%d,\"topMissing\":[%s]}"),
+		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"previousFilesCleared\":%d,")
+		TEXT("\"scriptYmaps\":%d,\"scriptActorsHidden\":%d,\"topMissing\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Path), NumYmaps, NumLayers, LayerFailures,
 		NumActors, NumProxies, NumFiltered, NumMalformed, Missing.Num(),
 		bSaved ? TEXT("true") : TEXT("false"), FPaths::FileExists(MapFile) ? TEXT("true") : TEXT("false"),
-		GRudeLastSaved, GRudeLastSaveFailed, Cleared, *TopMissing);
+		GRudeLastSaved, GRudeLastSaveFailed, Cleared, NumScriptYmaps, NumScriptActors, *TopMissing);
 }
 
 // Raw item slices: the text of each "  <Item ...>" ... "  </Item>" (indent 2) inside the named
@@ -7705,6 +7728,39 @@ FString URudeToolset::RegenerateMasters()
 		Seen > 0 ? TEXT("true") : TEXT("false"), Seen, Regenerated, Unparsed, *Names);
 }
 
+// ---- SetYmapVisible ---------------------------------------------------------------------
+// Show or hide one ymap's placed actors (folder RUDE_LS/<ymap>) - the editor's stand-in for the
+// game's IPL toggle on a script-controlled map. LOD-hidden actors stay governed by SetLodView.
+FString URudeToolset::SetYmapVisible(const FString& YmapName, const FString& Visible)
+{
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return TEXT("{\"ok\":false,\"error\":\"no editor world\"}"); }
+	const FString Want = YmapName.TrimStartAndEnd().ToLower();
+	const bool bShow = Visible.TrimStartAndEnd().Equals(TEXT("true"), ESearchCase::IgnoreCase) || Visible.TrimStartAndEnd() == TEXT("1");
+	const FString Folder = TEXT("RUDE_LS/") + Want;
+	int32 Touched = 0, SkippedLod = 0;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (!It->GetFolderPath().ToString().Equals(Folder, ESearchCase::IgnoreCase)) { continue; }
+		bool bLodHidden = false;
+		for (const FName& T : It->Tags)
+		{
+			const FString S = T.ToString();
+			if (S.StartsWith(TEXT("RUDE_LOD:")) && !S.EndsWith(TEXT("_HD"))) { bLodHidden = true; }
+		}
+		if (bShow && bLodHidden) { ++SkippedLod; continue; }
+		if (UStaticMeshComponent* SMC = It->FindComponentByClass<UStaticMeshComponent>())
+		{
+			SMC->SetVisibility(bShow, true);
+			SMC->SetHiddenInGame(!bShow, true);
+			It->MarkPackageDirty();
+			++Touched;
+		}
+	}
+	return FString::Printf(TEXT("{\"ok\":%s,\"ymap\":\"%s\",\"visible\":%s,\"actors\":%d,\"lodGoverned\":%d}"),
+		Touched > 0 ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Want), bShow ? TEXT("true") : TEXT("false"), Touched, SkippedLod);
+}
+
 // ---- XmlShapeRoundTrip -------------------------------------------------------------------
 // Walk a parsed tree into (path -> [attr=value...] + leaf text) rows, order-preserving by path
 // with sibling ordinals, so two parses compare exactly and a mismatch names its path.
@@ -8194,7 +8250,11 @@ static AActor* RudeSpawnEntityActor(UWorld* World, const FString& YmapName, cons
 		if (LodLv.IsEmpty()) { LodLv = TEXT("LODTYPES_DEPTH_HD"); }
 		A->Tags.Add(FName(*(TEXT("RUDE_LOD:") + LodLv)));
 		const bool bHd = LodLv == TEXT("LODTYPES_DEPTH_HD") || LodLv == TEXT("LODTYPES_DEPTH_ORPHANHD");
-		if (!bHd)
+		double FlagsD = 0.0;
+		Ent->TryGetNumberField(TEXT("flags"), FlagsD);
+		const bool bReflectionOnly = (((uint32)FlagsD) & 0x02000000u) != 0;   // ONLY_RENDER_IN_REFLECTIONS
+		if (bReflectionOnly) { A->Tags.Add(FName(TEXT("RUDE_REFLECTION_ONLY"))); }
+		if (!bHd || bReflectionOnly)
 		{
 			SMC->SetVisibility(false, true);
 			SMC->SetHiddenInGame(true, true);

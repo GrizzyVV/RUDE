@@ -267,6 +267,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Rebuild RUDE's generated master materials that are out of date, so every material using them updates.", RudeAudience="agent"))
 	static FString RegenerateMasters();
 
+	// Show/hide one ymap's placed actors - the editor's stand-in for the game's IPL toggle on a
+	// script-controlled map (CMapData flags bit 0; those start hidden).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show or hide everything one map file places - the way a script turns a map on or off in game. Mission and variant maps start hidden."))
+	static FString SetYmapVisible(const FString& YmapName, const FString& Visible);
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);
