@@ -6345,7 +6345,7 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 // content package is saved directly through UPackage::SavePackage - no prompt, no notification,
 // no Slate - and the count of what was written is what the caller gets.
 static int32 GRudeLastSaved = 0, GRudeLastSaveFailed = 0;
-static bool RudeSaveDirty(bool bMaps, bool bContent)
+bool RudeSaveDirty(bool bMaps, bool bContent)   // shared with RudeBuildArea.cpp (extern)
 {
 	GRudeLastSaved = 0; GRudeLastSaveFailed = 0;
 	if (!FSlateApplication::IsInitialized())
@@ -6898,13 +6898,38 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 	}
 	const bool bAll = Filter.TrimStartAndEnd().Equals(TEXT("ALL"), ESearchCase::IgnoreCase);
 
+	const FString LevelName = FPackageName::GetLongPackageAssetName(Path);
+	const FString LayerDir = FPackageName::GetLongPackagePath(Path) / (LevelName + TEXT("_Layers"));
+	// A REBUILD replaces the level. World Partition keeps every actor as its own file under
+	// __ExternalActors__/<level>/ and discovers them by scanning that folder, so a stale actor file
+	// from the previous build would come back as a duplicate. Clear the level's files first.
+	int32 Cleared = 0;
+	{
+		FString MapFile;
+		if (FPackageName::TryConvertLongPackageNameToFilename(Path, MapFile, FPackageName::GetMapPackageExtension()) && FPaths::FileExists(MapFile))
+		{
+			const FString ContentRoot = FPaths::GetPath(FPackageName::LongPackageNameToFilename(TEXT("/Game/"), TEXT("")));
+			const FString Rel = Path.Mid(FString(TEXT("/Game/")).Len());
+			for (const TCHAR* Sub : { TEXT("__ExternalActors__"), TEXT("__ExternalObjects__") })
+			{
+				const FString Dir = FPaths::Combine(ContentRoot, Sub, Rel);
+				if (IFileManager::Get().DirectoryExists(*Dir))
+				{
+					TArray<FString> Files;
+					IFileManager::Get().FindFilesRecursive(Files, *Dir, TEXT("*"), true, false);
+					Cleared += Files.Num();
+					IFileManager::Get().DeleteDirectory(*Dir, false, true);
+				}
+			}
+			IFileManager::Get().Delete(*MapFile, false, true, true);
+			++Cleared;
+		}
+	}
 	UWorld* World = GEditor->NewMap(/*bIsPartitionedWorld*/ true);
 	if (!World || !World->GetWorldPartition()) { return Fail(TEXT("could not create a World Partition world")); }
 	UDataLayerEditorSubsystem* DlSub = UDataLayerEditorSubsystem::Get();
 	if (!DlSub) { return Fail(TEXT("no DataLayerEditorSubsystem")); }
 	UStaticMesh* ProxyCube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
-	const FString LevelName = FPackageName::GetLongPackageAssetName(Path);
-	const FString LayerDir = FPackageName::GetLongPackagePath(Path) / (LevelName + TEXT("_Layers"));
 
 	TMap<FString, UStaticMesh*> MeshCache;
 	int32 NumYmaps = 0, NumLayers = 0, NumActors = 0, NumProxies = 0, NumFiltered = 0, NumMalformed = 0, LayerFailures = 0;
@@ -7002,11 +7027,11 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"level\":\"%s\",\"worldPartition\":true,\"ymaps\":%d,\"layers\":%d,\"layerFailures\":%d,")
 		TEXT("\"actors\":%d,\"proxies\":%d,\"filteredByLod\":%d,\"malformedEntities\":%d,\"missingMeshes\":%d,")
-		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"topMissing\":[%s]}"),
+		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"previousFilesCleared\":%d,\"topMissing\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Path), NumYmaps, NumLayers, LayerFailures,
 		NumActors, NumProxies, NumFiltered, NumMalformed, Missing.Num(),
 		bSaved ? TEXT("true") : TEXT("false"), FPaths::FileExists(MapFile) ? TEXT("true") : TEXT("false"),
-		GRudeLastSaved, GRudeLastSaveFailed, *TopMissing);
+		GRudeLastSaved, GRudeLastSaveFailed, Cleared, *TopMissing);
 }
 
 // Raw item slices: the text of each "  <Item ...>" ... "  </Item>" (indent 2) inside the named
@@ -7366,6 +7391,97 @@ FString URudeToolset::SetArchetypeField(const FString& PaletteFolder, const FStr
 	return FString::Printf(TEXT("{\"ok\":true,\"archetype\":\"%s\",\"field\":\"%s\",\"before\":\"%s\",\"after\":\"%s\",\"changed\":%s}"),
 		*RudeJsonEscape(Name), *RudeJsonEscape(Field), *RudeJsonEscape(Before), *RudeJsonEscape(After),
 		A->FieldsKey() != A->SourceFieldsKey ? TEXT("true") : TEXT("false"));
+}
+
+// ---- NewLevel / SaveLevel (agent) ---------------------------------------------------------
+FString URudeToolset::NewLevel(const FString& Partitioned)
+{
+	if (!GEditor) { return TEXT("{\"ok\":false,\"error\":\"no GEditor\"}"); }
+	const bool bWP = Partitioned.TrimStartAndEnd().Equals(TEXT("true"), ESearchCase::IgnoreCase) || Partitioned.TrimStartAndEnd() == TEXT("1");
+	UWorld* World = GEditor->NewMap(bWP);
+	return FString::Printf(TEXT("{\"ok\":%s,\"worldPartition\":%s,\"world\":\"%s\"}"),
+		World ? TEXT("true") : TEXT("false"), (World && World->GetWorldPartition()) ? TEXT("true") : TEXT("false"),
+		World ? *RudeJsonEscape(World->GetOutermost()->GetName()) : TEXT(""));
+}
+
+FString URudeToolset::SaveLevel(const FString& LevelPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	FString Path = LevelPath.TrimStartAndEnd();
+	if (Path.IsEmpty()) { Path = World->GetOutermost()->GetName(); }
+	if (!FPackageName::IsValidLongPackageName(Path) || Path.StartsWith(TEXT("/Temp"))) { return Fail(TEXT("give a content path for the level (it is untitled)")); }
+	bool bSaved = FEditorFileUtils::SaveMap(World, Path);
+	FString MapFile;
+	FPackageName::TryConvertLongPackageNameToFilename(Path, MapFile, FPackageName::GetMapPackageExtension());
+	if (!FPaths::FileExists(MapFile))
+	{
+		World->GetOutermost()->MarkPackageDirty();
+		bSaved = RudeSaveDirty(true, true) && FPaths::FileExists(MapFile);
+	}
+	else { RudeSaveDirty(false, true); }
+	return FString::Printf(TEXT("{\"ok\":%s,\"level\":\"%s\",\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d}"),
+		bSaved ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Path), FPaths::FileExists(MapFile) ? TEXT("true") : TEXT("false"),
+		GRudeLastSaved, GRudeLastSaveFailed);
+}
+
+// ---- PlaceInterior --------------------------------------------------------------------------
+// A packed interior level (PackAreaLevelInstance's output, built at the origin from ImportMlo) placed
+// as a Level Instance at every CMloInstanceDef of that archetype in the open level. The entity actor
+// (proxy cube + URudeEntityComponent) stays the placement's owner: the Level Instance attaches to it,
+// so the export still reads one entity per placement and the interior follows the entity when moved.
+FString URudeToolset::PlaceInterior(const FString& MloArchetypeName, const FString& LevelAsset)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	const FString Wanted = MloArchetypeName.TrimStartAndEnd().ToLower();
+	if (Wanted.IsEmpty()) { return Fail(TEXT("MloArchetypeName is empty")); }
+	const FString Pkg = LevelAsset.TrimStartAndEnd();
+	if (!FPackageName::DoesPackageExist(Pkg)) { return Fail(FString::Printf(TEXT("no level asset at %s"), *Pkg)); }
+	const TSoftObjectPtr<UWorld> WorldAsset(FSoftObjectPath(Pkg + TEXT(".") + FPackageName::GetShortName(Pkg)));
+	ULevelInstanceSubsystem* Sub = World->GetSubsystem<ULevelInstanceSubsystem>();
+	int32 Placements = 0, Placed = 0, AlreadyPlaced = 0, Refused = 0;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		const URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>();
+		if (!R || R->ItemType != TEXT("CMloInstanceDef") || R->ArchetypeName.ToLower() != Wanted) { continue; }
+		++Placements;
+		// already placed? (an attached Level Instance child)
+		bool bHas = false;
+		TArray<AActor*> Children;
+		It->GetAttachedActors(Children);
+		for (AActor* Ch : Children) { if (Cast<ILevelInstanceInterface>(Ch)) { bHas = true; break; } }
+		if (bHas) { ++AlreadyPlaced; continue; }
+		FActorSpawnParameters Spawn;
+		Spawn.ObjectFlags |= RF_Transactional;
+		AActor* LiActor = World->SpawnActor<AActor>(ALevelInstance::StaticClass(), It->GetActorTransform(), Spawn);
+		ILevelInstanceInterface* LI = Cast<ILevelInstanceInterface>(LiActor);
+		if (!LI || !LI->SetWorldAsset(WorldAsset))
+		{
+			++Refused;
+			if (LiActor) { World->DestroyActor(LiActor); }
+			continue;
+		}
+		LI->UpdateLevelInstanceFromWorldAsset();
+		LiActor->SetActorLabel(TEXT("MLO_") + Wanted);
+		LiActor->SetFolderPath(It->GetFolderPath());
+		LiActor->AttachToActor(*It, FAttachmentTransformRules::KeepWorldTransform);
+		// the proxy cube no longer needs to show: hide the entity's own mesh, keep the component
+		if (UStaticMeshComponent* SMC = It->FindComponentByClass<UStaticMeshComponent>()) { SMC->SetVisibility(false); }
+		if (Sub) { Sub->BlockLoadLevelInstance(LI); }
+		++Placed;
+	}
+	const bool bOk = Placements > 0 && Refused == 0;
+	return FString::Printf(TEXT("{\"ok\":%s,\"archetype\":\"%s\",\"placements\":%d,\"placed\":%d,\"alreadyPlaced\":%d,\"refused\":%d,\"levelAsset\":\"%s\"}"),
+		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Wanted), Placements, Placed, AlreadyPlaced, Refused, *RudeJsonEscape(Pkg));
 }
 
 // ---- XmlShapeRoundTrip -------------------------------------------------------------------

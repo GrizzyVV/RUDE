@@ -75,6 +75,7 @@
 // not Matt's - BUILD_AREA_DESIGN is the spec, the calls below are the reading of it.
 
 #include "RudeToolset.h"
+bool RudeSaveDirty(bool bMaps, bool bContent);   // RudeToolset.cpp
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Editor.h"
@@ -263,11 +264,9 @@ namespace RudeBuildArea
 		// NOTHING — FileHelpers.cpp:4659-4667. That is why this warning used to fire on every
 		// headless pack. Setting the flag routes to the engine's own modal-free save path, the
 		// same TGuardValue the engine uses at FileHelpers.cpp:5919.
-		TGuardValue<bool> UnattendedScriptGuard(GIsRunningUnattendedScript,
-			FApp::IsUnattended() ? true : GIsRunningUnattendedScript);
-		if (!FEditorFileUtils::SaveDirtyPackages(/*bPromptUserToSave*/ false,
-			/*bSaveMapPackages*/ true, /*bSaveContentPackages*/ true, /*bFastSave*/ false,
-			/*bNotifyNoPackagesSaved*/ false, /*bCanBeDeclined*/ false))
+		// Headless (a commandlet) has no Slate: SaveDirtyPackages asserts there (2026-09-05).
+		// RudeSaveDirty routes a headless run through UPackage::Save; the editor path is unchanged.
+		if (!RudeSaveDirty(/*bMaps*/ true, /*bContent*/ true))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("[RUDE] headless: SaveDirtyPackages reported failure "
 				"after moving actors into '%s' - continuing to the on-disk check, which is the "

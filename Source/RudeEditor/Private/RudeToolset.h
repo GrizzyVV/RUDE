@@ -238,6 +238,19 @@ public:
 	static FString SetArchetypeField(const FString& PaletteFolder, const FString& ArchetypeName,
 	                                 const FString& Field, const FString& Value);
 
+	// Script plumbing: a fresh untitled level (Partitioned = true/false) and a headless-safe map save.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Start a new empty level for the tools that follow.", RudeAudience="agent"))
+	static FString NewLevel(const FString& Partitioned);
+
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save the open level to a content path (needed for an untitled level).", RudeAudience="agent"))
+	static FString SaveLevel(const FString& LevelPath);
+
+	// A packed interior level placed as a Level Instance at every CMloInstanceDef of that archetype in
+	// the open level, attached to the placement's entity actor (the proxy cube is hidden, the
+	// component stays the export's source of truth).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Put a built interior into your level everywhere the map places it. Give the interior's archetype name and the interior level asset that Pack Area Level Instance made."))
+	static FString PlaceInterior(const FString& MloArchetypeName, const FString& LevelAsset);
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);
