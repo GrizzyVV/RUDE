@@ -67,6 +67,11 @@
 #include "ContentStreaming.h"
 #include "Containers/Ticker.h"
 #include "LevelInstance/LevelInstanceActor.h"
+#include "Engine/DirectionalLight.h"
+#include "Engine/SkyLight.h"
+#include "Components/DirectionalLightComponent.h"
+#include "Components/SkyLightComponent.h"
+#include "Components/SkyAtmosphereComponent.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Engine/LevelStreaming.h"
 #include "ShaderCompiler.h"
@@ -6927,9 +6932,45 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 	}
 	UWorld* World = GEditor->NewMap(/*bIsPartitionedWorld*/ true);
 	if (!World || !World->GetWorldPartition()) { return Fail(TEXT("could not create a World Partition world")); }
+	// Wave 1 = the bake-district: everything resident. With streaming ON, an editor session shows
+	// NOTHING until regions are loaded by hand (measured 2026-09-05: a black frame over 14,248
+	// actors). Streaming comes back with the corpus-streamed viewer (Wave 2+).
+	World->GetWorldPartition()->SetEnableStreaming(false);
 	UDataLayerEditorSubsystem* DlSub = UDataLayerEditorSubsystem::Get();
 	if (!DlSub) { return Fail(TEXT("no DataLayerEditorSubsystem")); }
 	UStaticMesh* ProxyCube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	// A fresh world has no light: sun + sky atmosphere + sky light, tagged RUDE_SKY (the
+	// time-of-day rig lands here later; SetWorldHour drives the archetype masks, not this).
+	{
+		FActorSpawnParameters SP;
+		ADirectionalLight* Sun = World->SpawnActor<ADirectionalLight>(FVector::ZeroVector, FRotator(-45.f, 30.f, 0.f), SP);
+		if (Sun)
+		{
+			Sun->SetActorLabel(TEXT("RUDE_Sun"));
+			Sun->Tags.Add(FName(TEXT("RUDE_SKY")));
+			if (UDirectionalLightComponent* DLC = Cast<UDirectionalLightComponent>(Sun->GetLightComponent()))
+			{
+				DLC->SetMobility(EComponentMobility::Movable);
+				DLC->SetIntensity(8.f);
+				DLC->bAtmosphereSunLight = true;
+			}
+		}
+		if (ASkyAtmosphere* Atm = World->SpawnActor<ASkyAtmosphere>(FVector::ZeroVector, FRotator::ZeroRotator, SP))
+		{
+			Atm->SetActorLabel(TEXT("RUDE_SkyAtmosphere"));
+			Atm->Tags.Add(FName(TEXT("RUDE_SKY")));
+		}
+		if (ASkyLight* Sky = World->SpawnActor<ASkyLight>(FVector::ZeroVector, FRotator::ZeroRotator, SP))
+		{
+			Sky->SetActorLabel(TEXT("RUDE_SkyLight"));
+			Sky->Tags.Add(FName(TEXT("RUDE_SKY")));
+			if (USkyLightComponent* SLC = Sky->GetLightComponent())
+			{
+				SLC->SetMobility(EComponentMobility::Movable);
+				SLC->bRealTimeCapture = true;
+			}
+		}
+	}
 
 	TMap<FString, UStaticMesh*> MeshCache;
 	int32 NumYmaps = 0, NumLayers = 0, NumActors = 0, NumProxies = 0, NumFiltered = 0, NumMalformed = 0, LayerFailures = 0;
