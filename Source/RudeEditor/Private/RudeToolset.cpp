@@ -23,6 +23,8 @@
 #include "StaticMeshCompiler.h"
 #include "UObject/Package.h"
 #include "XmlFile.h"
+#include "RudeCorpus.h"
+#include "RudeDds.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/SpotLightComponent.h"
@@ -1587,6 +1589,12 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 	//                     else-branch. That is defensible and it is now DISCLOSED rather than assumed.
 	int32 Declared = 0, ItemsWithoutName = 0, UsageDefaulted = 0, UsageUnknown = 0;
 	int32 MissingPixelCount = 0;
+	// Where the pixels came from. The corpus ships DDS sidecars ("<stem>/<tex>.dds", the game's
+	// own block data behind a DDS header); the PNG path is the older offline bridge, kept as the
+	// fallback. A DDS that exists but cannot be decoded (BC7, an unknown layout) is REFUSED and
+	// counted under pixelsRefused with its reason - never silently skipped, never guessed.
+	int32 PixelsFromDds = 0, PixelsFromPng = 0, PixelsRefused = 0;
+	FString RefusedReasons;
 	FString Missing;
 	for (const FXmlNode* Item : Root->GetChildrenNodes())
 	{
@@ -1606,9 +1614,17 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 			++UsageUnknown;
 		}
 
-		// decoded pixels (offline BC-decode bridge until native decode lands)
+		// Pixels: the DDS sidecar first (named by the manifest's <FileName>, else "<name>.dds"),
+		// then the offline PNG bridge.
+		const FXmlNode* FileNode = Item->FindChildNode(TEXT("FileName"));
+		const FString DdsName = FileNode && !FileNode->GetContent().TrimStartAndEnd().IsEmpty()
+			? FileNode->GetContent().TrimStartAndEnd() : (TexName + TEXT(".dds"));
+		const FString DdsPath = PixelFolder / DdsName;
 		const FString PngPath = PixelFolder / (TexName + TEXT(".png"));
 		TArray<uint8> PngBytes;
+		TArray<uint8> BGRA;
+		int32 W = 0, H = 0;
+		bool bHavePixels = false;
 		// ⛔ The missingPixels ARRAY is capped by nothing and read by no batch; MissingPixelCount is
 		// the scalar a caller can actually aggregate (ImportYtdBatch could not sum a JSON list).
 		auto NoPixels = [&]()
@@ -1619,25 +1635,48 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 				Missing += FString::Printf(TEXT("%s\"%s\""), Missing.IsEmpty() ? TEXT("") : TEXT(","), *TexName);
 			}
 		};
-		if (!FFileHelper::LoadFileToArray(PngBytes, *PngPath))
+		if (FPaths::FileExists(DdsPath))
 		{
-			NoPixels();
-			continue;
+			FRudeDdsImage Img;
+			FString DdsErr;
+			if (FRudeDds::Load(DdsPath, Img, DdsErr))
+			{
+				W = Img.Width; H = Img.Height; BGRA = MoveTemp(Img.Bgra);
+				bHavePixels = true;
+				++PixelsFromDds;
+			}
+			else
+			{
+				++PixelsRefused;
+				if (PixelsRefused <= 10)
+				{
+					RefusedReasons += FString::Printf(TEXT("%s\"%s: %s\""), RefusedReasons.IsEmpty() ? TEXT("") : TEXT(","), *TexName, *DdsErr);
+				}
+				continue;
+			}
 		}
-		TSharedPtr<IImageWrapper> Png = ImageWrapper.CreateImageWrapper(EImageFormat::PNG);
-		if (!Png.IsValid() || !Png->SetCompressed(PngBytes.GetData(), PngBytes.Num()))
+		if (!bHavePixels)
 		{
-			NoPixels();
-			continue;
+			if (!FFileHelper::LoadFileToArray(PngBytes, *PngPath))
+			{
+				NoPixels();
+				continue;
+			}
+			TSharedPtr<IImageWrapper> Png = ImageWrapper.CreateImageWrapper(EImageFormat::PNG);
+			if (!Png.IsValid() || !Png->SetCompressed(PngBytes.GetData(), PngBytes.Num()))
+			{
+				NoPixels();
+				continue;
+			}
+			if (!Png->GetRaw(ERGBFormat::BGRA, 8, BGRA))
+			{
+				NoPixels();
+				continue;
+			}
+			W = Png->GetWidth();
+			H = Png->GetHeight();
+			++PixelsFromPng;
 		}
-		TArray<uint8> BGRA;
-		if (!Png->GetRaw(ERGBFormat::BGRA, 8, BGRA))
-		{
-			NoPixels();
-			continue;
-		}
-		const int32 W = Png->GetWidth();
-		const int32 H = Png->GetHeight();
 
 		const FString PackageName = DestFolder / TxdName / TexName;
 		if (!FPackageName::IsValidLongPackageName(PackageName))
@@ -1711,10 +1750,11 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"txd\":\"%s\",\"declared\":%d,\"imported\":%d,\"invalidNames\":%d,")
 		TEXT("\"itemsWithoutName\":%d,\"usageDefaulted\":%d,\"usageUnknown\":%d,")
-		TEXT("\"missingPixelCount\":%d,\"missingPixels\":[%s]}"),
+		TEXT("\"missingPixelCount\":%d,\"missingPixels\":[%s],")
+		TEXT("\"pixelsFromDds\":%d,\"pixelsFromPng\":%d,\"pixelsRefused\":%d,\"pixelsRefusedReasons\":[%s]}"),
 		bTotalLoss ? TEXT("false") : TEXT("true"),
 		*TxdName, Declared, Imported, InvalidNames, ItemsWithoutName, UsageDefaulted, UsageUnknown,
-		MissingPixelCount, *Missing);
+		MissingPixelCount, *Missing, PixelsFromDds, PixelsFromPng, PixelsRefused, *RefusedReasons);
 }
 
 FString URudeToolset::ExportYdr(const FString& AssetPath, const FString& OutXmlPath)
@@ -4167,35 +4207,42 @@ static bool RudeReadParentTxdFile(const TArray<uint8>& B, TMap<FString, FString>
 // Read every CMapParentTxds table under <CorpusRoot>/ymt. Selection is by CONTENT (RBF0 header
 // naming CMapParentTxds), never by filename - the corpus holds gtxd.ymt and mph4_gtxd.ymt today
 // and a census is a lower bound, so a DLC whose table is named differently must still be found.
-static void RudeReadParentTxds(const FString& CorpusRoot, TMap<FString, FString>& Out,
+static void RudeReadParentTxds(const FRudeCorpus& Corpus, TMap<FString, FString>& Out,
                                int32& Files, int32& Relationships, int32& Refused)
 {
-	TArray<FString> Ymts;
-	IFileManager::Get().FindFiles(Ymts, *(CorpusRoot / TEXT("ymt") / TEXT("*.ymt")), true, false);
-	Ymts.Sort();
-	for (const FString& F : Ymts)
+	// The corpus converts CMapParentTxds (gtxd.ymt, RBF0) to "<name>.ymt.rbf.xml". Every copy across
+	// slots is read lowest-slot first so a DLC's table overrides the base's for the same child -
+	// the game's own load order. A copy still kept binary goes through the RBF0 reader.
+	TArray<const FRudeCorpusEntry*> Rows;
+	Corpus.AllOfType(TEXT("ymt"), Rows);
+	for (const FRudeCorpusEntry* E : Rows)
 	{
-		TArray<uint8> Bytes;
-		if (!FFileHelper::LoadFileToArray(Bytes, *(CorpusRoot / TEXT("ymt") / F))) { continue; }
-		if (Bytes.Num() < 32 || Bytes[0] != 'R' || Bytes[1] != 'B' || Bytes[2] != 'F' || Bytes[3] != '0')
+		if (E->Name != TEXT("gtxd")) { continue; }
+		const FString Path = Corpus.PathOf(*E);
+		if (E->bConverted)
 		{
+			FXmlFile Xml(Path);
+			if (!Xml.IsValid()) { ++Refused; continue; }
+			const FXmlNode* Root = Xml.GetRootNode();
+			const FXmlNode* Rel = Root ? Root->FindChildNode(TEXT("txdRelationships")) : nullptr;
+			if (!Rel) { ++Refused; continue; }
+			++Files;
+			for (const FXmlNode* Item : Rel->GetChildrenNodes())
+			{
+				const FXmlNode* P = Item->FindChildNode(TEXT("parent"));
+				const FXmlNode* C = Item->FindChildNode(TEXT("child"));
+				if (!P || !C) { continue; }
+				const FString Child = C->GetContent().TrimStartAndEnd().ToLower();
+				const FString Parent = P->GetContent().TrimStartAndEnd().ToLower();
+				if (Child.IsEmpty() || Parent.IsEmpty()) { continue; }
+				Out.Add(Child, Parent);
+				++Relationships;
+			}
 			continue;
 		}
-		bool bIsParentTable = false;
-		{
-			const char* Needle = "CMapParentTxds";
-			const int32 NLen = 14;
-			for (int32 i = 0; i + NLen <= 32 && i + NLen <= Bytes.Num(); ++i)
-			{
-				bool bMatch = true;
-				for (int32 j = 0; j < NLen; ++j)
-				{
-					if ((char)Bytes[i + j] != Needle[j]) { bMatch = false; break; }
-				}
-				if (bMatch) { bIsParentTable = true; break; }
-			}
-		}
-		if (!bIsParentTable) { continue; }
+		TArray<uint8> Bytes;
+		if (!FFileHelper::LoadFileToArray(Bytes, *Path)) { ++Refused; continue; }
+		if (Bytes.Num() < 32 || Bytes[0] != 'R' || Bytes[1] != 'B' || Bytes[2] != 'F' || Bytes[3] != '0') { continue; }
 		++Files;
 		int32 Added = 0;
 		if (RudeReadParentTxdFile(Bytes, Out, Added)) { Relationships += Added; }
@@ -4209,79 +4256,30 @@ static void RudeReadParentTxds(const FString& CorpusRoot, TMap<FString, FString>
 // file is ~15 MB / 262,124 entries and only four of its eight lanes are wanted here. Only the
 // two escapes JSON can legally put in these strings are handled (\\ and \"), and anything else
 // aborts the read rather than inventing a value.
-static void RudeReadResolvedSlots(const FString& CorpusRoot, TMap<FString, FString>& DictSlot,
-                                  TMap<FString, FString>& AssetSlot, int32& Entries)
+static void RudeReadCorpusSlots(const FRudeCorpus& Corpus, TMap<FString, FString>& DictSlot,
+                                TMap<FString, FString>& AssetSlot, int32& Entries)
 {
-	FString Text;
-	if (!FFileHelper::LoadFileToString(Text, *(CorpusRoot / TEXT("_RESOLVED.json")))) { return; }
-	int32 At = Text.Find(TEXT("\"winners\""));
-	if (At == INDEX_NONE) { return; }
-	At = Text.Find(TEXT("{"), ESearchCase::CaseSensitive, ESearchDir::FromStart, At);
-	if (At == INDEX_NONE) { return; }
-	++At;
-	const int32 Len = Text.Len();
-	auto ReadString = [&Text, Len](int32& Pos, FString& OutStr) -> bool
+	// Tier 5 of the texture scope: which build slot an asset resolves from. The ledger carries
+	// every copy; Effective() is the copy the game loads. (v1 read an agent-built _RESOLVED.json
+	// for this; that file was a derived view Matt killed - the ledger is the source.)
+	static const TCHAR* DictTypes[] = { TEXT("ytd") };
+	static const TCHAR* AssetTypes[] = { TEXT("ydr"), TEXT("yft"), TEXT("ydd") };
+	TArray<const FRudeCorpusEntry*> Rows;
+	for (const TCHAR* T : DictTypes)
 	{
-		while (Pos < Len && Text[Pos] != TEXT('"'))
-		{
-			const TCHAR C = Text[Pos];
-			if (C == TEXT('}')) { return false; }
-			if (C != TEXT(' ') && C != TEXT('\t') && C != TEXT('\r') && C != TEXT('\n')
-				&& C != TEXT(',') && C != TEXT(':'))
-			{
-				return false;
-			}
-			++Pos;
-		}
-		if (Pos >= Len) { return false; }
-		++Pos;
-		OutStr.Empty();
-		while (Pos < Len)
-		{
-			const TCHAR C = Text[Pos++];
-			if (C == TEXT('"')) { return true; }
-			if (C == TEXT('\\'))
-			{
-				if (Pos >= Len) { return false; }
-				const TCHAR E = Text[Pos++];
-				if (E == TEXT('\\')) { OutStr.AppendChar(TEXT('\\')); }
-				else if (E == TEXT('"')) { OutStr.AppendChar(TEXT('"')); }
-				else { return false; }
-				continue;
-			}
-			OutStr.AppendChar(C);
-		}
-		return false;
-	};
-	FString Key, Value;
-	while (At < Len)
+		Rows.Reset();
+		Corpus.ByPrefix(T, TEXT(""), Rows);
+		for (const FRudeCorpusEntry* E : Rows) { DictSlot.Add(E->Name, E->Slot); ++Entries; }
+	}
+	for (const TCHAR* T : AssetTypes)
 	{
-		if (!ReadString(At, Key)) { break; }
-		if (!ReadString(At, Value)) { break; }
-		++Entries;
-		FString K = Key.ToLower().Replace(TEXT("\\"), TEXT("/"));
-		// ytd -> a texture DICTIONARY's slot. ydr/yft/ydd -> the DRAWABLE's slot. The embedded
-		// dictionary of a drawable is keyed "<stem>__embedded", so it inherits its drawable's slot
-		// and a same-slot embedded copy can win tier 5 like any other dictionary.
-		if (K.StartsWith(TEXT("ytd/")) && K.EndsWith(TEXT(".ytd.xml")))
+		Rows.Reset();
+		Corpus.ByPrefix(T, TEXT(""), Rows);
+		for (const FRudeCorpusEntry* E : Rows)
 		{
-			DictSlot.Add(K.Mid(4, K.Len() - 12), Value);
-		}
-		else if (K.StartsWith(TEXT("ydr/")) && K.EndsWith(TEXT(".ydr.xml")))
-		{
-			const FString Stem = K.Mid(4, K.Len() - 12);
-			AssetSlot.Add(Stem, Value);
-			DictSlot.Add(Stem + TEXT("__embedded"), Value);
-		}
-		else if (K.StartsWith(TEXT("yft/")) && K.EndsWith(TEXT(".yft.xml")))
-		{
-			const FString Stem = K.Mid(4, K.Len() - 12);
-			AssetSlot.Add(Stem, Value);
-			DictSlot.Add(Stem + TEXT("__embedded"), Value);
-		}
-		else if (K.StartsWith(TEXT("ydd/")) && K.EndsWith(TEXT(".ydd.xml")))
-		{
-			AssetSlot.Add(K.Mid(4, K.Len() - 12), Value);
+			AssetSlot.Add(E->Name, E->Slot);
+			DictSlot.Add(E->Name + TEXT("__embedded"), E->Slot);
+			++Entries;
 		}
 	}
 }
@@ -4310,6 +4308,7 @@ struct FRudeArchetypeIndex
 	TMap<FString, FString> DictSlot;      // dictionary -> the build slot it was won from
 	TMap<FString, FString> AssetSlot;     // drawable asset -> the build slot it was won from
 	int32 GtxdFiles = 0, GtxdRelationships = 0, GtxdRefusals = 0, ResolvedEntries = 0;
+	TSharedPtr<FRudeCorpus> Corpus;      // the ledger index every lookup below goes through
 
 	// Assemble everything provable about ONE asset. Nothing is inferred from a path or a filename.
 	FRudeTextureScope MakeScope(const FString& AssetLower) const
@@ -4385,14 +4384,24 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 	// filesystem order, which is not a contract, so the list is SORTED: "the first file wins"
 	// then means "lexicographically first", the same determinism rule AssetTxd's tie-break exists
 	// for. A machine-dependent scope would make a material screenshot non-reproducible again.
+	// The corpus index answers "every ytyp, every slot" in load order (base first); later rows
+	// overwrite earlier ones below, which yields the game's own effective archetype table.
+	{
+		FString CorpusErr;
+		Out.Corpus = FRudeCorpus::Open(CorpusRoot, CorpusErr);
+		if (!Out.Corpus.IsValid()) { Error = CorpusErr; return false; }
+	}
 	TArray<FString> YtypFiles;
-	IFileManager::Get().FindFiles(YtypFiles, *(CorpusRoot / TEXT("ytyp") / TEXT("*.xml")), true, false);
-	YtypFiles.Sort();
+	{
+		TArray<const FRudeCorpusEntry*> Rows;
+		Out.Corpus->AllOfType(TEXT("ytyp"), Rows);
+		for (const FRudeCorpusEntry* E : Rows) { YtypFiles.Add(Out.Corpus->PathOf(*E)); }
+	}
 	TArray<FString> PendingAssets;   // reused per file
 	TSet<FString> PendingTxds;
 	for (const FString& F : YtypFiles)
 	{
-		FXmlFile Xml(CorpusRoot / TEXT("ytyp") / F);
+		FXmlFile Xml(F);
 		if (!Xml.IsValid()) { continue; }
 		const FXmlNode* Root = Xml.GetRootNode();
 		const FXmlNode* Arche = Root ? Root->FindChildNode(TEXT("archetypes")) : nullptr;
@@ -4420,7 +4429,7 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 					     MloName.Equals(MloSearch->WantHashName, ESearchCase::IgnoreCase) ||
 					     (MloSearch->bWantedIsHashName && RudeJoaat(MloName) == MloSearch->WantHash)))
 					{
-						MloSearch->FoundFile = CorpusRoot / TEXT("ytyp") / F;
+						MloSearch->FoundFile = F;
 						MloSearch->FoundName = MloName;
 					}
 				}
@@ -4496,13 +4505,13 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 	}
 	if (Out.ArchToAsset.Num() == 0)
 	{
-		Error = TEXT("no archetypes indexed - check CorpusRoot/ytyp");
+		Error = FString::Printf(TEXT("no archetypes indexed - the corpus at %s lists %d ytyp rows"), *CorpusRoot, YtypFiles.Num());
 		return false;
 	}
 	// Tiers 3 and 5 come from outside the ytyp walk and are loaded here so every lane that scopes
 	// gets all five signals from one call - two index builders would be two ways to disagree.
-	RudeReadParentTxds(CorpusRoot, Out.ParentTxd, Out.GtxdFiles, Out.GtxdRelationships, Out.GtxdRefusals);
-	RudeReadResolvedSlots(CorpusRoot, Out.DictSlot, Out.AssetSlot, Out.ResolvedEntries);
+	RudeReadParentTxds(*Out.Corpus, Out.ParentTxd, Out.GtxdFiles, Out.GtxdRelationships, Out.GtxdRefusals);
+	RudeReadCorpusSlots(*Out.Corpus, Out.DictSlot, Out.AssetSlot, Out.ResolvedEntries);
 	// Every scope source reports its own SIZE, because an index that silently carried ZERO of any
 	// of them would make the scoping a no-op that still looks wired - the exact shape of a gate
 	// that cannot fail. These numbers are what tell the next reader the scope actually arrived,
@@ -4627,10 +4636,12 @@ static void ImportIndexedDrawable(const FString& CorpusRoot, const FRudeArchetyp
 {
 	const FString* Dict = Index.DictEntries.Find(Drawable);
 	const bool bFrag = !Dict && Index.FragmentAssets.Contains(Drawable);
-	const FString XmlPath = Dict
-		? CorpusRoot / TEXT("ydd") / (*Dict + TEXT(".ydd.xml"))
-		: CorpusRoot / (bFrag ? TEXT("yft") : TEXT("ydr"))
-			/ (Drawable + (bFrag ? TEXT(".yft.xml") : TEXT(".ydr.xml")));
+	// Located through the ledger: the copy the game loads, whichever slot it sits in.
+	const FRudeCorpusEntry* Row = Index.Corpus.IsValid()
+		? Index.Corpus->Effective(Dict ? TEXT("ydd") : (bFrag ? TEXT("yft") : TEXT("ydr")), Dict ? *Dict : Drawable)
+		: nullptr;
+	if (!Row) { ++MeshMissing; return; }
+	const FString XmlPath = Index.Corpus->PathOf(*Row);
 	if (!FPaths::FileExists(XmlPath)) { ++MeshMissing; return; }
 	// ⛔ WHY bForce EXISTS (2026-07-30). This skip is the ONLY gate on the fragment and dictionary
 	// lanes, and those lanes are reachable ONLY through ImportArea/ImportMapArea - there is no
@@ -4721,14 +4732,16 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	{
 		P.TrimStartAndEndInline();
 		if (P.IsEmpty()) { continue; }
-		TArray<FString> Found;
-		IFileManager::Get().FindFiles(Found, *(CorpusRoot / TEXT("ymap") / (P + TEXT("*.xml"))), true, false);
-		for (const FString& F : Found)
+		// Every ymap whose NAME starts with the prefix, the effective copy of each (a patchday
+		// re-issue of dt1_00 wins over the base's), as full paths.
+		TArray<const FRudeCorpusEntry*> Found;
+		Index.Corpus->ByPrefix(TEXT("ymap"), P, Found);
+		for (const FRudeCorpusEntry* E : Found)
 		{
 			// TSet::Add's out-param is bIsAlreadyInSet - true for DUPLICATES, not new adds
 			bool bAlready = false;
-			SeenYmap.Add(F, &bAlready);
-			if (!bAlready) { YmapFiles.Add(F); }
+			SeenYmap.Add(E->Name, &bAlready);
+			if (!bAlready) { YmapFiles.Add(Index.Corpus->PathOf(*E)); }
 		}
 	}
 	YmapFiles.Sort();
@@ -4752,7 +4765,7 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	FString ScenesJson;
 	for (const FString& F : YmapFiles)
 	{
-		FXmlFile Xml(CorpusRoot / TEXT("ymap") / F);
+		FXmlFile Xml(F);
 		if (!Xml.IsValid()) { ++YmapsUnreadable; continue; }
 		++YmapsParsed;
 		const FXmlNode* Root = Xml.GetRootNode();
@@ -5011,7 +5024,7 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 	{
 		return Fail(FString::Printf(
 			TEXT("MLO archetype '%s' not found (also tried %s) among %d MLO archetypes under %s. Leading names: %s"),
-			*Wanted, *Search.WantHashName, Search.MloSeen, *(CorpusRoot / TEXT("ytyp")), *Search.Sample));
+			*Wanted, *Search.WantHashName, Search.MloSeen, *CorpusRoot, *Search.Sample));
 	}
 
 	// ---- 2) parse the declaring ytyp's MLO node ----

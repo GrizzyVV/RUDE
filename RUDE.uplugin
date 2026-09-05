@@ -10,6 +10,16 @@
 	"IsBetaVersion": true,
 	"Modules": [
 		{
+			"Name": "RudeCore",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "RudeIntake",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
 			"Name": "RudeEditor",
 			"Type": "Editor",
 			"LoadingPhase": "Default"

@@ -12,6 +12,7 @@
 // 204/204 binaries convert, 5,534,470 leaf comparisons, FMT_BUG = 0). Nothing in RUDE consumed
 // it until now.
 #include "RudeToolset.h"
+#include "RudeCorpus.h"
 
 #include "Components/SceneComponent.h"
 #include "Components/SplineComponent.h"
@@ -277,10 +278,29 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 	// ymt in --types. The two tolerances below were built for that gap and stay because they
 	// cost nothing and keep the tool drivable on ad-hoc folders: CorpusRoot may point straight
 	// AT a folder of *.ymt.xml, and RegionName may be a path to one file.
-	FString Dir = CorpusRoot / TEXT("ymt");
-	if (!FPaths::DirectoryExists(Dir)) { Dir = CorpusRoot; }
-	TArray<FString> Found;
-	IFileManager::Get().FindFiles(Found, *(Dir / TEXT("*.ymt.xml")), true, false);
+	// A corpus root lists every plain META ymt ("<name>.ymt.xml" - the pso/rbf gates are other
+	// tables) through the ledger; any other folder is an ad-hoc drop of *.ymt.xml files.
+	FString Dir = CorpusRoot;
+	TArray<FString> Found;   // full paths
+	if (FRudeCorpus::LooksLikeCorpus(CorpusRoot))
+	{
+		FString CorpusErr;
+		const TSharedPtr<FRudeCorpus> Corpus = FRudeCorpus::Open(CorpusRoot, CorpusErr);
+		if (!Corpus.IsValid()) { return Fail(CorpusErr); }
+		TArray<const FRudeCorpusEntry*> Rows;
+		Corpus->ByPrefix(TEXT("ymt"), TEXT(""), Rows);
+		for (const FRudeCorpusEntry* E : Rows)
+		{
+			if (E->SourceName.EndsWith(TEXT(".ymt.xml"), ESearchCase::IgnoreCase)) { Found.Add(Corpus->PathOf(*E)); }
+		}
+	}
+	else
+	{
+		if (FPaths::DirectoryExists(CorpusRoot / TEXT("ymt"))) { Dir = CorpusRoot / TEXT("ymt"); }
+		TArray<FString> Names;
+		IFileManager::Get().FindFiles(Names, *(Dir / TEXT("*.ymt.xml")), true, false);
+		for (const FString& N : Names) { Found.Add(Dir / N); }
+	}
 	Found.Sort();
 
 	auto StemOf = [](const FString& FileName) -> FString
@@ -313,7 +333,7 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 		{
 			if (StemOf(F).Equals(Region, ESearchCase::IgnoreCase))
 			{
-				RegionFile = Dir / F;
+				RegionFile = F;
 				break;
 			}
 		}

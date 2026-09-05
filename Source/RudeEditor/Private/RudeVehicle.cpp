@@ -30,6 +30,7 @@
 //     identity, but 46 sit two or three bones deep. So the transform MUST be composed up the
 //     chain - reading the local translation alone is wrong on one wheel in six.
 #include "RudeToolset.h"
+#include "RudeCorpus.h"
 
 #include "Components/StaticMeshComponent.h"
 #include "Dom/JsonObject.h"
@@ -215,7 +216,16 @@ FString URudeToolset::ImportVehicle(const FString& CorpusRoot, const FString& Ve
 	Name.RemoveFromEnd(TEXT(".xml"));
 	Name.RemoveFromEnd(TEXT(".yft"));
 	if (Name.IsEmpty()) { return Fail(TEXT("give a vehicle name, e.g. adder")); }
-	const FString XmlPath = CorpusRoot / TEXT("yft") / (Name + TEXT(".yft.xml"));
+	// A corpus root resolves the fragment through the ledger; any other folder is taken as an
+	// ad-hoc "<folder>/<name>.yft.xml" drop so the tool stays drivable on a single export.
+	FString XmlPath = CorpusRoot / (Name + TEXT(".yft.xml"));
+	if (FRudeCorpus::LooksLikeCorpus(CorpusRoot))
+	{
+		FString CorpusErr;
+		const TSharedPtr<FRudeCorpus> Corpus = FRudeCorpus::Open(CorpusRoot, CorpusErr);
+		if (!Corpus.IsValid()) { return Fail(CorpusErr); }
+		if (const FRudeCorpusEntry* Row = Corpus->Effective(TEXT("yft"), Name)) { XmlPath = Corpus->PathOf(*Row); }
+	}
 	if (!FPaths::FileExists(XmlPath))
 	{
 		return Fail(FString::Printf(TEXT("no fragment XML at %s - is the name right, and has "
@@ -361,7 +371,7 @@ FString URudeToolset::ImportVehicle(const FString& CorpusRoot, const FString& Ve
 						continue;
 					}
 					WheelSuffix(C.GroupName, C.Side, C.Axle);
-					C.SidecarPath = CorpusRoot / TEXT("yft") / Name /
+					C.SidecarPath = FPaths::GetPath(XmlPath) / Name /
 						(C.GroupName + TEXT(".ydr.xml"));
 					GeoChildren.Add(MoveTemp(C));
 				}

@@ -31,6 +31,9 @@ public class RudeEditor : ModuleRules
 			"ToolsetRegistry",
 			"ImageWrapper",
 			"Json",
+			// The corpus index: every "where is this game file" question goes through it.
+			"RudeIntake",
+			"RudeCore",
 		});
 	}
 }
