@@ -206,6 +206,38 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one placed object by x,y,z centimetres. Name it by the map file it came from and its number in that file.", RudeAudience="agent"))
 	static FString MoveRudeEntity(const FString& SourceYmap, const FString& SourceIndex, const FString& DeltaCm);
 
+	// Open a saved level in the editor (script chains: build -> reopen -> export). Verdict counts actors
+	// and RUDE entities in the loaded world.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Open a level you built earlier so the tools that follow work on it.", RudeAudience="agent"))
+	static FString OpenLevel(const FString& LevelPath);
+
+	// The district as a World Partition level: one Runtime Data Layer per ymap (toggle a ymap like a
+	// layer), one actor per entity carrying its URudeEntityComponent, saved headless. Reads the
+	// manifest ImportMapArea wrote; meshes from MeshFolder; Filter as ImportScene (empty = HD, ALL).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build a whole district as its own streaming level, with every map file as a layer you can switch on and off, and every object editable. Give the level a content path, and the manifest that Build Map Area wrote."))
+	static FString BuildDistrictLevel(const FString& LevelPath, const FString& ManifestPath,
+	                                  const FString& MeshFolder, const FString& Filter);
+
+	// The archetype palette: one URudeArchetype DataAsset per archetype the manifest's placements refer
+	// to (empty ManifestPath = every archetype in the corpus), fields by tier + provenance + own XML,
+	// under DestFolder; MeshFolder links the imported drawable when it exists.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build the palette of object definitions a district uses, as editable assets you can place from and edit (distances, flags, dictionaries)."))
+	static FString BuildArchetypePalette(const FString& CorpusRoot, const FString& ManifestPath,
+	                                     const FString& DestFolder, const FString& MeshFolder);
+
+	// Export the palette back to ytyp files (FiveM resource): the source ytyp's bytes are SPLICED - an
+	// untouched archetype goes out verbatim, an edited base/time archetype is rebuilt from its asset,
+	// an edited MLO archetype goes out as read (counted). YtypFilter = comma list (empty = all).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save the object-definition palette back out as game definition files, ready to stream. Definitions you did not touch go back exactly as they came in."))
+	static FString ExportPaletteYtyps(const FString& OutDir, const FString& PaletteFolder,
+	                                  const FString& YtypFilter, const FString& CorpusRoot);
+
+	// Set one property on a palette archetype asset by name (reflection; the value as text). The
+	// scriptable edit the palette export gate uses.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Change one value on an object definition in the palette, by field name.", RudeAudience="agent"))
+	static FString SetArchetypeField(const FString& PaletteFolder, const FString& ArchetypeName,
+	                                 const FString& Field, const FString& Value);
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);

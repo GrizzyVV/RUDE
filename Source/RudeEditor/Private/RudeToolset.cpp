@@ -28,8 +28,12 @@
 #include "RudeCorpus.h"
 #include "RudeDds.h"
 #include "RudeEntityComponent.h"
+#include "RudeArchetype.h"
 #include "DataLayer/DataLayerEditorSubsystem.h"
 #include "WorldPartition/WorldPartition.h"
+#include "WorldPartition/WorldPartitionHelpers.h"
+#include "WorldPartition/WorldPartitionHandle.h"
+#include "WorldPartition/WorldPartitionActorDescInstance.h"
 #include "WorldPartition/DataLayer/DataLayerAsset.h"
 #include "WorldPartition/DataLayer/DataLayerInstance.h"
 #include "WorldPartition/DataLayer/WorldDataLayers.h"
@@ -3600,6 +3604,9 @@ static void RudeXmlNodeToString(const FXmlNode* N, FString& O, int32 Depth)
 	O += TEXT("</"); O += N->GetTag(); O += TEXT(">\n");
 }
 
+static AActor* RudeSpawnEntityActor(UWorld* World, const FString& YmapName, const TSharedPtr<FJsonObject>& Ent,
+                                    const FTransform& Xf, UStaticMesh* Mesh, bool bProxy, uint32 TimeMask);
+
 static uint32 RudeJoaat(const FString& Name)
 {
 	uint32 H = 0;
@@ -6816,6 +6823,549 @@ FString URudeToolset::ProbeWorldPartitionLevel(const FString& LevelPath)
 		bAdded ? TEXT("true") : TEXT("false"), bSavedMap ? TEXT("true") : TEXT("false"),
 		bMapOnDisk ? TEXT("true") : TEXT("false"), bSavedAsset ? TEXT("true") : TEXT("false"),
 		GRudeLastSaved, GRudeLastSaveFailed, *RudeJsonEscape(MapFile), *RudeJsonEscape(DlPkgName));
+}
+
+// ---- OpenLevel (agent) ------------------------------------------------------------------
+FString URudeToolset::OpenLevel(const FString& LevelPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	if (!GEditor) { return Fail(TEXT("no GEditor")); }
+	FString File;
+	if (!FPackageName::TryConvertLongPackageNameToFilename(LevelPath.TrimStartAndEnd(), File, FPackageName::GetMapPackageExtension()))
+	{
+		return Fail(TEXT("LevelPath must be a long package name like /Game/RUDE/Levels/Downtown"));
+	}
+	if (!FPaths::FileExists(File)) { return Fail(FString::Printf(TEXT("no level at %s"), *File)); }
+	if (!FEditorFileUtils::LoadMap(File, /*bLoadAsTemplate*/ false, /*bShowProgress*/ false))
+	{
+		return Fail(TEXT("LoadMap failed"));
+	}
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	// A World Partition level loads NO actors by itself in a commandlet (measured 2026-09-05: 8 actors,
+	// 0 entities after LoadMap of a 14,248-actor level). Hold a reference to every actor descriptor so
+	// the actors load and STAY loaded for the tools that follow in this process.
+	static TArray<FWorldPartitionReference> HeldRefs;
+	HeldRefs.Reset();
+	int32 Descs = 0;
+	if (World && World->GetWorldPartition())
+	{
+		UWorldPartition* WP = World->GetWorldPartition();
+		FWorldPartitionHelpers::ForEachActorDescInstance(WP, [&](const FWorldPartitionActorDescInstance* D)
+		{
+			++Descs;
+			HeldRefs.Emplace(D->GetContainerInstance(), D->GetGuid());
+			return true;
+		});
+	}
+	int32 Actors = 0, Entities = 0;
+	if (World)
+	{
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			++Actors;
+			if (It->FindComponentByClass<URudeEntityComponent>()) { ++Entities; }
+		}
+	}
+	return FString::Printf(TEXT("{\"ok\":%s,\"world\":\"%s\",\"worldPartition\":%s,\"actorDescriptors\":%d,\"actors\":%d,\"rudeEntities\":%d}"),
+		World ? TEXT("true") : TEXT("false"), World ? *RudeJsonEscape(World->GetOutermost()->GetName()) : TEXT(""),
+		(World && World->GetWorldPartition()) ? TEXT("true") : TEXT("false"), Descs, Actors, Entities);
+}
+
+// ---- BuildDistrictLevel ------------------------------------------------------------------
+// The WP4 projection: a World Partition level for a district; every ymap in the manifest becomes
+// a Runtime Data Layer (toggle a ymap like a layer); every entity becomes an actor carrying its
+// URudeEntityComponent, placed on its ymap's layer. Saved headless (map + layer assets + the
+// external actor packages). Filter as ImportScene (empty = HD, ALL = every LOD level).
+FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString& ManifestPath,
+                                         const FString& MeshFolder, const FString& Filter)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	if (!GEditor) { return Fail(TEXT("no GEditor")); }
+	const FString Path = LevelPath.TrimStartAndEnd();
+	if (!FPackageName::IsValidLongPackageName(Path)) { return Fail(TEXT("LevelPath must be a long package name like /Game/RUDE/Levels/Downtown")); }
+	FString Raw;
+	if (!FFileHelper::LoadFileToString(Raw, *ManifestPath)) { return Fail(TEXT("cannot read the manifest")); }
+	TArray<TSharedPtr<FJsonValue>> Scenes;
+	{
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Raw);
+		if (!FJsonSerializer::Deserialize(Reader, Scenes)) { return Fail(TEXT("manifest is not a JSON array")); }
+	}
+	const bool bAll = Filter.TrimStartAndEnd().Equals(TEXT("ALL"), ESearchCase::IgnoreCase);
+
+	UWorld* World = GEditor->NewMap(/*bIsPartitionedWorld*/ true);
+	if (!World || !World->GetWorldPartition()) { return Fail(TEXT("could not create a World Partition world")); }
+	UDataLayerEditorSubsystem* DlSub = UDataLayerEditorSubsystem::Get();
+	if (!DlSub) { return Fail(TEXT("no DataLayerEditorSubsystem")); }
+	UStaticMesh* ProxyCube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	const FString LevelName = FPackageName::GetLongPackageAssetName(Path);
+	const FString LayerDir = FPackageName::GetLongPackagePath(Path) / (LevelName + TEXT("_Layers"));
+
+	TMap<FString, UStaticMesh*> MeshCache;
+	int32 NumYmaps = 0, NumLayers = 0, NumActors = 0, NumProxies = 0, NumFiltered = 0, NumMalformed = 0, LayerFailures = 0;
+	TMap<FString, int32> Missing;
+	for (const TSharedPtr<FJsonValue>& SceneVal : Scenes)
+	{
+		const TSharedPtr<FJsonObject>* SceneObj;
+		if (!SceneVal.IsValid() || !SceneVal->TryGetObject(SceneObj)) { continue; }
+		const TArray<TSharedPtr<FJsonValue>>* Entities;
+		if (!(*SceneObj)->TryGetArrayField(TEXT("entities"), Entities) || Entities->Num() == 0) { continue; }
+		const FString YmapName = (*SceneObj)->GetStringField(TEXT("ymap"));
+		++NumYmaps;
+		// one Data Layer per ymap: asset DL_<ymap> beside the level, Runtime, loaded in editor
+		UDataLayerInstance* Layer = nullptr;
+		{
+			const FString PkgName = LayerDir / (TEXT("DL_") + YmapName);
+			UPackage* Pkg = CreatePackage(*PkgName);
+			UDataLayerAsset* Asset = NewObject<UDataLayerAsset>(Pkg, FName(*FPackageName::GetLongPackageAssetName(PkgName)), RF_Public | RF_Standalone);
+			Asset->SetType(EDataLayerType::Runtime);
+			Pkg->MarkPackageDirty();
+			FDataLayerCreationParameters P;
+			P.DataLayerAsset = Asset;
+			P.WorldDataLayers = World->GetWorldDataLayers();
+			Layer = DlSub->CreateDataLayerInstance(P);
+			if (Layer) { ++NumLayers; DlSub->SetDataLayerIsLoadedInEditor(Layer, true, false); }
+			else { ++LayerFailures; }
+		}
+		TArray<AActor*> LayerActors;
+		for (const TSharedPtr<FJsonValue>& EntVal : *Entities)
+		{
+			const TSharedPtr<FJsonObject>* Ent;
+			if (!EntVal.IsValid() || !EntVal->TryGetObject(Ent)) { ++NumMalformed; continue; }
+			FString Lod;
+			(*Ent)->TryGetStringField(TEXT("lodLevel"), Lod);
+			const bool bHd = Lod.IsEmpty() || Lod == TEXT("LODTYPES_DEPTH_HD") || Lod == TEXT("LODTYPES_DEPTH_ORPHANHD");
+			if (!bAll && !bHd) { ++NumFiltered; continue; }
+			const TArray<TSharedPtr<FJsonValue>>* Loc;
+			const TArray<TSharedPtr<FJsonValue>>* Quat;
+			if (!(*Ent)->TryGetArrayField(TEXT("ue_location"), Loc) || Loc->Num() != 3 ||
+			    !(*Ent)->TryGetArrayField(TEXT("ue_quat"), Quat) || Quat->Num() != 4) { ++NumMalformed; continue; }
+			const double SXY = (*Ent)->HasField(TEXT("scaleXY")) ? (*Ent)->GetNumberField(TEXT("scaleXY")) : 1.0;
+			const double SZ = (*Ent)->HasField(TEXT("scaleZ")) ? (*Ent)->GetNumberField(TEXT("scaleZ")) : 1.0;
+			FQuat Q((*Quat)[0]->AsNumber(), (*Quat)[1]->AsNumber(), (*Quat)[2]->AsNumber(), (*Quat)[3]->AsNumber());
+			Q.Normalize();
+			const FTransform Xf(Q, FVector((*Loc)[0]->AsNumber(), (*Loc)[1]->AsNumber(), (*Loc)[2]->AsNumber()), FVector(SXY, SXY, SZ));
+			FString Drawable;
+			(*Ent)->TryGetStringField(TEXT("drawable"), Drawable);
+			Drawable.ToLowerInline();
+			UStaticMesh* Mesh = nullptr;
+			if (!Drawable.IsEmpty())
+			{
+				if (UStaticMesh** Cached = MeshCache.Find(Drawable)) { Mesh = *Cached; }
+				else { Mesh = LoadObject<UStaticMesh>(nullptr, *(MeshFolder / Drawable)); MeshCache.Add(Drawable, Mesh); }
+			}
+			uint32 TimeMask = 0;
+			{
+				int32 TF = 0;
+				if ((*Ent)->TryGetNumberField(TEXT("timeFlags"), TF) && TF > 0) { TimeMask = (uint32)TF; }
+			}
+			if (!Mesh) { Missing.FindOrAdd(Drawable.IsEmpty() ? (*Ent)->GetStringField(TEXT("archetype")) : Drawable)++; }
+			if (!Mesh && !ProxyCube) { continue; }
+			if (AActor* A = RudeSpawnEntityActor(World, YmapName, *Ent, Xf, Mesh ? Mesh : ProxyCube, Mesh == nullptr, TimeMask))
+			{
+				++NumActors;
+				if (!Mesh) { ++NumProxies; }
+				LayerActors.Add(A);
+			}
+		}
+		if (Layer && LayerActors.Num() > 0) { DlSub->AddActorsToDataLayers(LayerActors, { Layer }); }
+	}
+	// save: the map (SaveMap writes external actors + assets; the headless map leg writes the .umap)
+	bool bSaved = FEditorFileUtils::SaveMap(World, Path);
+	FString MapFile;
+	FPackageName::TryConvertLongPackageNameToFilename(Path, MapFile, FPackageName::GetMapPackageExtension());
+	if (!FPaths::FileExists(MapFile))
+	{
+		World->GetOutermost()->MarkPackageDirty();
+		bSaved = RudeSaveDirty(/*bMaps*/ true, /*bContent*/ true) && FPaths::FileExists(MapFile);
+	}
+	else
+	{
+		RudeSaveDirty(/*bMaps*/ false, /*bContent*/ true);   // the layer assets
+	}
+	FString TopMissing;
+	{
+		TArray<TPair<FString, int32>> Sorted;
+		for (const auto& KV : Missing) { Sorted.Add(KV); }
+		Sorted.Sort([](const TPair<FString, int32>& A, const TPair<FString, int32>& B) { return A.Value > B.Value; });
+		for (int32 i = 0; i < Sorted.Num() && i < 12; ++i)
+		{
+			TopMissing += FString::Printf(TEXT("%s\"%s x%d\""), i ? TEXT(",") : TEXT(""), *RudeJsonEscape(Sorted[i].Key), Sorted[i].Value);
+		}
+	}
+	const bool bOk = bSaved && NumActors > 0 && LayerFailures == 0 && NumMalformed == 0;
+	return FString::Printf(
+		TEXT("{\"ok\":%s,\"level\":\"%s\",\"worldPartition\":true,\"ymaps\":%d,\"layers\":%d,\"layerFailures\":%d,")
+		TEXT("\"actors\":%d,\"proxies\":%d,\"filteredByLod\":%d,\"malformedEntities\":%d,\"missingMeshes\":%d,")
+		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"topMissing\":[%s]}"),
+		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Path), NumYmaps, NumLayers, LayerFailures,
+		NumActors, NumProxies, NumFiltered, NumMalformed, Missing.Num(),
+		bSaved ? TEXT("true") : TEXT("false"), FPaths::FileExists(MapFile) ? TEXT("true") : TEXT("false"),
+		GRudeLastSaved, GRudeLastSaveFailed, *TopMissing);
+}
+
+// Raw item slices: the text of each "  <Item ...>" ... "  </Item>" (indent 2) inside the named
+// top-level block of a ROUT XML, in file order, each ending with its newline. Byte-true by
+// construction - the answer to FXmlFile flattening multi-line text (MLO <attachedObjects>).
+static bool RudeRawItems(const FString& Text, const TCHAR* BlockTag, TArray<FString>& Out)
+{
+	const FString Open = FString::Printf(TEXT("\n <%s>\n"), BlockTag);
+	const FString Close = FString::Printf(TEXT("\n </%s>"), BlockTag);
+	const int32 B = Text.Find(Open, ESearchCase::CaseSensitive);
+	if (B == INDEX_NONE) { return false; }
+	const int32 E = Text.Find(Close, ESearchCase::CaseSensitive, ESearchDir::FromStart, B + Open.Len());
+	if (E == INDEX_NONE) { return false; }
+	int32 Pos = B + Open.Len();
+	const FString ItemOpen = TEXT("  <Item");
+	const FString ItemClose = TEXT("\n  </Item>\n");
+	const FString ItemEmptyEnd = TEXT(" />\n");
+	while (Pos < E)
+	{
+		if (!Text.Mid(Pos, ItemOpen.Len()).Equals(ItemOpen)) { break; }
+		// self-closing "  <Item ... />" on one line, or a block ending at "\n  </Item>\n"
+		const int32 Nl = Text.Find(TEXT("\n"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Pos);
+		if (Nl == INDEX_NONE) { break; }
+		const FString FirstLine = Text.Mid(Pos, Nl - Pos + 1);
+		int32 End;
+		if (FirstLine.EndsWith(ItemEmptyEnd)) { End = Nl + 1; }
+		else
+		{
+			const int32 C = Text.Find(ItemClose, ESearchCase::CaseSensitive, ESearchDir::FromStart, Pos);
+			if (C == INDEX_NONE || C > E) { break; }
+			End = C + ItemClose.Len();
+		}
+		Out.Add(Text.Mid(Pos, End - Pos));
+		Pos = End;
+	}
+	return true;
+}
+
+// ---- BuildArchetypePalette ---------------------------------------------------------------
+// A ytyp archetype item -> a URudeArchetype asset. Field order in the file (verified against
+// downtown_01_metadata_001.ytyp.xml 2026-09-05): lodDist flags specialAttribute bbMin bbMax bsCentre
+// bsRadius hdTextureDist name textureDictionary clipDictionary drawableDictionary physicsDictionary
+// assetType assetName extensions [timeFlags] [mloFlags entities rooms portals entitySets ...].
+static void RudeFillArchetype(URudeArchetype* A, const FXmlNode* Item)
+{
+	auto Text = [Item](const TCHAR* Tag) -> FString
+	{
+		const FXmlNode* N = Item->FindChildNode(Tag);
+		return N ? N->GetContent().TrimStartAndEnd() : FString();
+	};
+	auto Val = [Item](const TCHAR* Tag, double Def) -> double
+	{
+		const FXmlNode* N = Item->FindChildNode(Tag);
+		return N ? FCString::Atod(*N->GetAttribute(TEXT("value"))) : Def;
+	};
+	auto Vec = [Item](const TCHAR* Tag) -> FVector
+	{
+		const FXmlNode* N = Item->FindChildNode(Tag);
+		if (!N) { return FVector::ZeroVector; }
+		return FVector(FCString::Atod(*N->GetAttribute(TEXT("x"))), FCString::Atod(*N->GetAttribute(TEXT("y"))), FCString::Atod(*N->GetAttribute(TEXT("z"))));
+	};
+	A->ArchetypeKind = Item->GetAttribute(TEXT("type"));
+	A->Name = Text(TEXT("name"));
+	A->AssetName = Text(TEXT("assetName"));
+	A->AssetType = Text(TEXT("assetType"));
+	A->TextureDictionary = Text(TEXT("textureDictionary"));
+	A->PhysicsDictionary = Text(TEXT("physicsDictionary"));
+	A->DrawableDictionary = Text(TEXT("drawableDictionary"));
+	A->ClipDictionary = Text(TEXT("clipDictionary"));
+	A->LodDist = (float)Val(TEXT("lodDist"), 0.0);
+	A->HdTextureDist = (float)Val(TEXT("hdTextureDist"), 0.0);
+	A->BbMin = Vec(TEXT("bbMin")); A->BbMax = Vec(TEXT("bbMax")); A->BsCentre = Vec(TEXT("bsCentre"));
+	A->BsRadius = (float)Val(TEXT("bsRadius"), 0.0);
+	A->TimeFlags = (uint32)Val(TEXT("timeFlags"), 0.0);
+	A->Flags = (uint32)Val(TEXT("flags"), 0.0);
+	A->SpecialAttribute = (uint32)Val(TEXT("specialAttribute"), 0.0);
+	A->ExtensionsXml.Reset();
+	if (const FXmlNode* Ext = Item->FindChildNode(TEXT("extensions")))
+	{
+		if (Ext->GetChildrenNodes().Num() > 0) { RudeXmlNodeToString(Ext, A->ExtensionsXml, 0); }
+	}
+	A->MloXml.Reset();
+	if (A->ArchetypeKind == TEXT("CMloArchetypeDef"))
+	{
+		// everything after <extensions> verbatim (mloFlags, entities, rooms, portals, entitySets, ...)
+		bool bAfter = false;
+		for (const FXmlNode* K : Item->GetChildrenNodes())
+		{
+			if (bAfter) { RudeXmlNodeToString(K, A->MloXml, 0); }
+			if (K->GetTag() == TEXT("extensions")) { bAfter = true; }
+		}
+	}
+	A->SourceXml.Reset();
+	RudeXmlNodeToString(Item, A->SourceXml, 2);
+	A->SourceFieldsKey = A->FieldsKey();
+}
+
+FString URudeToolset::BuildArchetypePalette(const FString& CorpusRoot, const FString& ManifestPath,
+                                            const FString& DestFolder, const FString& MeshFolder)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	FString CorpusErr;
+	const TSharedPtr<FRudeCorpus> Corpus = FRudeCorpus::Open(CorpusRoot, CorpusErr);
+	if (!Corpus.IsValid()) { return Fail(CorpusErr); }
+	if (!FPackageName::IsValidLongPackageName(DestFolder / TEXT("x"))) { return Fail(TEXT("DestFolder must be a content path like /Game/RUDE/Palette/Downtown")); }
+	// Which archetypes: every name the manifest's placements refer to (empty manifest = every archetype).
+	TSet<FString> Wanted;
+	if (!ManifestPath.TrimStartAndEnd().IsEmpty())
+	{
+		FString Raw;
+		if (!FFileHelper::LoadFileToString(Raw, *ManifestPath)) { return Fail(TEXT("cannot read the manifest")); }
+		TArray<TSharedPtr<FJsonValue>> Scenes;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Raw);
+		if (!FJsonSerializer::Deserialize(Reader, Scenes)) { return Fail(TEXT("manifest is not a JSON array")); }
+		for (const TSharedPtr<FJsonValue>& SV : Scenes)
+		{
+			const TSharedPtr<FJsonObject>* SO;
+			const TArray<TSharedPtr<FJsonValue>>* Ents;
+			if (!SV.IsValid() || !SV->TryGetObject(SO) || !(*SO)->TryGetArrayField(TEXT("entities"), Ents)) { continue; }
+			for (const TSharedPtr<FJsonValue>& EV : *Ents)
+			{
+				const TSharedPtr<FJsonObject>* EO;
+				if (EV.IsValid() && EV->TryGetObject(EO)) { Wanted.Add((*EO)->GetStringField(TEXT("archetype")).ToLower()); }
+			}
+		}
+	}
+	// Walk every ytyp in load order; a later slot's definition of the same name overwrites the asset.
+	TArray<const FRudeCorpusEntry*> Rows;
+	Corpus->AllOfType(TEXT("ytyp"), Rows);
+	int32 Files = 0, Seen = 0, Made = 0, Updated = 0, Invalid = 0, MeshLinked = 0;
+	TMap<FString, int32> Kinds;
+	TSet<FString> Done;
+	for (const FRudeCorpusEntry* E : Rows)
+	{
+		FXmlFile Xml(Corpus->PathOf(*E));
+		if (!Xml.IsValid() || !Xml.GetRootNode()) { continue; }
+		const FXmlNode* Arche = Xml.GetRootNode()->FindChildNode(TEXT("archetypes"));
+		if (!Arche) { continue; }
+		++Files;
+		FString RawText;
+		TArray<FString> RawItems;
+		FFileHelper::LoadFileToString(RawText, *Corpus->PathOf(*E));
+		RudeRawItems(RawText, TEXT("archetypes"), RawItems);
+		const bool bRawOk = RawItems.Num() == Arche->GetChildrenNodes().Num();
+		int32 Ordinal = -1;
+		for (const FXmlNode* Item : Arche->GetChildrenNodes())
+		{
+			++Ordinal;
+			const FXmlNode* NameN = Item->FindChildNode(TEXT("name"));
+			if (!NameN) { continue; }
+			const FString NameLower = NameN->GetContent().TrimStartAndEnd().ToLower();
+			if (NameLower.IsEmpty()) { continue; }
+			++Seen;
+			if (Wanted.Num() > 0 && !Wanted.Contains(NameLower)) { continue; }
+			const FString PkgName = DestFolder / NameLower;
+			if (!FPackageName::IsValidLongPackageName(PkgName)) { ++Invalid; continue; }
+			// Load the existing asset FIRST (a package created over an unloaded file is later
+			// re-serialised from disk by any LoadObject, overwriting the fresh in-memory fields -
+			// measured 2026-09-05: the export read last run's flattened SourceXml).
+			URudeArchetype* A = LoadObject<URudeArchetype>(nullptr, *(PkgName + TEXT(".") + NameLower));
+			UPackage* Pkg = A ? A->GetOutermost() : CreatePackage(*PkgName);
+			bool bNew = false;
+			if (!A) { A = NewObject<URudeArchetype>(Pkg, FName(*NameLower), RF_Public | RF_Standalone); bNew = true; }
+			RudeFillArchetype(A, Item);
+			if (bRawOk) { A->SourceXml = RawItems[Ordinal]; }   // the file's own bytes for this item
+			A->SourceYtyp = E->Name;
+			A->SourceSlot = E->Slot;
+			A->SourceIndex = Ordinal;
+			if (!MeshFolder.TrimStartAndEnd().IsEmpty())
+			{
+				const FString Asset = A->AssetName.IsEmpty() ? NameLower : A->AssetName.ToLower();
+				const FString MeshPkg = MeshFolder / Asset;
+				if (FPackageName::DoesPackageExist(MeshPkg)) { A->Mesh = TSoftObjectPtr<UStaticMesh>(FSoftObjectPath(MeshPkg + TEXT(".") + Asset)); ++MeshLinked; }
+			}
+			Pkg->MarkPackageDirty();
+			Kinds.FindOrAdd(A->ArchetypeKind)++;
+			if (Done.Contains(NameLower)) { ++Updated; } else { Done.Add(NameLower); if (bNew) { ++Made; } else { ++Updated; } }
+		}
+	}
+	FString KindsJson;
+	for (const auto& KV : Kinds) { KindsJson += FString::Printf(TEXT("%s\"%s\":%d"), KindsJson.IsEmpty() ? TEXT("") : TEXT(","), *KV.Key, KV.Value); }
+	const bool bOk = Done.Num() > 0 && Invalid == 0;
+	return FString::Printf(
+		TEXT("{\"ok\":%s,\"ytypFiles\":%d,\"archetypesSeen\":%d,\"wanted\":%d,\"assets\":%d,\"created\":%d,\"overwrittenByLaterSlot\":%d,")
+		TEXT("\"invalidNames\":%d,\"meshLinked\":%d,\"kinds\":{%s}}"),
+		bOk ? TEXT("true") : TEXT("false"), Files, Seen, Wanted.Num(), Done.Num(), Made, Updated, Invalid, MeshLinked, *KindsJson);
+}
+
+// ---- ExportPaletteYtyps ------------------------------------------------------------------
+static FString RudeArchetypeXml(const URudeArchetype* A)
+{
+	auto V3 = [](const FVector& V) { return FString::Printf(TEXT("x=\"%s\" y=\"%s\" z=\"%s\""), *RudeNum(V.X), *RudeNum(V.Y), *RudeNum(V.Z)); };
+	FString O;
+	O += FString::Printf(TEXT("  <Item type=\"%s\">\n"), *A->ArchetypeKind);
+	O += FString::Printf(TEXT("   <lodDist value=\"%s\" />\n"), *RudeNum(A->LodDist));
+	O += FString::Printf(TEXT("   <flags value=\"%u\" />\n"), A->Flags);
+	O += FString::Printf(TEXT("   <specialAttribute value=\"%u\" />\n"), A->SpecialAttribute);
+	O += FString::Printf(TEXT("   <bbMin %s />\n"), *V3(A->BbMin));
+	O += FString::Printf(TEXT("   <bbMax %s />\n"), *V3(A->BbMax));
+	O += FString::Printf(TEXT("   <bsCentre %s />\n"), *V3(A->BsCentre));
+	O += FString::Printf(TEXT("   <bsRadius value=\"%s\" />\n"), *RudeNum(A->BsRadius));
+	O += FString::Printf(TEXT("   <hdTextureDist value=\"%s\" />\n"), *RudeNum(A->HdTextureDist));
+	auto Tag = [&O](const TCHAR* T, const FString& S)
+	{
+		if (S.IsEmpty()) { O += FString::Printf(TEXT("   <%s />\n"), T); return; }
+		O += FString::Printf(TEXT("   <%s>"), T); RudeXmlEscapeInto(O, S); O += FString::Printf(TEXT("</%s>\n"), T);
+	};
+	Tag(TEXT("name"), A->Name);
+	Tag(TEXT("textureDictionary"), A->TextureDictionary);
+	Tag(TEXT("clipDictionary"), A->ClipDictionary);
+	Tag(TEXT("drawableDictionary"), A->DrawableDictionary);
+	Tag(TEXT("physicsDictionary"), A->PhysicsDictionary);
+	Tag(TEXT("assetType"), A->AssetType);
+	Tag(TEXT("assetName"), A->AssetName);
+	if (A->ExtensionsXml.TrimStartAndEnd().IsEmpty()) { O += TEXT("   <extensions />\n"); }
+	else
+	{
+		TArray<FString> Lines; A->ExtensionsXml.ParseIntoArrayLines(Lines);
+		for (const FString& L : Lines) { O += TEXT("   "); O += L; O += TEXT("\n"); }
+	}
+	if (A->ArchetypeKind == TEXT("CTimeArchetypeDef")) { O += FString::Printf(TEXT("   <timeFlags value=\"%u\" />\n"), A->TimeFlags); }
+	O += TEXT("  </Item>\n");
+	return O;
+}
+
+FString URudeToolset::ExportPaletteYtyps(const FString& OutDir, const FString& PaletteFolder,
+                                         const FString& YtypFilter, const FString& CorpusRoot)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	FString CorpusErr;
+	const TSharedPtr<FRudeCorpus> Corpus = FRudeCorpus::Open(CorpusRoot, CorpusErr);
+	if (!Corpus.IsValid()) { return Fail(CorpusErr); }
+	if (OutDir.TrimStartAndEnd().IsEmpty()) { return Fail(TEXT("give an OutDir")); }
+	TSet<FString> Wanted;
+	{
+		TArray<FString> Parts; YtypFilter.ParseIntoArray(Parts, TEXT(","), true);
+		for (FString P : Parts) { P.TrimStartAndEndInline(); if (!P.IsEmpty()) { Wanted.Add(P.ToLower()); } }
+	}
+	// every palette asset, grouped by source ytyp
+	FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+	TArray<FAssetData> Assets;
+	ARM.Get().ScanPathsSynchronous({ PaletteFolder }, true);
+	ARM.Get().GetAssetsByPath(FName(*PaletteFolder), Assets, true);
+	TMap<FString, TArray<URudeArchetype*>> Groups;
+	int32 Loaded = 0;
+	for (const FAssetData& AD : Assets)
+	{
+		URudeArchetype* A = Cast<URudeArchetype>(AD.GetAsset());
+		if (!A || A->SourceYtyp.IsEmpty()) { continue; }
+		++Loaded;
+		const FString Y = A->SourceYtyp.ToLower();
+		if (Wanted.Num() > 0 && !Wanted.Contains(Y)) { continue; }
+		Groups.FindOrAdd(Y).Add(A);
+	}
+	if (Groups.Num() == 0) { return Fail(FString::Printf(TEXT("no palette assets with a source ytyp under %s (%d loaded)"), *PaletteFolder, Loaded)); }
+	IFileManager::Get().MakeDirectory(*(OutDir / TEXT("stream")), true);
+	int32 Written = 0, Refused = 0, Kept = 0, Edited = 0, NotRebuilt = 0, Removed = 0;
+	FString Files, RefusedJson;
+	for (auto& KV : Groups)
+	{
+		const FString& Ytyp = KV.Key;
+		TArray<URudeArchetype*>& As = KV.Value;
+		As.Sort([](const URudeArchetype& X, const URudeArchetype& Y) { return X.SourceIndex < Y.SourceIndex; });
+		const FRudeCorpusEntry* Row = Corpus->Effective(TEXT("ytyp"), Ytyp);
+		if (!Row) { ++Refused; RefusedJson += FString::Printf(TEXT("%s\"%s: no source ytyp in the corpus\""), RefusedJson.IsEmpty() ? TEXT("") : TEXT(","), *Ytyp); continue; }
+		FString SrcText;
+		if (!FFileHelper::LoadFileToString(SrcText, *Corpus->PathOf(*Row))) { ++Refused; continue; }
+		FXmlFile Src(Corpus->PathOf(*Row));
+		const FXmlNode* Arche = (Src.IsValid() && Src.GetRootNode()) ? Src.GetRootNode()->FindChildNode(TEXT("archetypes")) : nullptr;
+		const int32 SourceCount = Arche ? Arche->GetChildrenNodes().Num() : 0;
+		TArray<FString> RawItems;
+		RudeRawItems(SrcText, TEXT("archetypes"), RawItems);
+		if (RawItems.Num() != SourceCount)
+		{
+			++Refused;
+			RefusedJson += FString::Printf(TEXT("%s\"%s: raw item slices %d != parsed items %d\""), RefusedJson.IsEmpty() ? TEXT("") : TEXT(","), *Ytyp, RawItems.Num(), SourceCount);
+			continue;
+		}
+		// Walk the SOURCE items by ordinal: an item with a palette asset goes out from the asset
+		// (verbatim when untouched, rebuilt when edited); an item WITHOUT one (the palette is filtered
+		// to a district) goes out as read. Nothing is dropped - a ytyp is a definition table other
+		// files reference by name; Wave 1 has no delete.
+		TMap<int32, const URudeArchetype*> ByOrdinal;
+		for (const URudeArchetype* A : As) { ByOrdinal.Add(A->SourceIndex, A); }
+		FString Block;
+		int32 Ordinal = -1;
+		if (Arche)
+		{
+			for (const FXmlNode* Item : Arche->GetChildrenNodes())
+			{
+				++Ordinal;
+				const URudeArchetype* const* Found = ByOrdinal.Find(Ordinal);
+				if (!Found)
+				{
+					Block += RawItems[Ordinal];
+					++Kept;
+					continue;
+				}
+				const URudeArchetype* A = *Found;
+				const bool bUntouched = !A->SourceXml.IsEmpty() && A->FieldsKey() == A->SourceFieldsKey;
+				const bool bRebuildable = A->ArchetypeKind == TEXT("CBaseArchetypeDef") || A->ArchetypeKind == TEXT("CTimeArchetypeDef");
+				if (bUntouched || !bRebuildable)
+				{
+					if (!bUntouched) { ++NotRebuilt; }
+					Block += A->SourceXml; if (!A->SourceXml.EndsWith(TEXT("\n"))) { Block += TEXT("\n"); }
+					++Kept;
+				}
+				else { Block += RudeArchetypeXml(A); ++Edited; }
+			}
+		}
+		FString Doc = SrcText;
+		const int32 Open = Doc.Find(TEXT("\n <archetypes>\n"), ESearchCase::CaseSensitive);
+		const int32 Close = Open == INDEX_NONE ? INDEX_NONE : Doc.Find(TEXT(" </archetypes>\n"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Open);
+		if (Open == INDEX_NONE || Close == INDEX_NONE) { ++Refused; RefusedJson += FString::Printf(TEXT("%s\"%s: no <archetypes> block to splice\""), RefusedJson.IsEmpty() ? TEXT("") : TEXT(","), *Ytyp); continue; }
+		Doc = Doc.Left(Open) + TEXT("\n <archetypes>\n") + Block + TEXT(" </archetypes>\n") + Doc.Mid(Close + FString(TEXT(" </archetypes>\n")).Len());
+		const FString OutPath = OutDir / TEXT("stream") / (Ytyp + TEXT(".ytyp"));
+		if (!FFileHelper::SaveStringToFile(Doc, *OutPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)) { return Fail(FString::Printf(TEXT("cannot write %s"), *OutPath)); }
+		++Written;
+		Files += FString::Printf(TEXT("%s\"%s\""), Files.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(OutPath));
+	}
+	FFileHelper::SaveStringToFile(TEXT("fx_version 'cerulean'\ngame 'gta5'\nthis_is_a_map 'yes'\n"), *(OutDir / TEXT("fxmanifest.lua")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	const bool bOk = Written > 0 && Refused == 0;
+	return FString::Printf(
+		TEXT("{\"ok\":%s,\"paletteAssets\":%d,\"ytypsWritten\":%d,\"ytypsRefused\":%d,\"kept\":%d,\"edited\":%d,\"notRebuilt\":%d,\"removed\":%d,\"files\":[%s],\"refused\":[%s]}"),
+		bOk ? TEXT("true") : TEXT("false"), Loaded, Written, Refused, Kept, Edited, NotRebuilt, Removed, *Files, *RefusedJson);
+}
+
+// ---- SetArchetypeField (agent; the scriptable palette edit) ------------------------------
+FString URudeToolset::SetArchetypeField(const FString& PaletteFolder, const FString& ArchetypeName,
+                                        const FString& Field, const FString& Value)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	const FString Name = ArchetypeName.TrimStartAndEnd().ToLower();
+	const FString PkgName = PaletteFolder / Name;
+	URudeArchetype* A = LoadObject<URudeArchetype>(nullptr, *(PkgName + TEXT(".") + Name));
+	if (!A) { return Fail(FString::Printf(TEXT("no palette asset %s"), *PkgName)); }
+	FProperty* Prop = A->GetClass()->FindPropertyByName(FName(*Field.TrimStartAndEnd()));
+	if (!Prop) { return Fail(FString::Printf(TEXT("URudeArchetype has no property '%s'"), *Field)); }
+	FString Before;
+	Prop->ExportTextItem_Direct(Before, Prop->ContainerPtrToValuePtr<void>(A), nullptr, A, PPF_None);
+	if (!Prop->ImportText_Direct(*Value, Prop->ContainerPtrToValuePtr<void>(A), A, PPF_None))
+	{
+		return Fail(FString::Printf(TEXT("could not parse '%s' for %s"), *Value, *Field));
+	}
+	A->MarkPackageDirty();
+	FString After;
+	Prop->ExportTextItem_Direct(After, Prop->ContainerPtrToValuePtr<void>(A), nullptr, A, PPF_None);
+	return FString::Printf(TEXT("{\"ok\":true,\"archetype\":\"%s\",\"field\":\"%s\",\"before\":\"%s\",\"after\":\"%s\",\"changed\":%s}"),
+		*RudeJsonEscape(Name), *RudeJsonEscape(Field), *RudeJsonEscape(Before), *RudeJsonEscape(After),
+		A->FieldsKey() != A->SourceFieldsKey ? TEXT("true") : TEXT("false"));
 }
 
 // ---- XmlShapeRoundTrip -------------------------------------------------------------------
