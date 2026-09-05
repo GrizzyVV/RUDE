@@ -7568,6 +7568,70 @@ FString URudeToolset::SetLodView(const FString& Level)
 		(NShown + NHidden) > 0 ? TEXT("true") : TEXT("false"), Want.IsEmpty() ? TEXT("HD") : *Want, NShown, NHidden, *Json(Shown), *Json(Hidden));
 }
 
+// ---- PlaceArchetype ---------------------------------------------------------------------
+// Author a NEW placement: an entity actor for a palette archetype at a UE-space location/rotation,
+// destined for TargetYmap (a new ymap name, or an existing one to append to). Fields default the way
+// the game's own new content does: ORPHANHD, PRI_REQUIRED, flags 1572864 (v1's in-game-proven
+// value), lodDist from the archetype, a guid hashed from ymap:archetype:position (v1's rule).
+FString URudeToolset::PlaceArchetype(const FString& PaletteFolder, const FString& ArchetypeName,
+                                     const FString& LocationCm, const FString& RotationDeg, const FString& TargetYmap)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	const FString Name = ArchetypeName.TrimStartAndEnd().ToLower();
+	const FString Ymap = TargetYmap.TrimStartAndEnd().ToLower();
+	if (Name.IsEmpty() || Ymap.IsEmpty()) { return Fail(TEXT("ArchetypeName and TargetYmap are required")); }
+	URudeArchetype* A = LoadObject<URudeArchetype>(nullptr, *(PaletteFolder / Name + TEXT(".") + Name));
+	if (!A) { return Fail(FString::Printf(TEXT("no palette asset for '%s' under %s - build the palette first"), *Name, *PaletteFolder)); }
+	TArray<FString> L, R;
+	LocationCm.Replace(TEXT(";"), TEXT(",")).ParseIntoArray(L, TEXT(","), true);
+	RotationDeg.Replace(TEXT(";"), TEXT(",")).ParseIntoArray(R, TEXT(","), true);
+	if (L.Num() != 3) { return Fail(TEXT("LocationCm must be x,y,z in UE centimetres")); }
+	const FVector Loc(FCString::Atod(*L[0]), FCString::Atod(*L[1]), FCString::Atod(*L[2]));
+	const FRotator Rot(R.Num() == 3 ? FCString::Atod(*R[0]) : 0.0, R.Num() == 3 ? FCString::Atod(*R[1]) : 0.0, R.Num() == 3 ? FCString::Atod(*R[2]) : 0.0);
+	UStaticMesh* Mesh = A->Mesh.LoadSynchronous();
+	UStaticMesh* ProxyCube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	if (!Mesh && !ProxyCube) { return Fail(TEXT("the archetype has no mesh and no proxy is available")); }
+	// the same row shape the manifest uses, so the one spawn helper builds it
+	TSharedPtr<FJsonObject> Ent = MakeShared<FJsonObject>();
+	Ent->SetStringField(TEXT("archetype"), Name);
+	Ent->SetStringField(TEXT("srcYmap"), Ymap);
+	Ent->SetStringField(TEXT("srcSlot"), TEXT(""));
+	Ent->SetNumberField(TEXT("srcIndex"), -1);
+	Ent->SetStringField(TEXT("lodLevel"), TEXT("LODTYPES_DEPTH_ORPHANHD"));
+	Ent->SetStringField(TEXT("priorityLevel"), TEXT("PRI_REQUIRED"));
+	Ent->SetNumberField(TEXT("lodDist"), A->LodDist);
+	Ent->SetNumberField(TEXT("childLodDist"), 0.0);
+	Ent->SetNumberField(TEXT("parentIndex"), -1);
+	Ent->SetNumberField(TEXT("flags"), 1572864.0);
+	Ent->SetNumberField(TEXT("numChildren"), 0.0);
+	Ent->SetNumberField(TEXT("aoMultiplier"), 255.0);
+	Ent->SetNumberField(TEXT("artificialAo"), 255.0);
+	Ent->SetNumberField(TEXT("tintValue"), 0.0);
+	Ent->SetStringField(TEXT("itemType"), TEXT("CEntityDef"));
+	const FTransform Xf(Rot, Loc, FVector::OneVector);
+	{
+		const double X = Loc.X / 100.0, Y = -Loc.Y / 100.0, Z = Loc.Z / 100.0;
+		const uint32 Guid = FCrc::StrCrc32(*FString::Printf(TEXT("%s:%s:%f:%f:%f"), *Ymap, *Name, X, Y, Z));
+		Ent->SetNumberField(TEXT("guid"), (double)Guid);
+	}
+	AActor* Actor = RudeSpawnEntityActor(World, Ymap, Ent, Xf, Mesh ? Mesh : ProxyCube, Mesh == nullptr, A->TimeFlags);
+	if (!Actor) { return Fail(TEXT("spawn failed")); }
+	// authored = never "untouched": no SourceXml, so the export rebuilds it from its fields
+	if (URudeEntityComponent* C = Actor->FindComponentByClass<URudeEntityComponent>())
+	{
+		C->SourceXml.Reset();
+		C->SourceFieldsKey.Reset();
+	}
+	Actor->MarkPackageDirty();
+	return FString::Printf(TEXT("{\"ok\":true,\"archetype\":\"%s\",\"targetYmap\":\"%s\",\"mesh\":%s,\"actor\":\"%s\",\"lodDist\":%g}"),
+		*RudeJsonEscape(Name), *RudeJsonEscape(Ymap), Mesh ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Actor->GetActorLabel()), A->LodDist);
+}
+
 // ---- XmlShapeRoundTrip -------------------------------------------------------------------
 // Walk a parsed tree into (path -> [attr=value...] + leaf text) rows, order-preserving by path
 // with sibling ordinals, so two parses compare exactly and a mismatch names its path.

@@ -256,6 +256,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Choose which detail level of the map you see: HD (the real buildings, default), LOD or SLOD (the far-away shells), or ALL stacked together. Nothing is removed, only shown or hidden."))
 	static FString SetLodView(const FString& Level);
 
+	// Author a NEW placement from the palette: an entity actor at a UE location (cm) / rotation
+	// (deg), destined for TargetYmap (a new ymap name, or an existing one to append to). Export it
+	// with ExportLevelYmaps NewEntitiesYmap=<same name>.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Place a new object from the palette into your level, and say which map file it should be saved into."))
+	static FString PlaceArchetype(const FString& PaletteFolder, const FString& ArchetypeName,
+	                              const FString& LocationCm, const FString& RotationDeg, const FString& TargetYmap);
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);
