@@ -7525,6 +7525,49 @@ FString URudeToolset::PlaceInterior(const FString& MloArchetypeName, const FStri
 		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Wanted), Placements, Placed, AlreadyPlaced, Refused, *RudeJsonEscape(Pkg));
 }
 
+// ---- SetLodView -------------------------------------------------------------------------
+// Which LOD level of the placed lineage is visible: HD (default: HD + ORPHANHD) | LOD | SLOD1 | SLOD2
+// | SLOD3 | SLOD4 | ALL. Everything stays placed; only visibility changes (nothing to export).
+FString URudeToolset::SetLodView(const FString& Level)
+{
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return TEXT("{\"ok\":false,\"error\":\"no editor world\"}"); }
+	const FString Want = Level.TrimStartAndEnd().ToUpper();
+	const bool bAll = Want == TEXT("ALL");
+	TSet<FString> Show;
+	if (Want.IsEmpty() || Want == TEXT("HD")) { Show.Add(TEXT("LODTYPES_DEPTH_HD")); Show.Add(TEXT("LODTYPES_DEPTH_ORPHANHD")); }
+	else if (!bAll) { Show.Add(TEXT("LODTYPES_DEPTH_") + Want); }
+	TMap<FString, int32> Shown, Hidden;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		FString Lv;
+		for (const FName& T : It->Tags)
+		{
+			const FString S = T.ToString();
+			if (S.StartsWith(TEXT("RUDE_LOD:"))) { Lv = S.Mid(9); break; }
+		}
+		if (Lv.IsEmpty()) { continue; }
+		UStaticMeshComponent* SMC = It->FindComponentByClass<UStaticMeshComponent>();
+		if (!SMC) { continue; }
+		const bool bShow = bAll || Show.Contains(Lv);
+		SMC->SetVisibility(bShow, true);
+		SMC->SetHiddenInGame(!bShow, true);
+		It->MarkPackageDirty();
+		(bShow ? Shown : Hidden).FindOrAdd(Lv)++;
+	}
+	auto Json = [](const TMap<FString, int32>& M)
+	{
+		FString O;
+		for (const auto& KV : M) { O += FString::Printf(TEXT("%s\"%s\":%d"), O.IsEmpty() ? TEXT("") : TEXT(","), *KV.Key.Replace(TEXT("LODTYPES_DEPTH_"), TEXT("")), KV.Value); }
+		return O;
+	};
+	int32 NShown = 0, NHidden = 0;
+	for (const auto& KV : Shown) { NShown += KV.Value; }
+	for (const auto& KV : Hidden) { NHidden += KV.Value; }
+	return FString::Printf(TEXT("{\"ok\":%s,\"view\":\"%s\",\"shown\":%d,\"hidden\":%d,\"shownByLevel\":{%s},\"hiddenByLevel\":{%s}}"),
+		(NShown + NHidden) > 0 ? TEXT("true") : TEXT("false"), Want.IsEmpty() ? TEXT("HD") : *Want, NShown, NHidden, *Json(Shown), *Json(Hidden));
+}
+
 // ---- XmlShapeRoundTrip -------------------------------------------------------------------
 // Walk a parsed tree into (path -> [attr=value...] + leaf text) rows, order-preserving by path
 // with sibling ordinals, so two parses compare exactly and a mismatch names its path.
@@ -8004,6 +8047,22 @@ static AActor* RudeSpawnEntityActor(UWorld* World, const FString& YmapName, cons
 		SMC->ComponentTags.Add(FName(*FString::Printf(TEXT("RUDE_TIME:%u"), TimeMask)));
 	}
 	if (bProxy) { A->Tags.Add(FName(TEXT("RUDE_PROXY"))); }
+	// LOD accounting: the game shows ONE level of a lineage at a time. Every level is PLACED (the
+	// export needs them all) but only HD / ORPHANHD is VISIBLE by default; LOD and SLOD shells stay
+	// hidden and tagged RUDE_LOD:<level> so SetLodView can switch the view (Matt, 2026-09-05: the
+	// blue "glass tower" was an SLOD shell stacked on its HD building).
+	{
+		FString LodLv;
+		Ent->TryGetStringField(TEXT("lodLevel"), LodLv);
+		if (LodLv.IsEmpty()) { LodLv = TEXT("LODTYPES_DEPTH_HD"); }
+		A->Tags.Add(FName(*(TEXT("RUDE_LOD:") + LodLv)));
+		const bool bHd = LodLv == TEXT("LODTYPES_DEPTH_HD") || LodLv == TEXT("LODTYPES_DEPTH_ORPHANHD");
+		if (!bHd)
+		{
+			SMC->SetVisibility(false, true);
+			SMC->SetHiddenInGame(true, true);
+		}
+	}
 	URudeEntityComponent* R = NewObject<URudeEntityComponent>(A, TEXT("RudeEntity"));
 	auto Str = [&Ent](const TCHAR* K) { FString V; Ent->TryGetStringField(K, V); return V; };
 	auto Num = [&Ent](const TCHAR* K, double Def) { double V = Def; Ent->TryGetNumberField(K, V); return V; };

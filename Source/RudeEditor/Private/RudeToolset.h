@@ -251,6 +251,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Put a built interior into your level everywhere the map places it. Give the interior's archetype name and the interior level asset that Pack Area Level Instance made."))
 	static FString PlaceInterior(const FString& MloArchetypeName, const FString& LevelAsset);
 
+	// LOD view: which LOD level of the placed lineage is visible (HD default, LOD, SLOD1..4, ALL).
+	// Everything stays placed; only visibility changes. The first cut of the GDD's lineage view.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Choose which detail level of the map you see: HD (the real buildings, default), LOD or SLOD (the far-away shells), or ALL stacked together. Nothing is removed, only shown or hidden."))
+	static FString SetLodView(const FString& Level);
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);
