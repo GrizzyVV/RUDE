@@ -22,9 +22,18 @@
 #include "StaticMeshAttributes.h"
 #include "StaticMeshCompiler.h"
 #include "UObject/Package.h"
+#include "UObject/SavePackage.h"
+#include "Framework/Application/SlateApplication.h"
 #include "XmlFile.h"
 #include "RudeCorpus.h"
 #include "RudeDds.h"
+#include "RudeEntityComponent.h"
+#include "DataLayer/DataLayerEditorSubsystem.h"
+#include "WorldPartition/WorldPartition.h"
+#include "WorldPartition/DataLayer/DataLayerAsset.h"
+#include "WorldPartition/DataLayer/DataLayerInstance.h"
+#include "WorldPartition/DataLayer/WorldDataLayers.h"
+#include "Components/StaticMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/SpotLightComponent.h"
@@ -1598,6 +1607,10 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 	FString Missing;
 	for (const FXmlNode* Item : Root->GetChildrenNodes())
 	{
+		// The dictionary's own trailing fields (BuildAddress, Unknown18/2A/3A - the D10 elements)
+		// are siblings of the items, not items: skip them or they count as nameless textures
+		// (2026-09-05: 1,808 phantom "itemsWithoutName" over 452 dictionaries = 4 each).
+		if (Item->GetTag() != TEXT("Item")) { continue; }
 		const FXmlNode* NameNode = Item->FindChildNode(TEXT("Name"));
 		if (!NameNode || NameNode->GetContent().TrimStartAndEnd().IsEmpty())
 		{
@@ -2340,12 +2353,26 @@ static FString RudeImportYdrScoped(const FString& XmlPath, const FString& DestFo
 	bool bFragment = false;
 	if (Root && Root->GetTag() == TEXT("Fragment"))
 	{
-		Root = Root->FindChildNode(TEXT("Drawable"));
+		const FXmlNode* Frag = Root;
+		Root = Frag->FindChildNode(TEXT("Drawable"));
+		// A CLOTH fragment owns its main drawable under <Cloths>/<Item>/<Drawable> (the cloth lane
+		// ROUT ported 2026-09-04); 165/3,183 downtown yft are this shape and were refused as
+		// "root is not <Drawable>" until 2026-09-05. First cloth item wins (one per file measured).
+		if (!Root)
+		{
+			if (const FXmlNode* Cloths = Frag->FindChildNode(TEXT("Cloths")))
+			{
+				for (const FXmlNode* Item : Cloths->GetChildrenNodes())
+				{
+					if (const FXmlNode* D = Item->FindChildNode(TEXT("Drawable"))) { Root = D; break; }
+				}
+			}
+		}
 		bFragment = true;
 	}
 	if (!Root || Root->GetTag() != TEXT("Drawable"))
 	{
-		return Fail(TEXT("root is not <Drawable> (or <Fragment> wrapping one)"));
+		return Fail(TEXT("root is not <Drawable> (or <Fragment> wrapping one, or a cloth Fragment's Cloths/Item/Drawable)"));
 	}
 
 	// Drawable name (strip ".#dr" style suffix)
@@ -3509,6 +3536,70 @@ static int32 RudeSumField(const FString& Json, const TCHAR* Key)
 // convention (quarry/ngcrypto.py joaat: lowercase input; the unresolvable-name fallback is
 // spelled "hash_%08X", UPPERCASE hex). ymap<->ytyp<->dictionary joins are hash-to-hash, so
 // matching by hash is the join's native form, not a workaround.
+// JSON string escape for text that rides inside the manifest (extension XML, names with quotes).
+static FString RudeJsonEscape(const FString& In)
+{
+	FString O;
+	O.Reserve(In.Len() + 8);
+	for (TCHAR C : In)
+	{
+		switch (C)
+		{
+		case TEXT('"'): O += TEXT("\\\""); break;
+		case TEXT('\\'): O += TEXT("\\\\"); break;
+		case TEXT('\n'): O += TEXT("\\n"); break;
+		case TEXT('\r'): break;
+		case TEXT('\t'): O += TEXT("\\t"); break;
+		default: O.AppendChar(C);
+		}
+	}
+	return O;
+}
+
+// Re-spell an XML subtree as text, as read: tag, attributes in file order, text content, children.
+// FXmlFile parses but cannot write, and the entity's <extensions> must survive verbatim into the
+// manifest and the component so export re-emits what the game shipped.
+static void RudeXmlEscapeInto(FString& O, const FString& In)
+{
+	for (TCHAR C : In)
+	{
+		switch (C)
+		{
+		case TEXT('&'): O += TEXT("&amp;"); break;
+		case TEXT('<'): O += TEXT("&lt;"); break;
+		case TEXT('>'): O += TEXT("&gt;"); break;
+		case TEXT('"'): O += TEXT("&quot;"); break;
+		default: O.AppendChar(C);
+		}
+	}
+}
+static void RudeXmlNodeToString(const FXmlNode* N, FString& O, int32 Depth)
+{
+	if (!N) { return; }
+	for (int32 i = 0; i < Depth; ++i) { O += TEXT(" "); }
+	O += TEXT("<"); O += N->GetTag();
+	for (const FXmlAttribute& A : N->GetAttributes())
+	{
+		O += TEXT(" "); O += A.GetTag(); O += TEXT("=\"");
+		RudeXmlEscapeInto(O, A.GetValue());
+		O += TEXT("\"");
+	}
+	const TArray<FXmlNode*>& Kids = N->GetChildrenNodes();
+	const FString Text = N->GetContent().TrimStartAndEnd();
+	if (Kids.Num() == 0 && Text.IsEmpty()) { O += TEXT(" />\n"); return; }
+	O += TEXT(">");
+	if (Kids.Num() == 0)
+	{
+		RudeXmlEscapeInto(O, Text);
+		O += TEXT("</"); O += N->GetTag(); O += TEXT(">\n");
+		return;
+	}
+	O += TEXT("\n");
+	for (const FXmlNode* K : Kids) { RudeXmlNodeToString(K, O, Depth + 1); }
+	for (int32 i = 0; i < Depth; ++i) { O += TEXT(" "); }
+	O += TEXT("</"); O += N->GetTag(); O += TEXT(">\n");
+}
+
 static uint32 RudeJoaat(const FString& Name)
 {
 	uint32 H = 0;
@@ -4668,7 +4759,15 @@ static void ImportIndexedDrawable(const FString& CorpusRoot, const FRudeArchetyp
 	// WorldGridMaterial still reports the counters that say WHY, and throwing them away because
 	// of the boolean is how this got lost the first time.
 	Tally.Accumulate(R);
-	if (R.Contains(TEXT("\"ok\":true"))) { ++MeshOk; } else { ++MeshFail; }
+	if (R.Contains(TEXT("\"ok\":true"))) { ++MeshOk; }
+	else
+	{
+		++MeshFail;
+		// A failed mesh is a NAMED failure: the batch sums it, but only the log can say which
+		// drawable and why (2026-09-05: 165/3,183 downtown meshes failed and nothing said why).
+		UE_LOG(LogTemp, Warning, TEXT("[RUDE] mesh import FAILED '%s' (%s): %s"), *Drawable,
+			Dict ? TEXT("ydd") : (bFrag ? TEXT("yft") : TEXT("ydr")), *R.Left(400));
+	}
 }
 
 FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& YmapPrefix,
@@ -4728,6 +4827,7 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	YmapPrefix.ParseIntoArray(Prefixes, TEXT(","), true);
 	TSet<FString> SeenYmap;
 	TArray<FString> YmapFiles;
+	TMap<FString, FString> YmapSlotByPath;   // provenance: which build slot each ymap copy came from
 	for (FString P : Prefixes)
 	{
 		P.TrimStartAndEndInline();
@@ -4741,7 +4841,12 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 			// TSet::Add's out-param is bIsAlreadyInSet - true for DUPLICATES, not new adds
 			bool bAlready = false;
 			SeenYmap.Add(E->Name, &bAlready);
-			if (!bAlready) { YmapFiles.Add(Index.Corpus->PathOf(*E)); }
+			if (!bAlready)
+			{
+				const FString Path = Index.Corpus->PathOf(*E);
+				YmapFiles.Add(Path);
+				YmapSlotByPath.Add(Path, E->Slot);
+			}
 		}
 	}
 	YmapFiles.Sort();
@@ -4773,8 +4878,16 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 		if (!Ents) { ++YmapsNoEntitiesNode; continue; }
 		FString EntJson;
 		int32 SceneEnts = 0;
+		// Provenance for every entity: the ymap's asset name, its build slot, and the entity's
+		// ordinal in the file's list (parentIndex values refer to ordinals, so it is identity).
+		FString SrcYmapName = FPaths::GetBaseFilename(F);
+		SrcYmapName.RemoveFromEnd(TEXT(".ymap"));
+		const FString* SrcSlotPtr = YmapSlotByPath.Find(F);
+		const FString SrcSlot = SrcSlotPtr ? *SrcSlotPtr : FString();
+		int32 EntOrdinal = -1;
 		for (const FXmlNode* E : Ents->GetChildrenNodes())
 		{
+			++EntOrdinal;
 			const FXmlNode* AN = E->FindChildNode(TEXT("archetypeName"));
 			const FXmlNode* Pos = E->FindChildNode(TEXT("position"));
 			// Counted, not silent. No index consequence on THIS lane (a ymap entity is not
@@ -4808,16 +4921,42 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 			// ImportScene re-spawns from - so a respawn keeps the day/night behaviour without
 			// re-reading every ytyp. 0 = no mask = always visible.
 			const uint32* TFlags = Index.ArchTimeFlags.Find(Arch);
+			// Every CEntityDef field rides in the manifest (the ymap spec's 17: 11 T1 + 6 T2), so the
+			// per-entity actor's component can be filled without re-reading the ymap, and so the
+			// manifest is a faithful record of what the file said. Text fields as spelled; the
+			// <extensions> subtree verbatim.
+			auto Text = [&](const TCHAR* Tag) -> FString
+			{
+				const FXmlNode* N = E->FindChildNode(Tag);
+				return N ? N->GetContent().TrimStartAndEnd() : FString();
+			};
+			FString ExtXml;
+			if (const FXmlNode* Ext = E->FindChildNode(TEXT("extensions")))
+			{
+				if (Ext->GetChildrenNodes().Num() > 0) { RudeXmlNodeToString(Ext, ExtXml, 0); }
+			}
+			FString ItemXml;   // the whole <Item type="CEntityDef"> as spelled - the byte-safe seam
+			RudeXmlNodeToString(E, ItemXml, 2);
 			EntJson += FString::Printf(TEXT(
 				"%s{\"archetype\":\"%s\",\"drawable\":%s,\"lodLevel\":\"%s\","
 				"\"ue_location\":[%f,%f,%f],\"ue_quat\":[%f,%f,%f,%f],\"scaleXY\":%f,"
-				"\"scaleZ\":%f,\"timeFlags\":%u}"),
+				"\"scaleZ\":%f,\"timeFlags\":%u,"
+				"\"flags\":%.0f,\"guid\":%.0f,\"lodDist\":%f,\"childLodDist\":%f,"
+				"\"numChildren\":%.0f,\"parentIndex\":%.0f,\"priorityLevel\":\"%s\","
+				"\"aoMultiplier\":%f,\"artificialAo\":%f,\"tintValue\":%.0f,"
+				"\"extensions\":\"%s\",\"srcYmap\":\"%s\",\"srcSlot\":\"%s\",\"srcIndex\":%d,"
+				"\"xml\":\"%s\",\"itemType\":\"%s\"}"),
 				SceneEnts > 1 ? TEXT(",") : TEXT(""), *Arch,
 				Asset ? *FString::Printf(TEXT("\"%s\""), **Asset) : TEXT("null"), *Lod,
 				Px * 100.0, -Py * 100.0, Pz * 100.0,
 				Qx, -Qy, Qz, Qw,
 				Val(TEXT("scaleXY"), 1.0), Val(TEXT("scaleZ"), 1.0),
-				TFlags ? *TFlags : 0u);
+				TFlags ? *TFlags : 0u,
+				Val(TEXT("flags"), 0.0), Val(TEXT("guid"), 0.0), Val(TEXT("lodDist"), 0.0), Val(TEXT("childLodDist"), 0.0),
+				Val(TEXT("numChildren"), 0.0), Val(TEXT("parentIndex"), -1.0), *RudeJsonEscape(Text(TEXT("priorityLevel"))),
+				Val(TEXT("ambientOcclusionMultiplier"), 255.0), Val(TEXT("artificialAmbientOcclusion"), 255.0), Val(TEXT("tintValue"), 0.0),
+				*RudeJsonEscape(ExtXml), *RudeJsonEscape(SrcYmapName), *RudeJsonEscape(SrcSlot), EntOrdinal,
+				*RudeJsonEscape(ItemXml), *RudeJsonEscape(E->GetAttribute(TEXT("type"))));
 		}
 		if (SceneEnts == 0) { continue; }
 		++YmapsWithEntities;
@@ -4860,7 +4999,10 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 		DictNeeded, NeededDrawables.Num(), MeshOk, MeshSkip, MeshFail, MeshMissing);
 	// ---- 4) spawn through the proven ImportScene path ----
 	// The spawn only understands lod levels - never hand it the FORCE token.
-	const FString Spawn = ImportScene(ManifestPath, DestMeshFolder, LodFilter);
+	// ACTORS in Mode = one actor per entity carrying its URudeEntityComponent (the editable
+	// scene); otherwise the ISM display path. FORCE never reaches the spawn.
+	const bool bSpawnActors = Mode.Contains(TEXT("ACTORS"), ESearchCase::IgnoreCase);
+	const FString Spawn = ImportScene(ManifestPath, DestMeshFolder, LodFilter, bSpawnActors ? TEXT("ACTORS") : TEXT(""));
 	// ⛔⛔ ok WAS A LITERAL, AND THE SPAWN'S OWN VERDICT WAS NESTED UNDERNEATH IT. This function
 	// calls ImportScene and then opens its format string with a hardcoded "ok":true - so
 	// "no editor world", the failure that produces an import with nothing placed in it, was
@@ -6190,8 +6332,55 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 // The engine's own escape hatch is the first branch — it guards with exactly this TGuardValue when
 // it needs a modal-free save (FileHelpers.cpp:5919). Setting it ONLY while unattended keeps the
 // interactive path (checkout prompts, source control) untouched for a human at the editor.
+// ⛔ AND IN A COMMANDLET THERE IS NO SLATE AT ALL (2026-09-05): `SaveDirtyPackages` reaches into
+// the Slate application for its notifications and asserted `CurrentBaseApplication.IsValid()`
+// the moment the CLI tried to persist 1,954 freshly imported dictionaries. Headless, every dirty
+// content package is saved directly through UPackage::SavePackage - no prompt, no notification,
+// no Slate - and the count of what was written is what the caller gets.
+static int32 GRudeLastSaved = 0, GRudeLastSaveFailed = 0;
 static bool RudeSaveDirty(bool bMaps, bool bContent)
 {
+	GRudeLastSaved = 0; GRudeLastSaveFailed = 0;
+	if (!FSlateApplication::IsInitialized())
+	{
+		TArray<UPackage*> Dirty;
+		if (bContent) { FEditorFileUtils::GetDirtyContentPackages(Dirty); }
+		if (bMaps) { FEditorFileUtils::GetDirtyWorldPackages(Dirty); }
+		for (UPackage* Pkg : Dirty)
+		{
+			if (!Pkg) { continue; }
+			const bool bIsMap = UWorld::FindWorldInPackage(Pkg) != nullptr;
+			const FString Ext = bIsMap ? FPackageName::GetMapPackageExtension() : FPackageName::GetAssetPackageExtension();
+			FString Filename;
+			if (!FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), Filename, Ext)) { ++GRudeLastSaveFailed; continue; }
+			FSavePackageArgs Args;
+			Args.TopLevelFlags = RF_Public | RF_Standalone;
+			Args.SaveFlags = SAVE_NoError;
+			Args.Error = GWarn;
+			// A FORCED re-import builds a NEW in-memory package over a file that already exists on
+			// disk, and the raw save answers Canceled (measured 2026-09-05: 6,888 canceled, every
+			// one an existing file; 3,032 new files saved). Set the old file aside, save, then
+			// drop the old copy - and put it back if the save fails, so a failure costs nothing.
+			IFileManager& FM = IFileManager::Get();
+			const FString Aside = Filename + TEXT(".rude_prev");
+			const bool bExisted = FM.FileExists(*Filename);
+			if (bExisted) { FM.Delete(*Aside, false, true, true); FM.Move(*Aside, *Filename, true, true, true, true); }
+			const FSavePackageResultStruct R = UPackage::Save(Pkg, nullptr, *Filename, Args);
+			if (R == ESavePackageResult::Success)
+			{
+				++GRudeLastSaved;
+				if (bExisted) { FM.Delete(*Aside, false, true, true); }
+			}
+			else
+			{
+				++GRudeLastSaveFailed;
+				if (bExisted) { FM.Move(*Filename, *Aside, true, true, true, true); }
+				UE_LOG(LogTemp, Warning, TEXT("[RUDE] save FAILED %s -> %s (result %d%s)"), *Pkg->GetName(), *Filename,
+					(int32)R.Result, bExisted ? TEXT(", existing file restored") : TEXT(""));
+			}
+		}
+		return GRudeLastSaveFailed == 0;
+	}
 	TGuardValue<bool> UnattendedScriptGuard(GIsRunningUnattendedScript,
 		FApp::IsUnattended() ? true : GIsRunningUnattendedScript);
 	return FEditorFileUtils::SaveDirtyPackages(
@@ -6209,9 +6398,518 @@ FString URudeToolset::SaveAssets()
 	// Content packages only (bSaveMapPackages=false) - an agent persisting its imports must not
 	// silently commit the operator's level edits.
 	const bool bOk = RudeSaveDirty(/*bMaps*/ false, /*bContent*/ true);
-	return FString::Printf(TEXT("{\"ok\":%s,\"unattended\":%s}"),
-		bOk ? TEXT("true") : TEXT("false"),
+	return FString::Printf(TEXT("{\"ok\":%s,\"saved\":%d,\"saveFailed\":%d,\"headless\":%s,\"unattended\":%s}"),
+		bOk ? TEXT("true") : TEXT("false"), GRudeLastSaved, GRudeLastSaveFailed,
+		FSlateApplication::IsInitialized() ? TEXT("false") : TEXT("true"),
 		FApp::IsUnattended() ? TEXT("true") : TEXT("false"));
+}
+
+// ---- ExportLevelYmaps --------------------------------------------------------------------
+// A number as the game's files spell it: shortest fixed form, no trailing zeros ("1", "15000",
+// "-153.610275"). Only EDITED entities are spelled this way; untouched ones go out verbatim.
+static FString RudeNum(double V)
+{
+	FString S = FString::Printf(TEXT("%.6f"), V);
+	if (S.Contains(TEXT(".")))
+	{
+		while (S.EndsWith(TEXT("0"))) { S.LeftChopInline(1); }
+		if (S.EndsWith(TEXT("."))) { S.LeftChopInline(1); }
+	}
+	if (S == TEXT("-0")) { S = TEXT("0"); }
+	return S;
+}
+
+// A CEntityDef from the component + the actor's transform, in the game's field order (verified
+// against dt1_02.ymap.xml 2026-09-05). UE -> RAGE: position /100 with Y mirrored; the ymap stores
+// the INVERSE orientation, so the actor quaternion goes out as (x, -y, z, w); scale XY from X.
+static FString RudeEntityDefXml(const URudeEntityComponent* R, const FTransform& Xf)
+{
+	const FVector P = Xf.GetLocation();
+	const FQuat Q = Xf.GetRotation().GetNormalized();
+	const FVector S = Xf.GetScale3D();
+	FString O;
+	O += TEXT("  <Item type=\"CEntityDef\">\n");
+	O += TEXT("   <archetypeName>"); RudeXmlEscapeInto(O, R->ArchetypeName); O += TEXT("</archetypeName>\n");
+	O += FString::Printf(TEXT("   <flags value=\"%u\" />\n"), R->Flags);
+	O += FString::Printf(TEXT("   <guid value=\"%u\" />\n"), R->Guid);
+	O += FString::Printf(TEXT("   <position x=\"%s\" y=\"%s\" z=\"%s\" />\n"), *RudeNum(P.X / 100.0), *RudeNum(-P.Y / 100.0), *RudeNum(P.Z / 100.0));
+	O += FString::Printf(TEXT("   <rotation x=\"%s\" y=\"%s\" z=\"%s\" w=\"%s\" />\n"), *RudeNum(Q.X), *RudeNum(-Q.Y), *RudeNum(Q.Z), *RudeNum(Q.W));
+	O += FString::Printf(TEXT("   <scaleXY value=\"%s\" />\n"), *RudeNum(S.X));
+	O += FString::Printf(TEXT("   <scaleZ value=\"%s\" />\n"), *RudeNum(S.Z));
+	O += FString::Printf(TEXT("   <parentIndex value=\"%d\" />\n"), R->ParentIndex);
+	O += FString::Printf(TEXT("   <lodDist value=\"%s\" />\n"), *RudeNum(R->LodDist));
+	O += FString::Printf(TEXT("   <childLodDist value=\"%s\" />\n"), *RudeNum(R->ChildLodDist));
+	O += TEXT("   <lodLevel>"); RudeXmlEscapeInto(O, R->LodLevel); O += TEXT("</lodLevel>\n");
+	O += FString::Printf(TEXT("   <numChildren value=\"%d\" />\n"), R->NumChildren);
+	O += TEXT("   <priorityLevel>"); RudeXmlEscapeInto(O, R->PriorityLevel); O += TEXT("</priorityLevel>\n");
+	if (R->ExtensionsXml.TrimStartAndEnd().IsEmpty()) { O += TEXT("   <extensions />\n"); }
+	else
+	{
+		// carried verbatim (RudeXmlNodeToString spelled it at depth 0; re-indent by 3)
+		TArray<FString> Lines;
+		R->ExtensionsXml.ParseIntoArrayLines(Lines);
+		for (const FString& L : Lines) { O += TEXT("   "); O += L; O += TEXT("\n"); }
+	}
+	O += FString::Printf(TEXT("   <ambientOcclusionMultiplier value=\"%s\" />\n"), *RudeNum(R->AmbientOcclusionMultiplier));
+	O += FString::Printf(TEXT("   <artificialAmbientOcclusion value=\"%s\" />\n"), *RudeNum(R->ArtificialAmbientOcclusion));
+	O += FString::Printf(TEXT("   <tintValue value=\"%u\" />\n"), R->TintValue);
+	O += TEXT("  </Item>\n");
+	return O;
+}
+
+struct FRudeExportEntity
+{
+	const URudeEntityComponent* R = nullptr;
+	FTransform Xf;
+	bool bUntouched = false;
+};
+
+FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& YmapFilter,
+                                       const FString& CorpusRoot, const FString& NewEntitiesYmap)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	if (OutDir.TrimStartAndEnd().IsEmpty()) { return Fail(TEXT("give an OutDir for the FiveM resource")); }
+	FString CorpusErr;
+	const TSharedPtr<FRudeCorpus> Corpus = FRudeCorpus::Open(CorpusRoot, CorpusErr);
+	if (!Corpus.IsValid()) { return Fail(CorpusErr); }
+
+	TSet<FString> Wanted;
+	{
+		TArray<FString> Parts;
+		YmapFilter.ParseIntoArray(Parts, TEXT(","), true);
+		for (FString P : Parts) { P.TrimStartAndEndInline(); if (!P.IsEmpty()) { Wanted.Add(P.ToLower()); } }
+	}
+	const FString NewYmap = NewEntitiesYmap.TrimStartAndEnd().ToLower();
+
+	// ---- 1) read the level back: every entity component, grouped by its source ymap
+	TMap<FString, TArray<FRudeExportEntity>> Groups;
+	int32 Seen = 0, Unsourced = 0, UnsourcedDropped = 0;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		const URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>();
+		if (!R) { continue; }
+		++Seen;
+		FString Ymap = R->SourceYmap.ToLower();
+		if (Ymap.IsEmpty())
+		{
+			++Unsourced;
+			if (NewYmap.IsEmpty()) { ++UnsourcedDropped; continue; }
+			Ymap = NewYmap;
+		}
+		if (Wanted.Num() > 0 && !Wanted.Contains(Ymap)) { continue; }
+		FRudeExportEntity E;
+		E.R = R;
+		E.Xf = It->GetActorTransform();
+		E.bUntouched = !R->SourceXml.IsEmpty() && R->SourceIndex >= 0
+			&& E.Xf.Equals(R->SourceTransform, 1e-3f)
+			&& R->FieldsKey() == R->SourceFieldsKey;
+		Groups.FindOrAdd(Ymap).Add(E);
+	}
+	if (Groups.Num() == 0) { return Fail(FString::Printf(TEXT("no RUDE entities to export (%d components seen)"), Seen)); }
+
+	IFileManager::Get().MakeDirectory(*(OutDir / TEXT("stream")), true);
+	int32 YmapsWritten = 0, YmapsRefused = 0;
+	int32 Kept = 0, Edited = 0, Added = 0, Removed = 0, EditsNotRebuilt = 0, ExtentsGrown = 0;
+	FString Files, Refused;
+	for (auto& KV : Groups)
+	{
+		const FString& YmapName = KV.Key;
+		TArray<FRudeExportEntity>& Ents = KV.Value;
+		Ents.Sort([](const FRudeExportEntity& A, const FRudeExportEntity& B)
+		{
+			const int32 IA = A.R->SourceIndex < 0 ? INT32_MAX : A.R->SourceIndex;
+			const int32 IB = B.R->SourceIndex < 0 ? INT32_MAX : B.R->SourceIndex;
+			if (IA != IB) { return IA < IB; }
+			return A.R->ArchetypeName < B.R->ArchetypeName;
+		});
+
+		// ---- 2) the source document (the file the entities came from), or a fresh one
+		const FRudeCorpusEntry* Row = Corpus->Effective(TEXT("ymap"), YmapName);
+		TUniquePtr<FXmlFile> Src;
+		FString SrcText;   // the file's own bytes: the output is spliced from these, never re-spelled
+		if (Row)
+		{
+			const FString SrcPath = Corpus->PathOf(*Row);
+			FFileHelper::LoadFileToString(SrcText, *SrcPath);
+			Src = MakeUnique<FXmlFile>(SrcPath);
+		}
+		const FXmlNode* Root = (Src.IsValid() && Src->IsValid()) ? Src->GetRootNode() : nullptr;
+		const FXmlNode* SrcEnts = Root ? Root->FindChildNode(TEXT("entities")) : nullptr;
+		int32 SourceCount = 0;
+		bool bLineage = false;
+		if (SrcEnts)
+		{
+			for (const FXmlNode* Item : SrcEnts->GetChildrenNodes())
+			{
+				++SourceCount;
+				const FXmlNode* Pi = Item->FindChildNode(TEXT("parentIndex"));
+				const FXmlNode* Nc = Item->FindChildNode(TEXT("numChildren"));
+				if ((Pi && FCString::Atoi(*Pi->GetAttribute(TEXT("value"))) >= 0)
+					|| (Nc && FCString::Atoi(*Nc->GetAttribute(TEXT("value"))) > 0)) { bLineage = true; }
+			}
+		}
+		int32 Present = 0;
+		for (const FRudeExportEntity& E : Ents) { if (E.R->SourceIndex >= 0) { ++Present; } }
+		const int32 RemovedHere = FMath::Max(0, SourceCount - Present);
+		if (RemovedHere > 0 && bLineage)
+		{
+			// Deleting an entity shifts every ordinal after it, and parentIndex values (in this
+			// file and in child ymaps) are ordinals. Refuse rather than ship broken LOD links.
+			++YmapsRefused;
+			Refused += FString::Printf(TEXT("%s\"%s: %d entity(ies) deleted from a file with LOD lineage - ordinals would shift; hide instead\""),
+				Refused.IsEmpty() ? TEXT("") : TEXT(","), *YmapName, RemovedHere);
+			continue;
+		}
+
+		// ---- 3) entities block
+		FString EntXml;
+		// Only EDITED/ADDED entities can push the file's extents: an untouched file keeps its
+		// extents verbatim (the game's own values encode archetype bounds and a streaming rule RUDE
+		// does not reproduce - measured 2026-09-05: recomputing them changed all 148 clean files).
+		double MinX = DBL_MAX, MinY = DBL_MAX, MinZ = DBL_MAX, MaxX = -DBL_MAX, MaxY = -DBL_MAX, MaxZ = -DBL_MAX;
+		int32 Movers = 0;
+		for (const FRudeExportEntity& E : Ents)
+		{
+			const bool bRebuildable = E.R->ItemType.IsEmpty() || E.R->ItemType == TEXT("CEntityDef");
+			if (E.bUntouched || (!bRebuildable && !E.R->SourceXml.IsEmpty()))
+			{
+				// Untouched: verbatim. An EDITED CMloInstanceDef (or any other item kind) has no Wave-1
+				// rebuild path - it goes out as read and the edit is COUNTED, never silently dropped.
+				if (!E.bUntouched) { ++EditsNotRebuilt; }
+				EntXml += E.R->SourceXml;
+				if (!E.R->SourceXml.EndsWith(TEXT("\n"))) { EntXml += TEXT("\n"); }
+				++Kept;
+			}
+			else
+			{
+				EntXml += RudeEntityDefXml(E.R, E.Xf);
+				if (E.R->SourceIndex >= 0) { ++Edited; } else { ++Added; }
+			}
+			if (!E.bUntouched)
+			{
+				const FVector P = E.Xf.GetLocation();
+				const double X = P.X / 100.0, Y = -P.Y / 100.0, Z = P.Z / 100.0;
+				MinX = FMath::Min(MinX, X); MinY = FMath::Min(MinY, Y); MinZ = FMath::Min(MinZ, Z);
+				MaxX = FMath::Max(MaxX, X); MaxY = FMath::Max(MaxY, Y); MaxZ = FMath::Max(MaxZ, Z);
+				++Movers;
+			}
+		}
+		Removed += RemovedHere;
+
+		// ---- 4) the document around it: every other node re-spelled as read (shape-safe by the
+		// XmlShapeRoundTrip gate); the two extents pairs only ever GROW to cover the entities.
+		auto Extents = [&](const FXmlNode* N, const TCHAR* Tag, bool bMin, double Margin) -> FString
+		{
+			// Verbatim unless an edited/added entity sits OUTSIDE the stored box; then grow by exactly
+			// what covers it (+Margin). Counted in the verdict so nobody mistakes it for the game's rule.
+			if (N && Movers == 0) { FString O; RudeXmlNodeToString(N, O, 1); return O; }
+			double Sx = bMin ? MinX - Margin : MaxX + Margin;
+			double Sy = bMin ? MinY - Margin : MaxY + Margin;
+			double Sz = bMin ? MinZ - Margin : MaxZ + Margin;
+			if (N)
+			{
+				const double Ox = FCString::Atod(*N->GetAttribute(TEXT("x")));
+				const double Oy = FCString::Atod(*N->GetAttribute(TEXT("y")));
+				const double Oz = FCString::Atod(*N->GetAttribute(TEXT("z")));
+				const bool bGrew = bMin ? (Sx < Ox || Sy < Oy || Sz < Oz) : (Sx > Ox || Sy > Oy || Sz > Oz);
+				if (!bGrew) { FString O; RudeXmlNodeToString(N, O, 1); return O; }
+				++ExtentsGrown;
+				Sx = bMin ? FMath::Min(Sx, Ox) : FMath::Max(Sx, Ox);
+				Sy = bMin ? FMath::Min(Sy, Oy) : FMath::Max(Sy, Oy);
+				Sz = bMin ? FMath::Min(Sz, Oz) : FMath::Max(Sz, Oz);
+			}
+			return FString::Printf(TEXT(" <%s x=\"%s\" y=\"%s\" z=\"%s\" />\n"), Tag, *RudeNum(Sx), *RudeNum(Sy), *RudeNum(Sz));
+		};
+		FString Doc;
+		if (Root && !SrcText.IsEmpty())
+		{
+			// SPLICE: the source bytes with (a) the top-level <entities> block replaced and (b) any
+			// extents line that had to grow replaced. Nothing else is touched - not even whitespace.
+			Doc = SrcText;
+			auto ReplaceTopLevel = [&Doc](const FString& OpenTag, const FString& CloseTag, const FString& EmptyTag, const FString& NewBlock) -> bool
+			{
+				const int32 Open = Doc.Find(OpenTag, ESearchCase::CaseSensitive);
+				if (Open != INDEX_NONE)
+				{
+					const int32 Close = Doc.Find(CloseTag, ESearchCase::CaseSensitive, ESearchDir::FromStart, Open);
+					if (Close == INDEX_NONE) { return false; }
+					const int32 End = Close + CloseTag.Len();
+					Doc = Doc.Left(Open) + NewBlock + Doc.Mid(End);
+					return true;
+				}
+				const int32 Empty = Doc.Find(EmptyTag, ESearchCase::CaseSensitive);
+				if (Empty == INDEX_NONE) { return false; }
+				Doc = Doc.Left(Empty) + NewBlock + Doc.Mid(Empty + EmptyTag.Len());
+				return true;
+			};
+			const bool bEntitiesChanged = (Edited + Added + RemovedHere) > 0 || Movers > 0;
+			if (bEntitiesChanged || Ents.Num() != SourceCount)
+			{
+				// (the block is rebuilt from verbatim rows + edited rows; identical text when nothing moved)
+			}
+			if (!ReplaceTopLevel(TEXT("\n <entities>\n"), TEXT(" </entities>\n"), TEXT("\n <entities />\n"),
+				TEXT("\n <entities>\n") + EntXml + TEXT(" </entities>\n")))
+			{
+				++YmapsRefused;
+				Refused += FString::Printf(TEXT("%s\"%s: no top-level <entities> block found to splice\""), Refused.IsEmpty() ? TEXT("") : TEXT(","), *YmapName);
+				continue;
+			}
+			if (Movers > 0)
+			{
+				auto ReplaceExtents = [&](const TCHAR* Tag, bool bMin)
+				{
+					const FXmlNode* N = Root->FindChildNode(Tag);
+					if (!N) { return; }
+					const FString NewLine = Extents(N, Tag, bMin, 0.0);
+					FString OldLine;
+					RudeXmlNodeToString(N, OldLine, 1);
+					if (NewLine == OldLine) { return; }   // did not grow: leave the source bytes alone
+					// the source line as the file spells it: " <tag x=.. y=.. z=.. />" on its own line
+					const FString Needle = FString::Printf(TEXT("\n <%s "), Tag);
+					const int32 At = Doc.Find(Needle, ESearchCase::CaseSensitive);
+					if (At == INDEX_NONE) { return; }
+					const int32 LineEnd = Doc.Find(TEXT("\n"), ESearchCase::CaseSensitive, ESearchDir::FromStart, At + 1);
+					if (LineEnd == INDEX_NONE) { return; }
+					Doc = Doc.Left(At + 1) + NewLine.TrimEnd() + Doc.Mid(LineEnd);
+				};
+				ReplaceExtents(TEXT("streamingExtentsMin"), true);
+				ReplaceExtents(TEXT("streamingExtentsMax"), false);
+				ReplaceExtents(TEXT("entitiesExtentsMin"), true);
+				ReplaceExtents(TEXT("entitiesExtentsMax"), false);
+			}
+		}
+		else
+		{
+			Doc = TEXT("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapData>\n");
+			// No source: a NEW ymap (authored content). Minimal, FiveM-loadable header.
+			Doc += FString::Printf(TEXT(" <name>%s</name>\n <parent />\n <flags value=\"0\" />\n <contentFlags value=\"1\" />\n"), *YmapName);
+			// A NEW file has no stored box: entity extents = positions +-10 m, streaming = +-500 m
+			// (a plain-prop reach; the game's rule is not reproduced - verdict says extentsGrown).
+			Doc += Extents(nullptr, TEXT("streamingExtentsMin"), true, 500.0);
+			Doc += Extents(nullptr, TEXT("streamingExtentsMax"), false, 500.0);
+			Doc += Extents(nullptr, TEXT("entitiesExtentsMin"), true, 10.0);
+			Doc += Extents(nullptr, TEXT("entitiesExtentsMax"), false, 10.0);
+			Doc += TEXT(" <entities>\n"); Doc += EntXml; Doc += TEXT(" </entities>\n");
+			Doc += TEXT(" <containerLods />\n <boxOccluders />\n <occludeModels />\n <physicsDictionaries />\n <instancedData>\n  <ImapLink />\n  <PropInstanceList />\n  <GrassInstanceList />\n </instancedData>\n <timeCycleModifiers />\n <carGenerators />\n <LODLightsSOA>\n  <direction />\n  <falloff />\n  <falloffExponent />\n  <timeAndStateFlags />\n  <hash />\n  <coneInnerAngle />\n  <coneOuterAngleOrCapExt />\n  <coronaIntensity />\n </LODLightsSOA>\n <DistantLODLightsSOA>\n  <position />\n  <RGBI />\n  <numStreetLights value=\"0\" />\n  <category value=\"0\" />\n </DistantLODLightsSOA>\n <block>\n  <version value=\"0\" />\n  <flags value=\"0\" />\n  <name>"); Doc += YmapName; Doc += TEXT("</name>\n  <exportedBy>RUDE</exportedBy>\n  <owner />\n  <time />\n </block>\n");
+			Doc += TEXT("</CMapData>\n");
+		}
+		const FString OutPath = OutDir / TEXT("stream") / (YmapName + TEXT(".ymap"));
+		if (!FFileHelper::SaveStringToFile(Doc, *OutPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+		{
+			return Fail(FString::Printf(TEXT("cannot write %s"), *OutPath));
+		}
+		++YmapsWritten;
+		Files += FString::Printf(TEXT("%s\"%s\""), Files.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(OutPath));
+	}
+	const FString Manifest = TEXT("fx_version 'cerulean'\ngame 'gta5'\nthis_is_a_map 'yes'\n");
+	FFileHelper::SaveStringToFile(Manifest, *(OutDir / TEXT("fxmanifest.lua")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	const bool bOk = YmapsWritten > 0 && YmapsRefused == 0;
+	return FString::Printf(
+		TEXT("{\"ok\":%s,\"componentsSeen\":%d,\"unsourced\":%d,\"unsourcedDropped\":%d,")
+		TEXT("\"ymapsWritten\":%d,\"ymapsRefused\":%d,\"kept\":%d,\"edited\":%d,\"added\":%d,\"removed\":%d,")
+		TEXT("\"editsNotRebuilt\":%d,\"extentsGrown\":%d,\"files\":[%s],\"refused\":[%s]}"),
+		bOk ? TEXT("true") : TEXT("false"), Seen, Unsourced, UnsourcedDropped,
+		YmapsWritten, YmapsRefused, Kept, Edited, Added, Removed, EditsNotRebuilt, ExtentsGrown, *Files, *Refused);
+}
+
+// ---- MoveRudeEntity (agent; the scriptable edit for the export gate) ----------------------
+FString URudeToolset::MoveRudeEntity(const FString& SourceYmap, const FString& SourceIndex, const FString& DeltaCm)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	const int32 Idx = FCString::Atoi(*SourceIndex);
+	TArray<FString> P;
+	DeltaCm.Replace(TEXT(";"), TEXT(",")).ParseIntoArray(P, TEXT(","), true);
+	if (P.Num() != 3) { return Fail(TEXT("DeltaCm must be x,y,z in UE centimetres")); }
+	const FVector D(FCString::Atod(*P[0]), FCString::Atod(*P[1]), FCString::Atod(*P[2]));
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		const URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>();
+		if (!R || R->SourceIndex != Idx || !R->SourceYmap.Equals(SourceYmap, ESearchCase::IgnoreCase)) { continue; }
+		const FVector Before = It->GetActorLocation();
+		It->SetActorLocation(Before + D);
+		It->MarkPackageDirty();
+		return FString::Printf(TEXT("{\"ok\":true,\"archetype\":\"%s\",\"before\":[%f,%f,%f],\"after\":[%f,%f,%f]}"),
+			*RudeJsonEscape(R->ArchetypeName), Before.X, Before.Y, Before.Z, Before.X + D.X, Before.Y + D.Y, Before.Z + D.Z);
+	}
+	return Fail(FString::Printf(TEXT("no entity %s[%d] in the level"), *SourceYmap, Idx));
+}
+
+// ---- ProbeWorldPartitionLevel (agent; the WP4 spike) -------------------------------------
+// One question, one answer, in-engine: can RUDE make a World Partition level from code, put a
+// Data Layer in it, place an actor on that layer, and save the lot - headless? Every step reports.
+FString URudeToolset::ProbeWorldPartitionLevel(const FString& LevelPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	if (!GEditor) { return Fail(TEXT("no GEditor")); }
+	const FString Path = LevelPath.TrimStartAndEnd();
+	if (!FPackageName::IsValidLongPackageName(Path)) { return Fail(TEXT("LevelPath must be a long package name like /Game/RUDE/Levels/Probe")); }
+	// 1) a fresh world with World Partition
+	UWorld* World = GEditor->NewMap(/*bIsPartitionedWorld*/ true);
+	if (!World) { return Fail(TEXT("NewMap(partitioned) returned null")); }
+	UWorldPartition* WP = World->GetWorldPartition();
+	if (!WP) { return Fail(TEXT("new map has no WorldPartition")); }
+	// 2) a Data Layer asset + instance
+	const FString DlPkgName = Path + TEXT("_DL_probe");
+	UPackage* DlPkg = CreatePackage(*DlPkgName);
+	UDataLayerAsset* DlAsset = NewObject<UDataLayerAsset>(DlPkg, FName(*FPackageName::GetLongPackageAssetName(DlPkgName)), RF_Public | RF_Standalone);
+	DlAsset->SetType(EDataLayerType::Runtime);
+	DlPkg->MarkPackageDirty();
+	UDataLayerEditorSubsystem* DlSub = UDataLayerEditorSubsystem::Get();
+	if (!DlSub) { return Fail(TEXT("no DataLayerEditorSubsystem")); }
+	FDataLayerCreationParameters P;
+	P.DataLayerAsset = DlAsset;
+	P.WorldDataLayers = World->GetWorldDataLayers();
+	UDataLayerInstance* Dl = DlSub->CreateDataLayerInstance(P);
+	if (!Dl) { return Fail(TEXT("CreateDataLayerInstance returned null")); }
+	// 3) an actor on that layer
+	AActor* A = World->SpawnActor<AActor>();
+	if (!A) { return Fail(TEXT("SpawnActor failed in the new world")); }
+	UStaticMeshComponent* SMC = NewObject<UStaticMeshComponent>(A, TEXT("Mesh"));
+	SMC->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube")));
+	A->SetRootComponent(SMC);
+	SMC->RegisterComponent();
+	A->AddInstanceComponent(SMC);
+	A->SetActorLabel(TEXT("RUDE_probe_cube"));
+	const bool bAdded = DlSub->AddActorToDataLayer(A, Dl);
+	// 4) save the map and the asset
+	bool bSavedMap = FEditorFileUtils::SaveMap(World, Path);
+	// Measured 2026-09-05: SaveMap answered true and wrote the external actors + the Data Layer
+	// asset, but NO .umap landed. Second leg: the headless saver over maps + content, then check.
+	{
+		FString MapFileCheck;
+		FPackageName::TryConvertLongPackageNameToFilename(Path, MapFileCheck, FPackageName::GetMapPackageExtension());
+		if (!FPaths::FileExists(MapFileCheck))
+		{
+			World->GetOutermost()->MarkPackageDirty();
+			bSavedMap = RudeSaveDirty(/*bMaps*/ true, /*bContent*/ true) && FPaths::FileExists(MapFileCheck);
+		}
+	}
+	FString AssetFile;
+	bool bSavedAsset = false;
+	if (FPackageName::TryConvertLongPackageNameToFilename(DlPkgName, AssetFile, FPackageName::GetAssetPackageExtension()))
+	{
+		FSavePackageArgs Args;
+		Args.TopLevelFlags = RF_Public | RF_Standalone;
+		Args.Error = GWarn;
+		bSavedAsset = UPackage::Save(DlPkg, DlAsset, *AssetFile, Args) == ESavePackageResult::Success;
+	}
+	FString MapFile;
+	FPackageName::TryConvertLongPackageNameToFilename(Path, MapFile, FPackageName::GetMapPackageExtension());
+	const bool bMapOnDisk = FPaths::FileExists(MapFile);
+	const bool bOk = bAdded && bSavedMap && bSavedAsset && bMapOnDisk;
+	return FString::Printf(TEXT("{\"ok\":%s,\"worldPartition\":true,\"dataLayerInstance\":\"%s\",\"actorAdded\":%s,")
+		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"assetSaved\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"map\":\"%s\",\"dataLayerAsset\":\"%s\"}"),
+		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Dl->GetDataLayerShortName()),
+		bAdded ? TEXT("true") : TEXT("false"), bSavedMap ? TEXT("true") : TEXT("false"),
+		bMapOnDisk ? TEXT("true") : TEXT("false"), bSavedAsset ? TEXT("true") : TEXT("false"),
+		GRudeLastSaved, GRudeLastSaveFailed, *RudeJsonEscape(MapFile), *RudeJsonEscape(DlPkgName));
+}
+
+// ---- XmlShapeRoundTrip -------------------------------------------------------------------
+// Walk a parsed tree into (path -> [attr=value...] + leaf text) rows, order-preserving by path
+// with sibling ordinals, so two parses compare exactly and a mismatch names its path.
+static void RudeXmlShapeRows(const FXmlNode* N, const FString& Path, TArray<FString>& Rows)
+{
+	if (!N) { return; }
+	FString Row = Path;
+	for (const FXmlAttribute& A : N->GetAttributes())
+	{
+		Row += TEXT(" @"); Row += A.GetTag(); Row += TEXT("="); Row += A.GetValue();
+	}
+	const TArray<FXmlNode*>& Kids = N->GetChildrenNodes();
+	if (Kids.Num() == 0)
+	{
+		Row += TEXT(" #"); Row += N->GetContent().TrimStartAndEnd();
+	}
+	Rows.Add(Row);
+	TMap<FString, int32> Ordinal;
+	for (const FXmlNode* K : Kids)
+	{
+		const int32 I = Ordinal.FindOrAdd(K->GetTag())++;
+		RudeXmlShapeRows(K, FString::Printf(TEXT("%s/%s[%d]"), *Path, *K->GetTag(), I), Rows);
+	}
+}
+
+FString URudeToolset::XmlShapeRoundTrip(const FString& ListPath, const FString& OutDir)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
+	};
+	TArray<FString> Files;
+	if (ListPath.EndsWith(TEXT(".xml"), ESearchCase::IgnoreCase)) { Files.Add(ListPath); }
+	else
+	{
+		FString Raw;
+		if (!FFileHelper::LoadFileToString(Raw, *ListPath)) { return Fail(TEXT("cannot read ListPath")); }
+		Raw.ParseIntoArrayLines(Files);
+	}
+	int32 Identical = 0, Differing = 0, Unreadable = 0;
+	int64 Elements = 0, Attributes = 0;
+	FString Mismatches;
+	int32 MismatchCount = 0;
+	for (FString F : Files)
+	{
+		F.TrimStartAndEndInline();
+		if (F.IsEmpty()) { continue; }
+		FXmlFile A(F);
+		if (!A.IsValid() || !A.GetRootNode()) { ++Unreadable; continue; }
+		FString Text = TEXT("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+		RudeXmlNodeToString(A.GetRootNode(), Text, 0);
+		FString OutPath;
+		if (!OutDir.TrimStartAndEnd().IsEmpty())
+		{
+			OutPath = OutDir / FPaths::GetCleanFilename(F);
+			FFileHelper::SaveStringToFile(Text, *OutPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+		}
+		FXmlFile B(Text, EConstructMethod::ConstructFromBuffer);
+		if (!B.IsValid() || !B.GetRootNode())
+		{
+			++Differing;
+			if (MismatchCount++ < 20) { Mismatches += FString::Printf(TEXT("%s\"%s: re-parse failed\""), Mismatches.IsEmpty() ? TEXT("") : TEXT(","), *F); }
+			continue;
+		}
+		TArray<FString> RowsA, RowsB;
+		RudeXmlShapeRows(A.GetRootNode(), A.GetRootNode()->GetTag(), RowsA);
+		RudeXmlShapeRows(B.GetRootNode(), B.GetRootNode()->GetTag(), RowsB);
+		Elements += RowsA.Num();
+		for (const FString& R : RowsA) { for (TCHAR C : R) { if (C == TEXT('@')) { ++Attributes; } } }
+		bool bSame = RowsA.Num() == RowsB.Num();
+		FString FirstDiff;
+		for (int32 i = 0; bSame && i < RowsA.Num(); ++i)
+		{
+			if (RowsA[i] != RowsB[i]) { bSame = false; FirstDiff = RowsA[i].Left(120) + TEXT(" != ") + RowsB[i].Left(120); }
+		}
+		if (bSame) { ++Identical; }
+		else
+		{
+			++Differing;
+			if (MismatchCount++ < 20)
+			{
+				Mismatches += FString::Printf(TEXT("%s\"%s: rows %d vs %d%s%s\""), Mismatches.IsEmpty() ? TEXT("") : TEXT(","),
+					*FPaths::GetCleanFilename(F), RowsA.Num(), RowsB.Num(), FirstDiff.IsEmpty() ? TEXT("") : TEXT("; first "), *RudeJsonEscape(FirstDiff));
+			}
+		}
+	}
+	const bool bOk = (Differing == 0) && (Unreadable == 0) && (Identical > 0);
+	return FString::Printf(
+		TEXT("{\"ok\":%s,\"files\":%d,\"identical\":%d,\"differing\":%d,\"unreadable\":%d,")
+		TEXT("\"elements\":%lld,\"attributes\":%lld,\"mismatches\":[%s]}"),
+		bOk ? TEXT("true") : TEXT("false"), Files.Num(), Identical, Differing, Unreadable,
+		Elements, Attributes, *Mismatches);
 }
 
 FString URudeToolset::SetWorldHour(const FString& Hour)
@@ -6579,8 +7277,67 @@ FString URudeToolset::ImportYtdBatch(const FString& ListPath, const FString& Des
 		UsageDefaulted, UsageUnknown, ItemsWithoutName, *FailedFiles);
 }
 
+// One actor per entity: a StaticMeshComponent root (the drawable, or the proxy cube when the
+// mesh is absent) plus a URudeEntityComponent filled from the manifest row. Folder RUDE_LS/<ymap>
+// so the idempotent clear and the per-ymap grouping both work; label = archetype name.
+static AActor* RudeSpawnEntityActor(UWorld* World, const FString& YmapName, const TSharedPtr<FJsonObject>& Ent,
+                                    const FTransform& Xf, UStaticMesh* Mesh, bool bProxy, uint32 TimeMask)
+{
+	AActor* A = World->SpawnActor<AActor>();
+	if (!A) { return nullptr; }
+	UStaticMeshComponent* SMC = NewObject<UStaticMeshComponent>(A, TEXT("Mesh"));
+	SMC->SetStaticMesh(Mesh);
+	SMC->SetMobility(EComponentMobility::Static);
+	A->SetRootComponent(SMC);
+	SMC->RegisterComponent();
+	A->AddInstanceComponent(SMC);
+	A->SetActorTransform(Xf);
+	if (TimeMask != 0 && TimeMask != 0xFFFFFFu)
+	{
+		SMC->ComponentTags.Add(FName(*FString::Printf(TEXT("RUDE_TIME:%u"), TimeMask)));
+	}
+	if (bProxy) { A->Tags.Add(FName(TEXT("RUDE_PROXY"))); }
+	URudeEntityComponent* R = NewObject<URudeEntityComponent>(A, TEXT("RudeEntity"));
+	auto Str = [&Ent](const TCHAR* K) { FString V; Ent->TryGetStringField(K, V); return V; };
+	auto Num = [&Ent](const TCHAR* K, double Def) { double V = Def; Ent->TryGetNumberField(K, V); return V; };
+	R->ArchetypeName = Str(TEXT("archetype"));
+	R->SourceYmap = Str(TEXT("srcYmap"));
+	R->SourceSlot = Str(TEXT("srcSlot"));
+	R->SourceIndex = (int32)Num(TEXT("srcIndex"), -1.0);
+	R->LodDist = (float)Num(TEXT("lodDist"), 0.0);
+	R->ChildLodDist = (float)Num(TEXT("childLodDist"), 0.0);
+	{
+		const FString Lod = Str(TEXT("lodLevel"));
+		if (!Lod.IsEmpty()) { R->LodLevel = Lod; }
+	}
+	R->ParentIndex = (int32)Num(TEXT("parentIndex"), -1.0);
+	{
+		const FString Pri = Str(TEXT("priorityLevel"));
+		if (!Pri.IsEmpty()) { R->PriorityLevel = Pri; }
+	}
+	R->ExtensionsXml = Str(TEXT("extensions"));
+	R->Flags = (uint32)Num(TEXT("flags"), 0.0);
+	R->Guid = (uint32)Num(TEXT("guid"), 0.0);
+	R->NumChildren = (int32)Num(TEXT("numChildren"), 0.0);
+	R->AmbientOcclusionMultiplier = (float)Num(TEXT("aoMultiplier"), 255.0);
+	R->ArtificialAmbientOcclusion = (float)Num(TEXT("artificialAo"), 255.0);
+	R->TintValue = (uint32)Num(TEXT("tintValue"), 0.0);
+	R->SourceXml = Str(TEXT("xml"));
+	{
+		const FString T = Str(TEXT("itemType"));
+		if (!T.IsEmpty()) { R->ItemType = T; }
+	}
+	R->SourceTransform = Xf;
+	R->SourceFieldsKey = R->FieldsKey();
+	R->RegisterComponent();
+	A->AddInstanceComponent(R);
+	A->SetActorLabel(R->ArchetypeName.IsEmpty() ? YmapName : R->ArchetypeName);
+	A->SetFolderPath(FName(*(TEXT("RUDE_LS/") + YmapName)));
+	return A;
+}
+
 FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& MeshFolder,
-                                  const FString& Filter)
+                                  const FString& Filter, const FString& Mode)
 {
 	auto Fail = [](const FString& Why)
 	{
@@ -6605,6 +7362,10 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		return Fail(TEXT("no editor world"));
 	}
 	const bool bAll = Filter.TrimStartAndEnd().Equals(TEXT("ALL"), ESearchCase::IgnoreCase);
+	// ACTORS = one actor per entity with its RUDE entity component (editable, exportable);
+	// empty = the ISM display path (fast, not per-entity addressable).
+	const bool bActors = Mode.TrimStartAndEnd().Equals(TEXT("ACTORS"), ESearchCase::IgnoreCase);
+	int32 NumActors = 0;
 
 	// Idempotent respawn: clear any previous RUDE_LS spawn first (re-running the tool
 	// REPLACES the scene instead of stacking duplicates).
@@ -6612,7 +7373,9 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		TArray<AActor*> Stale;
 		for (TActorIterator<AActor> It(World); It; ++It)
 		{
-			if (It->GetFolderPath() == FName(TEXT("RUDE_LS"))) { Stale.Add(*It); }
+			// RUDE_LS itself (ISM mode) and RUDE_LS/<ymap> (ACTORS mode) are both this tool's.
+			const FString Folder = It->GetFolderPath().ToString();
+			if (Folder == TEXT("RUDE_LS") || Folder.StartsWith(TEXT("RUDE_LS/"))) { Stale.Add(*It); }
 		}
 		for (AActor* A : Stale) { World->DestroyActor(A); }
 	}
@@ -6645,6 +7408,7 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		AActor* Actor = nullptr;
 		USceneComponent* Root = nullptr;
 		TMap<FString, UInstancedStaticMeshComponent*> IsmByMesh;   // key: mesh name or "proxy:<name>"
+		if (bActors && Entities->Num() > 0) { ++NumYmaps; }   // ACTORS mode has no per-ymap parent actor
 
 		// ⭐ The key carries the HOUR MASK as well as the mesh, so entities that appear only at
 		// certain hours land in their OWN component. Visibility is a per-component switch in UE,
@@ -6739,6 +7503,28 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 					// set and that is worth having as a number rather than a subtraction.
 					++UniqueMeshLookups;
 				}
+			}
+			if (bActors)
+			{
+				uint32 TimeMaskA = 0;
+				{
+					int32 TF = 0;
+					if ((*Ent)->TryGetNumberField(TEXT("timeFlags"), TF) && TF > 0) { TimeMaskA = (uint32)TF; }
+				}
+				if (!Mesh)
+				{
+					const FString Tag = Drawable.IsEmpty() ? (*Ent)->GetStringField(TEXT("archetype")) : Drawable;
+					Missing.FindOrAdd(Tag)++;
+				}
+				if (Mesh || ProxyCube)
+				{
+					if (RudeSpawnEntityActor(World, YmapName, *Ent, Xf, Mesh ? Mesh : ProxyCube, Mesh == nullptr, TimeMaskA))
+					{
+						++NumActors;
+						if (Mesh) { ++NumInstances; } else { ++NumProxies; }
+					}
+				}
+				continue;
 			}
 			if (Mesh)
 			{
@@ -6837,11 +7623,13 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		TEXT("{\"ok\":%s,\"ymaps\":%d,\"entitiesInManifest\":%d,\"entities\":%d,")
 		TEXT("\"filteredByLod\":%d,\"unknownLodLevel\":%d,\"emptyLodLevel\":%d,")
 		TEXT("\"malformedEntities\":%d,\"instances\":%d,\"proxies\":%d,")
-		TEXT("\"uniqueMeshes\":%d,\"uniqueMeshLookups\":%d,\"missingMeshes\":%d,\"topMissing\":[%s]}"),
+		TEXT("\"uniqueMeshes\":%d,\"uniqueMeshLookups\":%d,\"missingMeshes\":%d,\"topMissing\":[%s],")
+		TEXT("\"mode\":\"%s\",\"actors\":%d}"),
 		bOk ? TEXT("true") : TEXT("false"),
 		NumYmaps, EntitiesInManifest, NumEntities, FilteredByLod, UnknownLodLevel, EmptyLodLevel,
 		MalformedEntities, NumInstances, NumProxies,
-		UniqueMeshes, UniqueMeshLookups, Missing.Num(), *TopMissing);
+		UniqueMeshes, UniqueMeshLookups, Missing.Num(), *TopMissing,
+		bActors ? TEXT("ACTORS") : TEXT("ISM"), NumActors);
 }
 
 // ======================= RudeYdrBin - READING binary .ydr (RSC7 v165) =======================

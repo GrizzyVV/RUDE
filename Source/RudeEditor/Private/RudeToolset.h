@@ -190,9 +190,40 @@ public:
 	// typical manifest (measured, 1,500 resolved ymap / 239,662 entities) and used to do
 	// it with no counter. uniqueMeshes now counts meshes that LOADED - it used to report
 	// MeshCache.Num(), and the cache deliberately memoises nullptr for known-missing.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Re-place an area you already imported, into the level you have open. Reads the manifest that Build Map Area wrote, so it spawns the objects again WITHOUT re-importing any models."))
+	// Export the open level's RUDE entities back to ymap files, one per source ymap, as a FiveM
+	// resource (<OutDir>/stream/<ymap>.ymap + fxmanifest.lua; FiveM Legacy loads the XML form).
+	// An untouched entity goes out VERBATIM (its own XML from import); an edited one is rebuilt
+	// from its component + actor transform. Extents only grow. A ymap with LOD lineage refuses
+	// deletions (ordinals would shift). YmapFilter = comma list of ymap names (empty = every source
+	// ymap in the level); NewEntitiesYmap names the file for entities authored in UE (empty = they
+	// are counted and dropped).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save the placements in your open level back out as game map files, ready to stream in FiveM. Objects you did not touch go back exactly as they came in."))
+	static FString ExportLevelYmaps(const FString& OutDir, const FString& YmapFilter,
+	                                const FString& CorpusRoot, const FString& NewEntitiesYmap);
+
+	// Move one placed entity by a delta (UE cm) - the scriptable edit the export gate needs so the
+	// import -> edit -> export loop can run headless. Identity = source ymap + ordinal.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one placed object by x,y,z centimetres. Name it by the map file it came from and its number in that file.", RudeAudience="agent"))
+	static FString MoveRudeEntity(const FString& SourceYmap, const FString& SourceIndex, const FString& DeltaCm);
+
+	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
+	static FString ProbeWorldPartitionLevel(const FString& LevelPath);
+
+	// Shape round-trip of a ROUT XML through RUDE's own parser + writer: parse, re-spell, re-parse,
+	// compare element paths / attributes / leaf text. ListPath = a text file of XML paths (one per
+	// line) or a single XML path. Verdict: {ok, files, identical, differing, elements, attributes,
+	// mismatches:[...]} - ok is false when any file differs. The WP3 gate; it must be green before
+	// any exporter re-emits a carried subtree.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Check that RUDE can read a game XML file and write it back without losing or changing any element. Give one XML path or a list file.", RudeAudience="agent"))
+	static FString XmlShapeRoundTrip(const FString& ListPath, const FString& OutDir);
+
+	// Mode: empty = instanced display (one ISM per mesh per ymap, fast, not per-entity addressable);
+	// "ACTORS" = one actor per entity carrying a URudeEntityComponent with every CEntityDef field
+	// and its provenance - the editable, exportable scene. Verdict adds mode + actors.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Re-place an area you already imported, into the level you have open. Reads the manifest that Build Map Area wrote, so it spawns the objects again WITHOUT re-importing any models. Mode ACTORS places one editable actor per object instead of fast instanced batches."))
 	static FString ImportScene(const FString& ManifestPath, const FString& MeshFolder,
-	                           const FString& Filter);
+	                           const FString& Filter, const FString& Mode);
 
 	// Export a UStaticMesh as a ydr XML file (.ydr.xml) (the reverse
 	// lane). Positions/normals/UVs inverse-transformed per the RUDE convention;

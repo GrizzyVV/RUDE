@@ -33,6 +33,8 @@ public class RudeEditor : ModuleRules
 			"Json",
 			// The corpus index: every "where is this game file" question goes through it.
 			"RudeIntake",
+			// WP4: Data Layers from code (the ymap-as-layer projection).
+			"DataLayerEditor",
 			"RudeCore",
 		});
 	}

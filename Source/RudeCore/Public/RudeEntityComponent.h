@@ -43,6 +43,11 @@ public:
 	UPROPERTY(EditAnywhere, Category = "RUDE|Entity")
 	FString ArchetypeName;
 
+	// The item's type as the file spells it: CEntityDef (a prop) or CMloInstanceDef (a whole interior
+	// placed). Wave 1 rebuilds only CEntityDef on edit; an edited MLO instance exports as read.
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Entity")
+	FString ItemType = TEXT("CEntityDef");
+
 	// The ymap (asset name) this entity was read from; empty for an entity authored in UE.
 	UPROPERTY(VisibleAnywhere, Category = "RUDE|Source")
 	FString SourceYmap;
@@ -103,4 +108,27 @@ public:
 	// ---- carried --------------------------------------------------------------------------
 	UPROPERTY(VisibleAnywhere, AdvancedDisplay, Category = "RUDE|Carried")
 	TArray<FRudeCarriedField> Carried;
+
+	// ---- the byte-safe seam ---------------------------------------------------------------
+	// The entity's own <Item type="CEntityDef"> as the file spelled it, and the transform it was
+	// placed with. Export re-emits SourceXml VERBATIM while the actor still sits at
+	// SourceTransform with SourceFieldsKey unchanged - an untouched entity goes back out exactly
+	// as it came in; only an edited one is rebuilt from the fields above.
+	UPROPERTY(VisibleAnywhere, AdvancedDisplay, Category = "RUDE|Source")
+	FString SourceXml;
+
+	UPROPERTY(VisibleAnywhere, AdvancedDisplay, Category = "RUDE|Source")
+	FTransform SourceTransform;
+
+	UPROPERTY(VisibleAnywhere, AdvancedDisplay, Category = "RUDE|Source")
+	FString SourceFieldsKey;
+
+	// One string over every exportable field, so "did anything change" is one comparison.
+	FString FieldsKey() const
+	{
+		return FString::Printf(TEXT("%s|%g|%g|%s|%d|%s|%s|%u|%u|%d|%g|%g|%u"),
+			*ArchetypeName, LodDist, ChildLodDist, *LodLevel, ParentIndex, *PriorityLevel,
+			*ExtensionsXml, Flags, Guid, NumChildren, AmbientOcclusionMultiplier,
+			ArtificialAmbientOcclusion, TintValue);
+	}
 };
