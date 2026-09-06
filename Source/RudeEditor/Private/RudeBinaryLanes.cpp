@@ -260,10 +260,14 @@ namespace RudeYdrBin
 	}
 
 	// Verify a drawable we just built, in place, before it is compressed and written.
-	static FVerify VerifyDrawable(const TArray<uint8>& Sys)
+	// Base = the gtaDrawable's offset inside Sys (0 for a standalone .ydr; a dictionary ENTRY's record for a
+	// .ydd, WP11). SharedInDeg = an in-degree map shared across a dictionary's entries, so a block owned by
+	// two entries (the same non-idempotent-fixup crash) is caught; null = this drawable alone.
+	static FVerify VerifyDrawable(const TArray<uint8>& Sys, int32 Base = 0, TMap<int32, int32>* SharedInDeg = nullptr)
 	{
 		FVerify V;
-		TMap<int32, int32> InDeg;
+		TMap<int32, int32> LocalInDeg;
+		TMap<int32, int32>& InDeg = SharedInDeg ? *SharedInDeg : LocalInDeg;
 		auto P = [&Sys](int32 O) -> uint32 { uint32 X = 0; U32(Sys, O, X); return X; };
 		auto Deref = [&Sys](uint32 T, int32 Need, int32& O) -> bool
 		{
@@ -272,16 +276,16 @@ namespace RudeYdrBin
 			return O >= 0 && O + Need <= Sys.Num();
 		};
 
-		Own(InDeg, V, P(0x08), TEXT("hdr+0x08 blockmap"));
-		Own(InDeg, V, P(0x10), TEXT("hdr+0x10 ShaderGroup"));
-		Own(InDeg, V, P(0x50), TEXT("hdr+0x50 ModelsHigh"));
-		Own(InDeg, V, P(0xa8), TEXT("hdr+0xa8 name"));
-		Own(InDeg, V, P(0xc8), TEXT("hdr+0xc8 Bound"));
+		Own(InDeg, V, P(Base + 0x08), TEXT("hdr+0x08 blockmap"));
+		Own(InDeg, V, P(Base + 0x10), TEXT("hdr+0x10 ShaderGroup"));
+		Own(InDeg, V, P(Base + 0x50), TEXT("hdr+0x50 ModelsHigh"));
+		Own(InDeg, V, P(Base + 0xa8), TEXT("hdr+0xa8 name"));
+		Own(InDeg, V, P(Base + 0xc8), TEXT("hdr+0xc8 Bound"));
 		// hdr+0xa0 intentionally NOT counted - byte-identical alias of +0x50 in 3,479/3,479 real files.
 
 		// ShaderGroup -> shaders -> param tables -> texture stubs -> stub name strings
 		int32 SG = 0;
-		if (Deref(P(0x10), 0x40, SG))
+		if (Deref(P(Base + 0x10), 0x40, SG))
 		{
 			Own(InDeg, V, P(SG + 0x10), TEXT("SG+0x10 shaderArr"));
 			uint16 NSh = 0; U16(Sys, SG + 0x18, NSh);
@@ -313,7 +317,7 @@ namespace RudeYdrBin
 
 		// models -> grmModel -> geometries -> VB/IB/fvf/data
 		int32 MH = 0;
-		if (Deref(P(0x50), 0x10, MH))
+		if (Deref(P(Base + 0x50), 0x10, MH))
 		{
 			Own(InDeg, V, P(MH + 0x00), TEXT("modelsHdr ptrArr"));
 			uint16 NMod = 0; U16(Sys, MH + 0x08, NMod);
@@ -403,7 +407,7 @@ namespace RudeYdrBin
 		// while every export still printed "selfCheck: passed". The span also had to widen from
 		// 0x80 to 0xb0: the composite header this writer emits is 0xb0 bytes (:6364) and +0xa0
 		// must be inside the checked span or the read is unguarded.
-		if (Deref(P(0xc8), 0xb0, Comp))
+		if (Deref(P(Base + 0xc8), 0xb0, Comp))
 		{
 			Own(InDeg, V, P(Comp + 0x70), TEXT("composite children array"));
 			uint16 NCh = 0; U16(Sys, Comp + 0xa0, NCh);
@@ -2363,6 +2367,45 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 #else
 	return Fail(TEXT("editor-only"));
 #endif
+}
+
+// ======================= RudeBinaryShared bridge (WP11 skinned writer) =======================
+// The seams RudeSkinnedWriter.cpp needs from this file's file-local machinery: RSC7 load, the grcFvf decode,
+// the uniform-page plan and the single-ownership self-check. Thin forwards only - the laws stay HERE, in one
+// place (the repo's rule: lift, never duplicate the machinery that has already paid for its crashes).
+#include "RudeBinaryShared.h"
+bool RudeBinLoadRsc7(const FString& Path, TArray<uint8>& OutSys, TArray<uint8>& OutGfx, uint32& OutVersion, FString& OutError)
+{
+	RudeYdrBin::FRes R;
+	if (!RudeYdrBin::LoadFile(Path, R, OutError)) { return false; }
+	OutSys = MoveTemp(R.Sys); OutGfx = MoveTemp(R.Gfx); OutVersion = R.Version;
+	return true;
+}
+bool RudeBinBuildDecl(uint32 Mask, uint64 Nibbles, int32 DeclStride, int32 OutOfs[16], FString& OutError)
+{
+	RudeYdrBin::FDecl D;
+	if (!RudeYdrBin::BuildDecl(Mask, Nibbles, DeclStride, D, OutError)) { return false; }
+	for (int32 i = 0; i < 16; ++i) { OutOfs[i] = D.Ofs[i]; }
+	return true;
+}
+uint32 RudeBinSysPageFlagsUniform(uint32 RawSize, uint32 PageSize, uint32& OutPadded, uint32& OutPages)
+{
+	return RudeYbn::SysPageFlagsUniform(RawSize, PageSize, OutPadded, OutPages);
+}
+int32 RudeBinVerifyDrawable(const TArray<uint8>& Sys, int32 Base, TMap<int32, int32>& InDeg,
+                            int32& OutShared, int32& OutDeclBad, int32& OutBoundsBad, FString& OutFirstProblem)
+{
+	const RudeYdrBin::FVerify V = RudeYdrBin::VerifyDrawable(Sys, Base, &InDeg);
+	OutShared += V.SharedBlocks; OutDeclBad += V.DeclBad; OutBoundsBad += V.BoundsBad;
+	if (OutFirstProblem.IsEmpty()) { OutFirstProblem = V.FirstProblem; }
+	return V.SharedBlocks + V.DeclBad + V.BoundsBad;
+}
+void RudeBinOwn(TMap<int32, int32>& InDeg, uint32 Tagged, const FString& Label, int32& OutShared, FString& OutFirstProblem)
+{
+	RudeYdrBin::FVerify V;
+	RudeYdrBin::Own(InDeg, V, Tagged, Label);
+	OutShared += V.SharedBlocks;
+	if (OutFirstProblem.IsEmpty()) { OutFirstProblem = V.FirstProblem; }
 }
 
 // ======================= ProbeYdrBinary - verify the binary READ path =======================

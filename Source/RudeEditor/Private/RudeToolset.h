@@ -514,6 +514,40 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one parked-car spawn spot by x,y,z centimetres.", RudeAudience="agent"))
 	static FString MoveCarGenerator(const FString& YmapName, const FString& Index, const FString& DeltaCm);
 
+	// ---- WP11 skinned drawable dictionary (RudeSkinnedWriter.cpp) ----
+	// Write a BINARY .ydd (RSC7 v165 pgDictionary<gtaDrawable>) holding one SKINNED drawable per USkeletalMesh -
+	// the custom-clothing container a FiveM ped streams. Container (3/3 game binaries, ROUT 400/400): 0x40
+	// header {vft, blockmap*, 0, refcount 1, hashArr*, n|cap<<16, entryArr* (8B/entry), n|cap<<16}, hashes
+	// ASCENDING, one 0xD0 gtaDrawable record per entry (blockmap/skeleton/bound slots raw NULL). Per drawable:
+	// the ydr writer's structs with the skinned deltas measured on 2 peds / 56 geometries + 3 binaries:
+	// grmModel +0x28 = rig bone count, +0x29 = 1, +0x2D = 1; grmGeometry +0x68 -> identity u16 bone-id table,
+	// +0x72 = its count; GTAV1 layout mask 0x7F stride 48 (Pos f3 | BlendWeights u8x4 | BlendIndices u8x4 |
+	// Normal f3 | Colour0 | Colour1 | UV0 f2); BlendWeights are bytes summing to 255 (27,808/27,808 measured),
+	// BlendIndices = rig index (bone-id table identity); the `ped` 13-parameter shader template verbatim
+	// (DiffuseSampler/TextureSamplerDiffPal/VolumeSampler=givemechecker/BumpSampler/SpecSampler + 8 vec4s,
+	// registers 0,2,3,4,5 / 187..180; +0x14 = 336, +0x16 = 432, +0x24 = 5<<24). Materials: the Diffuse /
+	// Normal / Specular parameters of each slot's material instance (the ydr writer's path). Bone order: the
+	// mesh's USkeleton reference skeleton (Options "SKELETON=<path>" overrides) - ImportPed builds it in yft
+	// order; mesh bones map by NAME; an influence on an unmapped bone is dropped and counted, a vertex left with
+	// no weight is bound to bone 0 and counted, a 5th+ influence is truncated and counted. High LOD only.
+	// Self-check before writing: single ownership across the whole dictionary + geoBounds/count + declarations.
+	// SkeletalMeshAssetPaths / DrawableNames = comma lists (name default = the asset name; the entry hash is
+	// joaat(name), e.g. "uppr_000_u"). Returns JSON {ok, yddPath, drawables:[{name, hash, geometries, vertices,
+	// triangles, bonesReferenced, influencesUnmapped, influencesTruncated, verticesRebound, uv1Dropped,
+	// texturesMissing, textures}], rigBones, rig, bytes, segSize, pages, sysFlags, selfCheck}.
+	// Laws + denominators: scratchpad/wp11/ydd_writer/LAWS.md. In-game load: NOT yet verified (Matt's test).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save clothing pieces (skinned meshes on a ped skeleton) as a finished GTA V clothing file the game loads directly."))
+	static FString ExportYddBinary(const FString& SkeletalMeshAssetPaths, const FString& DrawableNames,
+	                               const FString& OutYddPath, const FString& Options);
+
+	// Parse a BINARY .ydd and report it as JSON: entries (name, hash, ascending), per entry shaders / models /
+	// geometries / vertices / triangles / declarations, skin facts (vertices whose 4 weight bytes sum to 255,
+	// max blend index, indices inside the bone-id table, bone-id table size and identity), skeleton / bound
+	// presence, and the single-ownership audit (advisory on game files - an embedded texdict may share).
+	// Reads untrusted files: every access bounds-checked; malformed input returns ok:false.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Inspect a GTA V clothing file and report its internals as raw JSON, without importing.", RudeAudience="agent"))
+	static FString ProbeYddBinary(const FString& BinPath);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);
