@@ -312,6 +312,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Rebuild the far-away lights (the dots you see at night from a distance) from every light on the placed objects.", RudeAudience="agent"))
 	static FString RebakeLodLights(const FString& OutDir, const FString& Name, const FString& YmapFilter);
 
+	// Edit one light of an entity (intensity, colour r,g,b, falloff, falloffExponent, coneInner, coneOuter,
+	// position x,y,z in RAGE metres); the export writes it into the entity's light extension.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Change one light on a placed object (brightness, colour, reach, cone or position).", RudeAudience="agent"))
+	static FString SetLightField(const FString& ActorLabel, const FString& LightIndex, const FString& Field, const FString& Value);
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);

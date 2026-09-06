@@ -1471,7 +1471,7 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 				Qw = FCString::Atod(*Rot->GetAttribute(TEXT("w")));
 			}
 			FQuat Q(Qx, -Qy, Qz, Qw);
-			Q.Normalize();
+			// not normalised: the source quaternion is unit within float32 and re-normalising in double moves its last digit (measured 2026-09-06: 0.9961947 -> 0.996194661 on an untouched entity)
 			Ent.Xf = FTransform(Q, FVector(Px * 100.0, -Py * 100.0, Pz * 100.0),
 				FVector(Val(E, TEXT("scaleXY"), 1.0), Val(E, TEXT("scaleXY"), 1.0), Val(E, TEXT("scaleZ"), 1.0)));
 
@@ -3040,6 +3040,7 @@ AActor* RudeSpawnEntityActor(UWorld* World, const FString& YmapName, const TShar
 	R->SourceFieldsKey = R->FieldsKey();
 	R->RegisterComponent();
 	A->AddInstanceComponent(R);
+	RudeAttachEntityLights(A, R);   // its light extensions as UE lights (RUDE_LIGHT:<i> components)
 	A->SetActorLabel(R->ArchetypeName.IsEmpty() ? YmapName : R->ArchetypeName);
 	A->SetFolderPath(FName(*(TEXT("RUDE_LS/") + YmapName)));
 	return A;
@@ -3194,7 +3195,7 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 			const double SXY = (*Ent)->HasField(TEXT("scaleXY")) ? (*Ent)->GetNumberField(TEXT("scaleXY")) : 1.0;
 			const double SZ = (*Ent)->HasField(TEXT("scaleZ")) ? (*Ent)->GetNumberField(TEXT("scaleZ")) : 1.0;
 			FQuat Q((*Quat)[0]->AsNumber(), (*Quat)[1]->AsNumber(), (*Quat)[2]->AsNumber(), (*Quat)[3]->AsNumber());
-			Q.Normalize();
+			// not normalised: the source quaternion is unit within float32 and re-normalising in double moves its last digit (measured 2026-09-06: 0.9961947 -> 0.996194661 on an untouched entity)
 			const FTransform Xf(Q,
 				FVector((*Loc)[0]->AsNumber(), (*Loc)[1]->AsNumber(), (*Loc)[2]->AsNumber()),
 				FVector(SXY, SXY, SZ));

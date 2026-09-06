@@ -62,3 +62,12 @@ uint32 RudeJoaat(const FString& Name);
 // (bLodPartial, tagged RUDE_LOD_PARTIAL).
 void RudeResolveLodLineage(UWorld* World, const TMap<FString, FString>& YmapParent,
                            int32& OutLinks, int32& OutUnresolved, int32& OutPartial);
+
+// ---- entity lights (RudeLevelTools.cpp) ----
+// Every CLightAttrDef instance in the entity's carried <extensions> becomes a UE light component on the
+// actor (tags RUDE_LIGHT:<index>, RUDE_LIGHT_KEY:<hash of the fields it mirrors>). Returns the count.
+int32 RudeAttachEntityLights(AActor* Actor, class URudeEntityComponent* R);
+// Before export keying: any light component whose mirrored fields changed rewrites its instance inside
+// R->ExtensionsXml (position, colour, intensity, falloff, exponent, cone angles, direction) so the
+// entity keys as edited and only those fields move. Returns the number of instances rewritten.
+int32 RudeSyncEntityLights(AActor* Actor, class URudeEntityComponent* R);

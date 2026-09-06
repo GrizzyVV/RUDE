@@ -82,6 +82,8 @@
 #include "Serialization/JsonSerializer.h"
 #include "RudeToolsetInternal.h"
 #include "MeshReductionSettings.h"
+#include "Components/PointLightComponent.h"
+#include "Components/SpotLightComponent.h"
 #include "IMeshReductionManagerModule.h"
 #include "IMeshMergeUtilities.h"
 #include "MeshMergeModule.h"
@@ -169,6 +171,217 @@ void RudeResolveLodLineage(UWorld* World, const TMap<FString, FString>& YmapPare
 			++OutPartial;
 		}
 	}
+}
+
+
+// =========================== entity lights (Tier 1: lights on the owning actor) ===========================
+static FString RudeNum(double V);   // defined with the entity writer below
+namespace RudeLights
+{
+	struct FInst
+	{
+		FVector Posn = FVector::ZeroVector, Colour = FVector(255, 255, 255), Dir = FVector(0, 0, -1), Off = FVector::ZeroVector;
+		double Intensity = 0, Falloff = 0, FalloffExp = 0, ConeIn = 0, ConeOut = 0;
+		int32 Type = 2;
+		FXmlNode* Node = nullptr;
+	};
+	static bool Vec(const FXmlNode* N, const TCHAR* Tag, FVector& Out)
+	{
+		const FXmlNode* C = N ? N->FindChildNode(Tag) : nullptr;
+		if (!C) { return false; }
+		TArray<FString> T; C->GetContent().ParseIntoArrayWS(T);
+		if (T.Num() < 3) { return false; }
+		Out = FVector(FCString::Atod(*T[0]), FCString::Atod(*T[1]), FCString::Atod(*T[2]));
+		return true;
+	}
+	static double Num(const FXmlNode* N, const TCHAR* Tag, double Def)
+	{
+		const FXmlNode* C = N ? N->FindChildNode(Tag) : nullptr;
+		return C ? FCString::Atod(*C->GetAttribute(TEXT("value"))) : Def;
+	}
+	// every instance of every CExtensionDefLightEffect, in document order (index = light index)
+	static void Parse(FXmlNode* Root, TArray<FInst>& Out)
+	{
+		FXmlNode* Ext = Root->FindChildNode(TEXT("extensions"));
+		if (!Ext) { Ext = Root; }
+		for (FXmlNode* Item : Ext->GetChildrenNodes())
+		{
+			if (Item->GetAttribute(TEXT("type")) != TEXT("CExtensionDefLightEffect")) { continue; }
+			FVector Off = FVector::ZeroVector;
+			if (const FXmlNode* O = Item->FindChildNode(TEXT("offsetPosition")))
+			{
+				Off = FVector(FCString::Atod(*O->GetAttribute(TEXT("x"))), FCString::Atod(*O->GetAttribute(TEXT("y"))), FCString::Atod(*O->GetAttribute(TEXT("z"))));
+			}
+			FXmlNode* Inst = Item->FindChildNode(TEXT("instances"));
+			if (!Inst) { continue; }
+			for (FXmlNode* L : Inst->GetChildrenNodes())
+			{
+				FInst I;
+				I.Node = L; I.Off = Off;
+				Vec(L, TEXT("posn"), I.Posn); Vec(L, TEXT("colour"), I.Colour); Vec(L, TEXT("direction"), I.Dir);
+				I.Intensity = Num(L, TEXT("intensity"), 0); I.Falloff = Num(L, TEXT("falloff"), 0); I.FalloffExp = Num(L, TEXT("falloffExponent"), 0);
+				I.ConeIn = Num(L, TEXT("coneInnerAngle"), 0); I.ConeOut = Num(L, TEXT("coneOuterAngle"), 0); I.Type = (int32)Num(L, TEXT("lightType"), 2);
+				Out.Add(I);
+			}
+		}
+	}
+	// the fields a component mirrors, hashed the same way from either side
+	static uint32 Key(const FVector& LocalCm, const FLinearColor& C, double IntensityCd, double RadiusCm, double Exp, double In, double Out, const FRotator& Rot)
+	{
+		const FString S = FString::Printf(TEXT("%.1f,%.1f,%.1f|%.3f,%.3f,%.3f|%.2f|%.1f|%.2f|%.2f|%.2f|%.2f,%.2f,%.2f"),
+			LocalCm.X, LocalCm.Y, LocalCm.Z, C.R, C.G, C.B, IntensityCd, RadiusCm, Exp, In, Out, Rot.Pitch, Rot.Yaw, Rot.Roll);
+		return FCrc::StrCrc32(*S);
+	}
+	static FString Tag(const FName& N, const TCHAR* Prefix) { const FString S = N.ToString(); return S.StartsWith(Prefix) ? S.Mid(FCString::Strlen(Prefix)) : FString(); }
+	static uint32 KeyOf(const ULightComponent* LC)
+	{
+		double Exp = 0, In = 0, Out = 0;
+		if (const UPointLightComponent* P = Cast<UPointLightComponent>(LC)) { Exp = P->LightFalloffExponent; }
+		if (const USpotLightComponent* Sp = Cast<USpotLightComponent>(LC)) { In = Sp->InnerConeAngle; Out = Sp->OuterConeAngle; }
+		const UPointLightComponent* PL = Cast<UPointLightComponent>(LC);
+		return Key(LC->GetRelativeLocation(), LC->GetLightColor(), LC->Intensity, PL ? PL->AttenuationRadius : 0.0, Exp, In, Out, LC->GetRelativeRotation());
+	}
+}
+
+int32 RudeAttachEntityLights(AActor* Actor, URudeEntityComponent* R)
+{
+	if (!Actor || !R || !R->ExtensionsXml.Contains(TEXT("CExtensionDefLightEffect"))) { return 0; }
+	FXmlFile Doc(TEXT("<root>") + R->ExtensionsXml + TEXT("</root>"), EConstructMethod::ConstructFromBuffer);
+	if (!Doc.IsValid() || !Doc.GetRootNode()) { return 0; }
+	TArray<RudeLights::FInst> Insts;
+	RudeLights::Parse(Doc.GetRootNode(), Insts);
+	USceneComponent* RootC = Actor->GetRootComponent();
+	int32 N = 0;
+	for (int32 i = 0; i < Insts.Num(); ++i)
+	{
+		const RudeLights::FInst& I = Insts[i];
+		const FVector L = I.Posn + I.Off;
+		const FVector LocalCm(L.X * 100.0, -L.Y * 100.0, L.Z * 100.0);
+		const FVector DirUe = FVector(I.Dir.X, -I.Dir.Y, I.Dir.Z).GetSafeNormal();
+		UPointLightComponent* LC = nullptr;
+		if (I.Type == 2)
+		{
+			USpotLightComponent* Sp = NewObject<USpotLightComponent>(Actor, *FString::Printf(TEXT("RudeLight%d"), i));
+			Sp->InnerConeAngle = (float)FMath::Clamp(I.ConeIn, 0.0, 89.0);
+			Sp->OuterConeAngle = (float)FMath::Clamp(I.ConeOut, 1.0, 89.0);
+			LC = Sp;
+		}
+		else
+		{
+			LC = NewObject<UPointLightComponent>(Actor, *FString::Printf(TEXT("RudeLight%d"), i));
+			if (I.Type == 4) { LC->SourceLength = 50.f; }   // capsule: a rough length
+		}
+		LC->SetMobility(EComponentMobility::Static);
+		LC->SetIntensityUnits(ELightUnits::Candelas);
+		LC->Intensity = (float)(I.Intensity * 100.0);   // RAGE intensity -> candelas, a rough factor
+		LC->SetLightColor(FLinearColor(I.Colour.X / 255.f, I.Colour.Y / 255.f, I.Colour.Z / 255.f));
+		LC->AttenuationRadius = (float)FMath::Max(I.Falloff * 100.0, 10.0);
+		LC->bUseInverseSquaredFalloff = false;
+		LC->LightFalloffExponent = (float)FMath::Clamp(I.FalloffExp, 2.0, 16.0);
+		LC->CastShadows = false;
+		LC->SetupAttachment(RootC);
+		LC->SetRelativeLocation(LocalCm);
+		LC->SetRelativeRotation(FRotationMatrix::MakeFromX(DirUe.IsNearlyZero() ? FVector(0, 0, -1) : DirUe).Rotator());
+		LC->ComponentTags.Add(FName(*FString::Printf(TEXT("RUDE_LIGHT:%d"), i)));
+		LC->ComponentTags.Add(FName(*FString::Printf(TEXT("RUDE_LIGHT_KEY:%u"), RudeLights::KeyOf(LC))));
+		LC->RegisterComponent();
+		Actor->AddInstanceComponent(LC);
+		++N;
+	}
+	return N;
+}
+
+int32 RudeSyncEntityLights(AActor* Actor, URudeEntityComponent* R)
+{
+	if (!Actor || !R || !R->ExtensionsXml.Contains(TEXT("CExtensionDefLightEffect"))) { return 0; }
+	TArray<UPointLightComponent*> Comps;
+	Actor->GetComponents<UPointLightComponent>(Comps);
+	TMap<int32, UPointLightComponent*> ByIndex;
+	bool bAnyChanged = false;
+	for (UPointLightComponent* LC : Comps)
+	{
+		int32 Idx = -1; uint32 Stored = 0; bool bHas = false;
+		for (const FName& T : LC->ComponentTags)
+		{
+			const FString A = RudeLights::Tag(T, TEXT("RUDE_LIGHT:")); if (!A.IsEmpty()) { Idx = FCString::Atoi(*A); }
+			const FString K = RudeLights::Tag(T, TEXT("RUDE_LIGHT_KEY:")); if (!K.IsEmpty()) { Stored = (uint32)FCString::Strtoui64(*K, nullptr, 10); bHas = true; }
+		}
+		if (Idx < 0) { continue; }
+		ByIndex.Add(Idx, LC);
+		if (!bHas || RudeLights::KeyOf(LC) != Stored) { bAnyChanged = true; }
+	}
+	if (!bAnyChanged) { return 0; }
+	FXmlFile Doc(TEXT("<root>") + R->ExtensionsXml + TEXT("</root>"), EConstructMethod::ConstructFromBuffer);
+	if (!Doc.IsValid() || !Doc.GetRootNode()) { return 0; }
+	TArray<RudeLights::FInst> Insts;
+	RudeLights::Parse(Doc.GetRootNode(), Insts);
+	int32 Rewritten = 0;
+	auto SetVal = [](FXmlNode* N, const TCHAR* Tag, const FString& V)
+	{
+		FXmlNode* C = N->FindChildNode(Tag);
+		if (!C) { return; }
+		TArray<FXmlAttribute> A = C->GetAttributes();
+		bool bSet = false;
+		for (FXmlAttribute& At : A) { if (At.GetTag() == TEXT("value")) { At = FXmlAttribute(TEXT("value"), V); bSet = true; } }
+		if (!bSet) { A.Add(FXmlAttribute(TEXT("value"), V)); }
+		C->SetAttributes(A);
+	};
+	for (int32 i = 0; i < Insts.Num(); ++i)
+	{
+		UPointLightComponent** Found = ByIndex.Find(i);
+		if (!Found) { continue; }
+		UPointLightComponent* LC = *Found;
+		uint32 Stored = 0; bool bHas = false;
+		for (const FName& T : LC->ComponentTags) { const FString K = RudeLights::Tag(T, TEXT("RUDE_LIGHT_KEY:")); if (!K.IsEmpty()) { Stored = (uint32)FCString::Strtoui64(*K, nullptr, 10); bHas = true; } }
+		if (bHas && RudeLights::KeyOf(LC) == Stored) { continue; }
+		RudeLights::FInst& I = Insts[i];
+		// Only a field whose component value differs from the SOURCE's own mapping is rewritten: UE holds
+		// some values approximately (a 90 deg cone clamps to 89, exponents clamp to 2..16), and an untouched
+		// field must keep the game's spelling (measured 2026-09-06: coneOuterAngle 90 -> 89 on an intensity edit).
+		const FVector SrcL = I.Posn + I.Off;
+		const FVector SrcLocalCm(SrcL.X * 100.0, -SrcL.Y * 100.0, SrcL.Z * 100.0);
+		const FVector Rel = LC->GetRelativeLocation();
+		if (!Rel.Equals(SrcLocalCm, 0.05))
+		{
+			const FVector LocalRage(Rel.X / 100.0, -Rel.Y / 100.0, Rel.Z / 100.0);
+			const FVector Posn = LocalRage - I.Off;
+			I.Node->FindChildNode(TEXT("posn"))->SetContent(FString::Printf(TEXT("%s %s %s"), *RudeNum(Posn.X), *RudeNum(Posn.Y), *RudeNum(Posn.Z)));
+		}
+		const FLinearColor C = LC->GetLightColor();
+		const int32 Cr = FMath::RoundToInt(C.R * 255.f), Cg = FMath::RoundToInt(C.G * 255.f), Cb = FMath::RoundToInt(C.B * 255.f);
+		if (Cr != (int32)I.Colour.X || Cg != (int32)I.Colour.Y || Cb != (int32)I.Colour.Z)
+		{
+			if (FXmlNode* Cn = I.Node->FindChildNode(TEXT("colour"))) { Cn->SetContent(FString::Printf(TEXT("%d %d %d"), Cr, Cg, Cb)); }
+		}
+		if (!FMath::IsNearlyEqual(LC->Intensity / 100.0, I.Intensity, 1e-3)) { SetVal(I.Node, TEXT("intensity"), RudeNum(LC->Intensity / 100.0)); }
+		if (!FMath::IsNearlyEqual(LC->AttenuationRadius / 100.0, FMath::Max(I.Falloff, 0.1), 1e-3)) { SetVal(I.Node, TEXT("falloff"), RudeNum(LC->AttenuationRadius / 100.0)); }
+		if (!FMath::IsNearlyEqual((double)LC->LightFalloffExponent, FMath::Clamp(I.FalloffExp, 2.0, 16.0), 1e-3)) { SetVal(I.Node, TEXT("falloffExponent"), RudeNum(LC->LightFalloffExponent)); }
+		if (const USpotLightComponent* Sp = Cast<USpotLightComponent>(LC))
+		{
+			if (!FMath::IsNearlyEqual((double)Sp->InnerConeAngle, FMath::Clamp(I.ConeIn, 0.0, 89.0), 1e-3)) { SetVal(I.Node, TEXT("coneInnerAngle"), RudeNum(Sp->InnerConeAngle)); }
+			if (!FMath::IsNearlyEqual((double)Sp->OuterConeAngle, FMath::Clamp(I.ConeOut, 1.0, 89.0), 1e-3)) { SetVal(I.Node, TEXT("coneOuterAngle"), RudeNum(Sp->OuterConeAngle)); }
+		}
+		const FVector SrcDirUe = FVector(I.Dir.X, -I.Dir.Y, I.Dir.Z).GetSafeNormal();
+		const FVector Fwd = LC->GetRelativeRotation().Vector();
+		if (!Fwd.Equals(SrcDirUe.IsNearlyZero() ? FVector(0, 0, -1) : SrcDirUe, 1e-3))
+		{
+			if (FXmlNode* Dn = I.Node->FindChildNode(TEXT("direction"))) { Dn->SetContent(FString::Printf(TEXT("%s %s %s"), *RudeNum(Fwd.X), *RudeNum(-Fwd.Y), *RudeNum(Fwd.Z))); }
+		}
+		// the key now matches the written values
+		TArray<FName> Tags;
+		for (const FName& T : LC->ComponentTags) { if (!T.ToString().StartsWith(TEXT("RUDE_LIGHT_KEY:"))) { Tags.Add(T); } }
+		Tags.Add(FName(*FString::Printf(TEXT("RUDE_LIGHT_KEY:%u"), RudeLights::KeyOf(LC))));
+		LC->ComponentTags = Tags;
+		++Rewritten;
+	}
+	if (Rewritten > 0)
+	{
+		FString O;
+		FXmlNode* Ext = Doc.GetRootNode()->FindChildNode(TEXT("extensions"));
+		RudeXmlNodeToString(Ext ? Ext : Doc.GetRootNode(), O, 0);
+		R->ExtensionsXml = O;
+	}
+	return Rewritten;
 }
 
 // What the links say the derived fields should be. Ordinal: component -> its ordinal in the file the
@@ -261,8 +474,23 @@ static FString RudeEntityDefXml(const URudeEntityComponent* R, const FTransform&
 	O += TEXT("   <archetypeName>"); RudeXmlEscapeInto(O, R->ArchetypeName); O += TEXT("</archetypeName>\n");
 	O += FString::Printf(TEXT("   <flags value=\"%u\" />\n"), R->Flags);
 	O += FString::Printf(TEXT("   <guid value=\"%u\" />\n"), R->Guid);
-	O += FString::Printf(TEXT("   <position x=\"%s\" y=\"%s\" z=\"%s\" />\n"), *RudeNum(P.X / 100.0), *RudeNum(-P.Y / 100.0), *RudeNum(P.Z / 100.0));
-	O += FString::Printf(TEXT("   <rotation x=\"%s\" y=\"%s\" z=\"%s\" w=\"%s\" />\n"), *RudeNum(Q.X), *RudeNum(-Q.Y), *RudeNum(Q.Z), *RudeNum(Q.W));
+	// An UNMOVED entity keeps the game's own position/rotation lines verbatim: the rotation is stored
+	// inverted, and inverting a float32 quaternion in double and back does not land on the same float
+	// (measured 2026-09-06: w 0.9961947 -> 0.996194661 on a light-only edit).
+	auto SourceLine = [&](const TCHAR* Tag) -> FString
+	{
+		if (R->SourceXml.IsEmpty() || !Xf.Equals(R->SourceTransform, 1e-3f)) { return FString(); }
+		const FString Open = FString::Printf(TEXT("<%s "), Tag);
+		const int32 A = R->SourceXml.Find(Open);
+		if (A == INDEX_NONE) { return FString(); }
+		const int32 B = R->SourceXml.Find(TEXT("/>"), ESearchCase::CaseSensitive, ESearchDir::FromStart, A);
+		return B == INDEX_NONE ? FString() : R->SourceXml.Mid(A, B + 2 - A);
+	};
+	const FString SrcPos = SourceLine(TEXT("position")), SrcRot = SourceLine(TEXT("rotation"));
+	if (!SrcPos.IsEmpty()) { O += TEXT("   ") + SrcPos + TEXT("\n"); }
+	else { O += FString::Printf(TEXT("   <position x=\"%s\" y=\"%s\" z=\"%s\" />\n"), *RudeNum(P.X / 100.0), *RudeNum(-P.Y / 100.0), *RudeNum(P.Z / 100.0)); }
+	if (!SrcRot.IsEmpty()) { O += TEXT("   ") + SrcRot + TEXT("\n"); }
+	else { O += FString::Printf(TEXT("   <rotation x=\"%s\" y=\"%s\" z=\"%s\" w=\"%s\" />\n"), *RudeNum(Q.X), *RudeNum(-Q.Y), *RudeNum(Q.Z), *RudeNum(Q.W)); }
 	O += FString::Printf(TEXT("   <scaleXY value=\"%s\" />\n"), *RudeNum(S.X));
 	O += FString::Printf(TEXT("   <scaleZ value=\"%s\" />\n"), *RudeNum(S.Z));
 	O += FString::Printf(TEXT("   <parentIndex value=\"%d\" />\n"), R->ParentIndex);
@@ -334,6 +562,10 @@ FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& Yma
 		FRudeExportEntity E;
 		E.R = R;
 		E.Xf = It->GetActorTransform();
+		// An UNMOVED entity spells its transform from the transform it was spawned with: the actor's
+		// rotation lives in UE as Euler angles and comes back with its last digit moved (measured
+		// 2026-09-06: w 0.9961947 -> 0.996194661 on a light-only edit). Moved = the actor's transform.
+		if (R->SourceIndex >= 0 && E.Xf.Equals(R->SourceTransform, 1e-3f)) { E.Xf = R->SourceTransform; }
 		Groups.FindOrAdd(Ymap).Add(E);
 	}
 	if (Groups.Num() == 0) { return Fail(FString::Printf(TEXT("no RUDE entities to export (%d components seen)"), Seen)); }
@@ -343,6 +575,12 @@ FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& Yma
 	// keys identical (verbatim bytes) and a re-parent rebuilds exactly the entities whose fields moved.
 	// lodDist / childLodDist are never touched (law 26). Ordinals: source entities keep theirs (deletions
 	// in lineage files are refused below); added entities are appended in the export's own order.
+	// ---- 1a) lights edited in UE -> their instance inside the carried <extensions> (only those fields move)
+	int32 LightsRewritten = 0;
+	for (auto& KV : Groups)
+	{
+		for (FRudeExportEntity& E : KV.Value) { LightsRewritten += RudeSyncEntityLights(E.R->GetOwner(), E.R); }
+	}
 	int32 LineageDerived = 0;
 	TMap<FString, FString> LineageBad;   // ymap -> why the whole file is refused
 	{
@@ -609,9 +847,9 @@ FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& Yma
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"componentsSeen\":%d,\"unsourced\":%d,\"unsourcedDropped\":%d,")
 		TEXT("\"ymapsWritten\":%d,\"ymapsRefused\":%d,\"kept\":%d,\"edited\":%d,\"added\":%d,\"removed\":%d,")
-		TEXT("\"editsNotRebuilt\":%d,\"extentsGrown\":%d,\"lineageDerived\":%d,\"files\":[%s],\"refused\":[%s]}"),
+		TEXT("\"editsNotRebuilt\":%d,\"extentsGrown\":%d,\"lineageDerived\":%d,\"lightsRewritten\":%d,\"files\":[%s],\"refused\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"), Seen, Unsourced, UnsourcedDropped,
-		YmapsWritten, YmapsRefused, Kept, Edited, Added, Removed, EditsNotRebuilt, ExtentsGrown, LineageDerived, *Files, *Refused);
+		YmapsWritten, YmapsRefused, Kept, Edited, Added, Removed, EditsNotRebuilt, ExtentsGrown, LineageDerived, LightsRewritten, *Files, *Refused);
 }
 
 // ---- MoveRudeEntity (agent; the scriptable edit for the export gate) ----------------------
@@ -916,7 +1154,7 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 			const double SXY = (*Ent)->HasField(TEXT("scaleXY")) ? (*Ent)->GetNumberField(TEXT("scaleXY")) : 1.0;
 			const double SZ = (*Ent)->HasField(TEXT("scaleZ")) ? (*Ent)->GetNumberField(TEXT("scaleZ")) : 1.0;
 			FQuat Q((*Quat)[0]->AsNumber(), (*Quat)[1]->AsNumber(), (*Quat)[2]->AsNumber(), (*Quat)[3]->AsNumber());
-			Q.Normalize();
+			// not normalised: the source quaternion is unit within float32 and re-normalising in double moves its last digit (measured 2026-09-06: 0.9961947 -> 0.996194661 on an untouched entity)
 			const FTransform Xf(Q, FVector((*Loc)[0]->AsNumber(), (*Loc)[1]->AsNumber(), (*Loc)[2]->AsNumber()), FVector(SXY, SXY, SZ));
 			FString Drawable;
 			(*Ent)->TryGetStringField(TEXT("drawable"), Drawable);
@@ -2382,6 +2620,44 @@ FString URudeToolset::RebakeLodLights(const FString& OutDir, const FString& Name
 		TEXT("\"extentsM\":[%s,%s],\"note\":\"packings per ENGINEERING_LOG law 32; hash = unique atDataHash(guid, index), formula unknown (law 33); corona 0\"}"),
 		Lights.Num(), EntitiesWithLights, Entities, Ymaps.Num(), Malformed, *RudeJsonEscape(DistPath), *RudeJsonEscape(LodPath),
 		*RudeJsonEscape(FString::Printf(TEXT("%.1f,%.1f,%.1f"), Mn.X, Mn.Y, Mn.Z)), *RudeJsonEscape(FString::Printf(TEXT("%.1f,%.1f,%.1f"), Mx.X, Mx.Y, Mx.Z)));
+}
+
+// ---- SetLightField (agent) ---------------------------------------------------------------
+// Edit one light of an entity from the CLI (Matt edits the component in Details). Field: intensity
+// (RAGE units), colour "r,g,b", falloff (m), falloffExponent, coneInner, coneOuter, position "x,y,z"
+// (RAGE metres, entity-local). The export writes the change into the entity's extension instance.
+FString URudeToolset::SetLightField(const FString& ActorLabel, const FString& LightIndex, const FString& Field, const FString& Value)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	AActor* A = RudeFindActorByLabel(World, ActorLabel);
+	if (!A) { return Fail(FString::Printf(TEXT("no actor labelled '%s'"), *ActorLabel)); }
+	const int32 Idx = FCString::Atoi(*LightIndex);
+	TArray<UPointLightComponent*> Comps;
+	A->GetComponents<UPointLightComponent>(Comps);
+	UPointLightComponent* LC = nullptr;
+	for (UPointLightComponent* C : Comps) { if (C->ComponentTags.Contains(FName(*FString::Printf(TEXT("RUDE_LIGHT:%d"), Idx)))) { LC = C; break; } }
+	if (!LC) { return Fail(FString::Printf(TEXT("the entity has no RUDE light %d (%d lights)"), Idx, Comps.Num())); }
+	const FString F = Field.TrimStartAndEnd().ToLower();
+	TArray<FString> P; Value.Replace(TEXT(";"), TEXT(",")).ParseIntoArray(P, TEXT(","), true);
+	A->Modify(); LC->Modify();
+	if (F == TEXT("intensity")) { LC->Intensity = (float)(FCString::Atod(*Value) * 100.0); }
+	else if (F == TEXT("colour") || F == TEXT("color")) { if (P.Num() != 3) { return Fail(TEXT("colour needs r,g,b")); } LC->SetLightColor(FLinearColor(FCString::Atof(*P[0]) / 255.f, FCString::Atof(*P[1]) / 255.f, FCString::Atof(*P[2]) / 255.f)); }
+	else if (F == TEXT("falloff")) { LC->AttenuationRadius = (float)(FCString::Atod(*Value) * 100.0); }
+	else if (F == TEXT("falloffexponent")) { LC->LightFalloffExponent = (float)FMath::Clamp(FCString::Atod(*Value), 2.0, 16.0); }
+	else if (F == TEXT("coneinner") || F == TEXT("coneouter"))
+	{
+		USpotLightComponent* Sp = Cast<USpotLightComponent>(LC);
+		if (!Sp) { return Fail(TEXT("that light is not a spot light")); }
+		if (F == TEXT("coneinner")) { Sp->InnerConeAngle = (float)FCString::Atod(*Value); } else { Sp->OuterConeAngle = (float)FCString::Atod(*Value); }
+	}
+	else if (F == TEXT("position")) { if (P.Num() != 3) { return Fail(TEXT("position needs x,y,z")); } LC->SetRelativeLocation(FVector(FCString::Atod(*P[0]) * 100.0, -FCString::Atod(*P[1]) * 100.0, FCString::Atod(*P[2]) * 100.0)); }
+	else { return Fail(TEXT("unknown field (intensity, colour, falloff, falloffExponent, coneInner, coneOuter, position)")); }
+	LC->MarkRenderStateDirty();
+	A->MarkPackageDirty();
+	return FString::Printf(TEXT("{\"ok\":true,\"actor\":\"%s\",\"light\":%d,\"field\":\"%s\",\"value\":\"%s\",\"intensityCd\":%g,\"attenuationCm\":%g}"),
+		*RudeJsonEscape(A->GetActorLabel()), Idx, *RudeJsonEscape(F), *RudeJsonEscape(Value), LC->Intensity, LC->AttenuationRadius);
 }
 
 // ---- PickAt (agent) -----------------------------------------------------------------------
