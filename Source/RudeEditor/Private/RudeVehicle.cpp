@@ -646,6 +646,39 @@ namespace RudeVehicle
 	// but ShaderGroup / Skeleton / Joints / DrawableModels* / Bounds), ShaderGroup, Models' items
 	// under <DrawableModelsHigh> (a base Medium/Low/VeryLow group is re-tagged High so the shared
 	// importer reads it), and optionally a <Bounds> subtree.
+	// The archetype composite for the body's collision, minus the child types ParseBound's catalogue
+	// does not carry. MEASURED IN-ENGINE 2026-09-06 (scratchpad/wp10/vehicles/cli_probe.log): blista's
+	// four wheel bounds are type="Disc", ParseBound refuses "unknownType:Disc", and its gate
+	// (collisionBoundsMalformed) turned the WHOLE body import ok:false while 16 Geometry + 1 Box had
+	// imported (378 collision triangles). A Disc is a wheel's cylinder - no faithful UE target, the
+	// same class as Cylinder (unmapped) - so it is left out of the graft and COUNTED in the verdict
+	// (boundsSkippedDisc); the wheel bounds still ride the DataAsset's child table (BoundType + box as
+	// spelled). Every composite child carries its own transform (ParseBound reads it per item), so
+	// dropping one cannot desync another. Any OTHER unseen type still reaches ParseBound and gates.
+	static void SpellBoundsFiltered(const FXmlNode* Bounds, FString& O)
+	{
+		O += TEXT(" <Bounds");
+		for (const FXmlAttribute& A : Bounds->GetAttributes())
+		{
+			O += TEXT(" "); O += A.GetTag(); O += TEXT("=\"");
+			RudeXmlEscapeInto(O, A.GetValue());
+			O += TEXT("\"");
+		}
+		O += TEXT(">\n");
+		for (const FXmlNode* C : Bounds->GetChildrenNodes())
+		{
+			if (C->GetTag() != TEXT("Children")) { RudeXmlNodeToString(C, O, 2); continue; }
+			O += TEXT("  <Children>\n");
+			for (const FXmlNode* Item : C->GetChildrenNodes())
+			{
+				if (Item->GetAttribute(TEXT("type")) == TEXT("Disc")) { continue; }
+				RudeXmlNodeToString(Item, O, 3);
+			}
+			O += TEXT("  </Children>\n");
+		}
+		O += TEXT(" </Bounds>\n");
+	}
+
 	static FString SpellDrawableBuffer(const FXmlNode* Header, const FXmlNode* ShaderGroup,
 		const FXmlNode* Models, const FXmlNode* Bounds)
 	{
@@ -665,7 +698,7 @@ namespace RudeVehicle
 		O += TEXT(" <DrawableModelsHigh>\n");
 		if (Models) { for (const FXmlNode* M : Models->GetChildrenNodes()) { RudeXmlNodeToString(M, O, 2); } }
 		O += TEXT(" </DrawableModelsHigh>\n");
-		if (Bounds) { RudeXmlNodeToString(Bounds, O, 1); }
+		if (Bounds) { SpellBoundsFiltered(Bounds, O); }
 		O += TEXT("</Drawable>\n");
 		return O;
 	}
@@ -686,9 +719,12 @@ namespace RudeVehicle
 				return nullptr;
 			}
 			OutVerdict = ImportDrawableNode(Doc.GetRootNode(), MeshName, DestFolder, nullptr);
-			// A mesh the importer BUILT is kept even when its verdict is not ok: this corpus carries no
-			// vehicle texture sidecars (LAWS.md 1), so every vehicle reports missing textures - a counted
-			// condition, not a mesh failure (measured 2026-09-06: blista's body, 24 geometries, refused).
+			// A mesh the importer BUILT (its verdict names an assetPath) is kept even when that verdict
+			// is not ok, so the composite finishes and REPORTS the gate instead of dying on it (rule
+			// added on the live tree by another session, 2026-09-06, kept here; the composite folds a
+			// not-ok body verdict into its own ok and missing[] - see bodyVerdictOk - so nothing is
+			// swallowed). Note for the record: missing textures never gate ImportDrawableNode's ok; the
+			// blista refusal that motivated the rule was the wheel Disc bounds, now filtered out.
 			const TSharedPtr<FJsonObject> Obj = ParseVerdict(OutVerdict);
 			FString Reported;
 			if (Obj.IsValid() && Obj->TryGetStringField(TEXT("assetPath"), Reported) && !Reported.IsEmpty())
@@ -1003,6 +1039,7 @@ FString URudeToolset::ImportVehicleComposite(const FString& CorpusRoot, const FS
 		if (HC) { for (const FXmlNode* It : HC->GetChildrenNodes()) { HiChildren.Add(It); } }
 	}
 	TMap<FString, int32> BoundTypeCounts;
+	int32 BoundsSkippedDisc = 0;
 	if (const FXmlNode* Ch = Lod1->FindChildNode(TEXT("Children")))
 	{
 		for (const FXmlNode* It : Ch->GetChildrenNodes())
@@ -1028,6 +1065,7 @@ FString URudeToolset::ImportVehicleComposite(const FString& CorpusRoot, const FS
 				const FXmlNode* B = BoundChildren[C.Index];
 				C.BoundType = B->GetAttribute(TEXT("type"));
 				++BoundTypeCounts.FindOrAdd(C.BoundType);
+				if (C.BoundType == TEXT("Disc")) { ++BoundsSkippedDisc; }   // left out of the collision graft (see SpellBoundsFiltered)
 				auto Spell = [&](const TCHAR* Tag) -> FString
 				{
 					const FXmlNode* V = B->FindChildNode(Tag);
@@ -1064,6 +1102,23 @@ FString URudeToolset::ImportVehicleComposite(const FString& CorpusRoot, const FS
 	}
 	const int32 BodyGeos = JsonInt(BodyVerdict, TEXT("geometries"), -1);
 	const int32 BodyMissingTex = JsonInt(BodyVerdict, TEXT("missingTextures"), -1);
+	// An existing package skips the import (empty verdict = nothing to judge); a fresh import that the
+	// drawable importer gated (slotsWithoutMaterial / collisionBoundsMalformed) is kept as built but
+	// NAMED here and folded into this verdict's ok - the gate stays visible.
+	const bool bBodyVerdictOk = BodyVerdict.IsEmpty() || BodyVerdict.Contains(TEXT("\"ok\":true"));
+	if (!bBodyVerdictOk)
+	{
+		FString Reasons;
+		const TSharedPtr<FJsonObject> BodyObj = ParseVerdict(BodyVerdict);
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (BodyObj.IsValid() && BodyObj->TryGetArrayField(TEXT("collisionReasons"), Arr))
+		{
+			for (const TSharedPtr<FJsonValue>& V : *Arr) { Reasons += (Reasons.IsEmpty() ? TEXT("") : TEXT(", ")) + V->AsString(); }
+		}
+		Missing.Add(FString::Printf(TEXT("body drawable verdict is ok:false (mesh kept as built): slotsWithoutMaterial %d, collisionBoundsMalformed %d%s%s"),
+			JsonInt(BodyVerdict, TEXT("slotsWithoutMaterial"), -1), JsonInt(BodyVerdict, TEXT("collisionBoundsMalformed"), -1),
+			Reasons.IsEmpty() ? TEXT("") : TEXT(" - "), *Reasons));
+	}
 	TArray<FString> LodSources, LodAssets;
 	LodSources.Add((HiDrawable ? Name + TEXT("_hi") : Name) + TEXT(":DrawableModelsHigh"));
 	int32 LodFailed = 0;
@@ -1330,6 +1385,9 @@ FString URudeToolset::ImportVehicleComposite(const FString& CorpusRoot, const FS
 	else if (LiverySampler == TEXT("BumpSampler")) { LiveryParam = TEXT("Normal"); }
 	else if (LiverySampler == TEXT("SpecSampler")) { LiveryParam = TEXT("Specular"); }
 	else if (LiverySampler == TEXT("DetailSampler")) { LiveryParam = TEXT("Detail"); }
+	// Added on the live tree by another session (2026-09-06, "the L masters"): a second diffuse for the
+	// vehicle_paint3-class liveries. Kept as authored; SetVehicleLivery still checks the slot's master
+	// actually exposes the parameter before writing it, so a master without Diffuse2 refuses by name.
 	else if (LiverySampler == TEXT("DiffuseSampler2")) { LiveryParam = TEXT("Diffuse2"); }   // the L masters (2026-09-06)
 
 	// ---- 7) the three metadata rows, joined the way the game joins them ----------------------------
@@ -1440,12 +1498,12 @@ FString URudeToolset::ImportVehicleComposite(const FString& CorpusRoot, const FS
 	}
 	const int32 MissingListCap = 20;
 	const bool bWheelsIntact = (WheelBones == 0) || (WheelsPlaced > 0);
-	const bool bOk = bWheelsIntact && ChildComponents == Children.Num() && LodFailed == 0;
+	const bool bOk = bBodyVerdictOk && bWheelsIntact && ChildComponents == Children.Num() && LodFailed == 0;
 	return FString::Printf(TEXT(
 		"{\"ok\":%s,\"vehicle\":\"%s\",\"actor\":\"%s\",\"asset\":\"%s\",\"bodyAsset\":\"%s\",\"bodyGeos\":%d,"
-		"\"bodyMissingTextures\":%d,\"hiFragment\":%s,\"lodCount\":%d,\"lodSources\":[%s],\"lodFailed\":%d,"
+		"\"bodyMissingTextures\":%d,\"bodyVerdictOk\":%s,\"hiFragment\":%s,\"lodCount\":%d,\"lodSources\":[%s],\"lodFailed\":%d,"
 		"\"bonesRead\":%d,\"wheelBones\":%d,\"wheelsPlaced\":%d,\"wheelsMirrored\":%d,"
-		"\"children\":%d,\"childrenWithGeometry\":%d,\"childComponents\":%d,\"boundChildren\":%d,\"boundTypes\":{%s},"
+		"\"children\":%d,\"childrenWithGeometry\":%d,\"childComponents\":%d,\"boundChildren\":%d,\"boundTypes\":{%s},\"boundsSkippedDisc\":%d,"
 		"\"liveries\":%d,\"liveryTextures\":[%s],\"liveryShaderIndex\":%d,\"liveryShader\":\"%s\",\"liverySampler\":\"%s\","
 		"\"liveryParameter\":\"%s\",\"liverySlots\":%d,\"hasLiveryFlag\":%s,"
 		"\"handlingId\":\"%s\",\"handlingFields\":%d,\"vehiclesMetaFields\":%d,\"carVariationsFields\":%d,"
@@ -1453,9 +1511,9 @@ FString URudeToolset::ImportVehicleComposite(const FString& CorpusRoot, const FS
 		"\"missingCount\":%d,\"missingTruncated\":%d,\"missing\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"),
 		*Name, *JsonEscape(Actor->GetActorLabel()), *JsonEscape(AssetPkgName), *JsonEscape(BodyAssetPath), BodyGeos,
-		BodyMissingTex, HiDrawable ? TEXT("true") : TEXT("false"), LodCount, *JsonStrings(LodSources), LodFailed,
+		BodyMissingTex, bBodyVerdictOk ? TEXT("true") : TEXT("false"), HiDrawable ? TEXT("true") : TEXT("false"), LodCount, *JsonStrings(LodSources), LodFailed,
 		Bones.Num(), WheelBones, WheelsPlaced, WheelsMirrored,
-		Children.Num(), ChildrenWithGeometry, ChildComponents, BoundChildren.Num(), *BoundJson,
+		Children.Num(), ChildrenWithGeometry, ChildComponents, BoundChildren.Num(), *BoundJson, BoundsSkippedDisc,
 		LiveryKeys.Num(), *JsonStrings(LiveryNames), LiveryShaderIndex, *JsonEscape(LiveryPreset), *JsonEscape(LiverySampler),
 		*JsonEscape(LiveryParam), LiverySlots.Num(), VA->bHasLiveryFlag ? TEXT("true") : TEXT("false"),
 		*JsonEscape(HandlingId), HandHit.Fields.Num(), VehHit.Fields.Num(), CarHit.Fields.Num(),

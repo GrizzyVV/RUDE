@@ -486,6 +486,20 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Change which paint-job (livery) an imported vehicle shows. Give the vehicle actor's name and the livery number."))
 	static FString SetVehicleLivery(const FString& ActorLabel, const FString& LiveryIndex);
 
+	// ---- THE SANDBOX (GDD 1b): PIE as the rehearsal space (RudeSandboxTools.cpp; runtime classes in RudeCore) ----
+	// Ready a level for Play: a PlayerStart tagged RUDE_SANDBOX_SPAWN at Location ("x,y,z" UE cm, ';' accepted,
+	// empty = origin; Z snaps to the ground under it), the level's GameMode override = RudeSandboxGameMode
+	// (DefaultPawn = the on-foot ARudeSandboxPawn), a RUDE_SKY rig if the level has none, then the level saved.
+	// Empty LevelPath = the open level. In PIE: `Rude.Native <native> [args]` drives the mocked FiveM natives.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Make a level playable: add a spawn point, set the sandbox game mode and save, so Play walks you around in it."))
+	static FString SandboxSetup(const FString& LevelPath, const FString& Location);
+
+	// The Lua that calls the REAL FiveM native the sandbox shim mocks ("every export ships its invocation").
+	// Kind = ipl | cutscene | entityset | scenario | clock (empty = list). Name = the ymap / the cut / "interior|set" /
+	// the group / "HH:MM". Verdict: native, shim (the Rude.Native line for PIE), lua (the snippet), note.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show the FiveM script lines that do in game what a sandbox command does in Play: load a map, run a cutscene, switch an interior set, enable a scenario group, set the clock."))
+	static FString EmitNativeSnippet(const FString& Kind, const FString& Name);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

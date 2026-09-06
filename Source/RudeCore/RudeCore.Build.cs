@@ -14,6 +14,10 @@ public class RudeCore : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
+			// THE SANDBOX (GDD 1b): raw-key input bindings (EKeys) and cutscene playback (ULevelSequencePlayer).
+			"InputCore",
+			"LevelSequence",
+			"MovieScene",
 		});
 	}
 }
