@@ -115,7 +115,7 @@ row below is missing, they cannot.
 | `RUDE-<version>-Source.zip` | **yes** | The universal route. Works on any 5.8 install, needs Visual Studio |
 | `RUDE-<version>-UE5.8-Win64-Binary.zip` | strongly recommended | The **only** route that works with no compiler. This is what makes RUDE installable by a mapper who has never opened Unreal |
 | `SHA256SUMS.txt` | recommended | Both zips, so a download can be checked |
-| ⛔ QUARRY, an extractor, key material, or a link that auto-downloads any of them | **never** | RUDE is Apache-2.0 and deliberately carries no archive or crypto code. Bundling or auto-fetching a tool that does imports that exposure straight into this plugin and destroys the reason the two are separate products. Naming a companion tool in prose is fine; shipping, vendoring, submoduling or auto-downloading it is not |
+| ⛔ ROUT or any other extractor, key material, or a link that auto-downloads any of them | **never** | RUDE is Apache-2.0 and deliberately carries no archive or crypto code. Bundling or auto-fetching a tool that does imports that exposure straight into this plugin and destroys the reason the two are separate products. Naming a companion tool in prose is fine; shipping, vendoring, submoduling or auto-downloading it is not |
 | ⛔ Any Rockstar-derived data — meshes, textures, XML exports, archive contents | **never** | Including "just one test asset" |
 
 ### Both zips must unpack to exactly one folder
@@ -186,7 +186,7 @@ common install failure and it is entirely preventable at packaging time — the 
 Source zip — this is just the repository at the tag, without build output:
 
 ```powershell
-pwsh -File Tools\Package-Release.ps1 -Version 0.2.0 -OutDir B:\RUDE_Release
+pwsh -File Tools\Package-Release.ps1 -Version 0.2.0 -OutDir <ReleaseDir>
 ```
 
 Binary zip — compile the plugin standalone against the target engine:
@@ -194,7 +194,7 @@ Binary zip — compile the plugin standalone against the target engine:
 ```
 "<EngineDir>\Engine\Build\BatchFiles\RunUAT.bat" BuildPlugin ^
     -Plugin="<abs>\Plugins\RUDE\RUDE.uplugin" ^
-    -Package="B:\RUDE_Release\RUDE" ^
+    -Package="<ReleaseDir>\RUDE" ^
     -TargetPlatforms=Win64 ^
     -StrictIncludes
 ```
@@ -218,10 +218,10 @@ Then zip the produced `RUDE` folder as `RUDE-<version>-UE5.8-Win64-Binary.zip`.
 git tag -a v0.2.0 -m "RUDE v0.2.0"
 git push origin v0.2.0
 gh release create v0.2.0 `
-    B:\RUDE_Release\RUDE-0.2.0-Source.zip `
-    B:\RUDE_Release\RUDE-0.2.0-UE5.8-Win64-Binary.zip `
-    B:\RUDE_Release\SHA256SUMS.txt `
-    --title "RUDE v0.2.0" --notes-file B:\RUDE_Release\release-notes.md
+    <ReleaseDir>\RUDE-0.2.0-Source.zip `
+    <ReleaseDir>\RUDE-0.2.0-UE5.8-Win64-Binary.zip `
+    <ReleaseDir>\SHA256SUMS.txt `
+    --title "RUDE v0.2.0" --notes-file <ReleaseDir>\release-notes.md
 ```
 
 - [ ] Download your own release into a scratch folder and install from it. Not the build

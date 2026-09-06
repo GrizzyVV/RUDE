@@ -8,7 +8,7 @@
 // carrying it (or a subclass of it) would be exported into a ymap. Its identity is
 // (interior archetype, entity set, ordinal), its file is a ytyp, and it has no LOD lineage at all
 // (measured 2026-09-06 over 67,440/67,440 MLO entities: parentIndex -1, numChildren 0,
-// lodLevel ORPHANHD - scratchpad/wp11/mlo_export/LAWS.md).
+// lodLevel ORPHANHD - maintainer lane `mlo_export` (`LAWS.md`)).
 //
 // The actor's transform IS the placement (MLO-local: the interior root sits at the world origin;
 // export reads the transform RELATIVE to the root, so a root moved as a whole changes nothing).

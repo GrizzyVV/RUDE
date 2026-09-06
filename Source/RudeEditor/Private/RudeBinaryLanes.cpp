@@ -84,7 +84,7 @@
 #include "RudeToolsetInternal.h"
 
 // ======================= RudeYdrBin - READING binary .ydr (RSC7 v165) =======================
-// The import side's keystone: RUDE could WRITE binary but only READ the XML form, so QUARRY's
+// The import side's keystone: RUDE could WRITE binary but only READ the XML form, so ROUT's
 // output (real game binaries) could not reach the importer at all. This parses the container and
 // the drawable graph into the SAME RudeYdr::FGeo intermediate the XML lane produces, so the proven
 // mesh builder is reused rather than duplicated (today's crash #6 was a duplication bug - do not
@@ -395,7 +395,7 @@ namespace RudeYdrBin
 		// FIXED 2026-08-03 - this gate had NEVER run on the embedded bound. NCh was read from
 		// Comp+0x78, which is the CurrentMatrices POINTER (this file writes it at :6375 as
 		// PPTR(Comp,0x78,OXf), aliased to +0x80); NumChildren is the u16 at Comp+0xa0 (written
-		// at :6378, and read there by quarry's oracle-validated reader, ydr2xml.py:1011). So the
+		// at :6378, and read there by ROUT's oracle-validated prototype reader). So the
 		// U16 read returned the low 16 bits of a tagged pointer - measured 49,440 / 56,720 /
 		// 65,472 / 60,464 / 14,192 / 5,136 across the 14 emitted .ydr, where the true count is 1
 		// in 14/14. The Deref bounds check below then failed in 13/14 files and the composite
@@ -471,8 +471,8 @@ namespace RudeYdrBin
 }
 
 // ======================= ExportYtdBinary - clean-room .ytd (RSC7 v13) =======================
-// Reverse-engineered from our own CW-roundtripped diff pair + verified byte-identical
-// (tools/write_ytd.py, docs/ENGINEERING_LOG "RSC7 binary container"). No CodeWalker code read.
+// Reverse-engineered from our own round-tripped diff pair (reference export vs re-export) + verified byte-identical
+// (tools/write_ytd.py, docs/ENGINEERING_LOG "RSC7 binary container"). Clean-room: no third-party exporter code read.
 // RSC7 header (16B: 'RSC7' | u32 version=13 | u32 sysFlags | u32 gfxFlags) + raw DEFLATE of
 // [ system-segment | graphics-pages ]. System = pgDictionary<grcTexture>; graphics = pixel pages.
 // Pointers are tagged fixups: 0x50000000|off -> system, 0x60000000|off -> graphics.
@@ -856,7 +856,7 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 	}
 	if (Gfx.Num() % GP) { Gfx.AddZeroed(GP - (Gfx.Num() % GP)); }
 
-	// ---- system segment: pgDictionary<grcTexture> at CW's observed offsets ----
+	// ---- system segment: pgDictionary<grcTexture> at the offsets observed in the reference exports ----
 	const int32 TEX_BASE = 0x450, TEX_SZ = 0x90;
 	// NAME_SLOT was a fixed 0x20. RAGE texture names routinely exceed 31 chars (~10% of the Cayo
 	// set), and the write loop below bounds only against the segment end - so a >=32-char name lost
@@ -975,8 +975,8 @@ FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString
 }
 
 // ======================= ExportYbnBinary - clean-room .ybn (RSC7 v43) =======================
-// UStaticMesh -> phBoundComposite[ phBoundGeometryBVH ], binary, no CodeWalker. P5 step 2.
-// Format reversed from our own CW diff pair; every struct is CONSTRUCTED from pinned field
+// UStaticMesh -> phBoundComposite[ phBoundGeometryBVH ], binary, clean-room. P5 step 2.
+// Format reversed from our own reference diff pair; every struct is CONSTRUCTED from pinned field
 // offsets (docs/ENGINEERING_LOG "ybn binary format") - no template bytes, so it generalizes.
 // Validated offline against the rock (2097v/4073t) + a synthetic cube: vertices round-trip
 // within quantum, polys in range, BVH covers every poly exactly once.
@@ -987,8 +987,8 @@ namespace RudeYbn
 	static const float CHILD_MARGIN = 0.005f;      // child+0x2c ; composite margin = 0
 	static const uint32 CHILD_FLAGS1 = 0x3e;       // composite ChildrenFlags1 (single child)
 	static const uint32 CHILD_FLAGS2 = 0x3e;       // composite ChildrenFlags2
-	// Second u32 of each 16-byte ChildrenFlags entry, copied from CW's known-good binary
-	// byte-for-byte (looks like don't-care/uninitialized in CW's writer; kept for parity).
+	// Second u32 of each 16-byte ChildrenFlags entry, copied from the known-good reference binary
+	// byte-for-byte (looks like don't-care/uninitialized in the reference writer; kept for parity).
 	static const uint32 CHILD_FLAGS_PAD = 0x07f3bec0;
 	static const int32 POLYS_PER_LEAF = 4;
 	// phOptimizedBvh m_Trees: maximal subtrees of <= this many nodes. Pinned from the real
@@ -1074,7 +1074,7 @@ namespace RudeYbn
 	// Page size must be >= the largest single emitted block, or the block SPANS a page
 	// boundary - RAGE pages are independently relocatable and a torn blob crashes the
 	// allocator (ERR_MEM_MULTIALLOC_FREE, learned in-game on the first binary ydr: the
-	// rock's 120KB vertex blob straddled uniform 64KB pages; CW's oracle avoids it with
+	// rock's 120KB vertex blob straddled uniform 64KB pages; the reference oracle avoids it with
 	// a 128KB first page). Encoding: P = 0x200 << (ss+k); count of class-k pages lives
 	// in a bounded bit-field, so pick the smallest ss whose k-field holds N.
 	static uint32 SysPageFlagsUniform(uint32 RawSize, uint32 P, uint32& OutPadded, uint32& OutPages)
@@ -1094,13 +1094,13 @@ namespace RudeYbn
 		return 0xFFFFFFFFu;   // unencodable (absurd sizes) - caller must fail
 	}
 
-	// RSC7 system-segment page flags, reverse-engineered from CW's KNOWN-GOOD ybn output.
+	// RSC7 system-segment page flags, reverse-engineered from the KNOWN-GOOD reference ybn output.
 	// RAGE caps a system page at 0x10000 (64KB) - a single 128KB page is rejected at load
 	// with "Invalid fixup, address is neither virtual nor physical". So:
 	//   - segment <= 64KB : one page, size rounded up to a power of two (>=0x2000), base=size/16
 	//     (matches real small ybns, e.g. itzmapz 0x4000 -> 0x20020001).
 	//   - segment  > 64KB : rounded up to a 64KB multiple, N equal 64KB pages, base 0x200,
-	//     class k7 (matches CW: 0x20000 -> two 64KB pages -> 0x20000040).
+	//     class k7 (matches the reference: 0x20000 -> two 64KB pages -> 0x20000040).
 	// Returns the low-28 flag bits (caller ORs the 0x2 segment-type nibble) and the padded size.
 	static uint32 SysPageFlags(uint32 RawSize, uint32& OutSize)
 	{
@@ -1131,7 +1131,7 @@ namespace RudeYbn
 }
 
 // ======================= ExportYdrBinary - clean-room .ydr (RSC7 v165) =======================
-// The LAST CodeWalker dependency. Every struct pinned against our own CW oracle
+// The last third-party-exporter dependency, retired. Every struct pinned against our own reference oracle
 // (rude_rockwall.ydr) + its XML ground truth - docs/ENGINEERING_LOG "ydr binary format",
 // "COMPLETE STRUCT MAP". Bound serialization: same structures as ExportYbnBinary (the
 // phBound code below is intentionally duplicated from the in-game-proven ybn writer with
@@ -1403,7 +1403,7 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	// (index & 0x7FFF) - a completely different vertex - plus a spurious edge flag. Measured over
 	// 60 real base-game .ybn (768,438 triangle vertex refs): bit 15 is SET in 12.48% of refs while
 	// the largest bound in the sample declares 13,023 verts and the largest index used is 11,706,
-	// so a set bit 15 cannot be index data. quarry's oracle-validated reader agrees independently
+	// so a set bit 15 cannot be index data. ROUT's oracle-validated reader agrees independently
 	// (ydr2xml.py:975 masks with 0x7FFF and takes bit 15 as the flag). Nothing tested this: it
 	// passed the writer's own guards and the BVH coverage check (the indices ARE covered, just
 	// wrong), so a large export - an MLO shell, a terrain tile, a merged district - would have
@@ -1582,7 +1582,7 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 		// ⛔⛔ IN-GAME CRASH #5 ("Invalid fixup", 2026-07-26, Matt-witnessed on the first
 		// multi-material export) - ROOT CAUSE AND FIX.
 		// The old behaviour declared the shader by its OWN name hash while handing it
-		// normal_spec's 9-register parameter block. That is harmless in the XML lane (CW
+		// normal_spec's 9-register parameter block. That is harmless in the XML lane (the reference
 		// rebuilds the params) and FATAL in binary: the game resolves the shader by hash,
 		// then walks THAT shader's real register layout over our block. A preset wanting
 		// more params than normal_spec (e.g. normal_spec_detail) reads straight past our
@@ -2064,7 +2064,7 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	// indices whose bit 15 the loader strips: it reads (index & 0x7FFF), a different vertex, and
 	// takes a spurious edge flag. Measured over 60 real base-game .ybn (768,438 triangle vertex
 	// refs): bit 15 SET in 12.48%, while the largest bound declares 13,023 verts and the largest
-	// index used is 11,706 - a set bit 15 provably is not index data. quarry's reader agrees
+	// index used is 11,706 - a set bit 15 provably is not index data. ROUT's reader agrees
 	// (ydr2xml.py:975: index & 0x7FFF, bit 15 -> f1/f2/f3). The NP > 65535 guard below stays:
 	// the BVH PolyStart really is a full u16.
 	if (NV > 32767) { return Fail(TEXT("vertex count exceeds 32767 - the bound polygon vertex index is 15 bits (bit 15 is the edge flag) - split the mesh")); }
@@ -2226,9 +2226,9 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	const int32 OPoly = Emit(PolyBytes);
 	const int32 ONode = Emit(NodeBytes);
 	const int32 OVert = Emit(VertBytes);
-	// NOTE: child +0xb8 (m_CompressedShrunkVertices) is left NULL - CW's known-good binary
+	// NOTE: child +0xb8 (m_CompressedShrunkVertices) is left NULL - the known-good reference binary
 	// leaves it null and loads fine, so it is NOT required (an earlier theory that it caused
-	// the fixup crash was disproven by diffing CW's working output).
+	// the fixup crash was disproven by diffing the reference's working output).
 	const int32 OMidx = Emit(MatIdxBytes);
 
 	// m_Trees array: 16 bytes/entry = the root node's quantized AABB (s16 min/max, same
@@ -2281,7 +2281,7 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	RudeYbn::PVEC3(ChildBox, 0x00, WorldMin); RudeYbn::PU32(ChildBox, 0x0c, 1);
 	RudeYbn::PVEC3(ChildBox, 0x10, WorldMax); RudeYbn::PF32(ChildBox, 0x1c, RudeYbn::CHILD_MARGIN);
 	const int32 OBbox = Emit(ChildBox);
-	// ChildrenFlags arrays: 16 bytes PER CHILD (not 4 - CW and real ybns use a 16-byte
+	// ChildrenFlags arrays: 16 bytes PER CHILD (not 4 - the reference and real ybns use a 16-byte
 	// stride; second word copied from the known-good binary, trailing 8 bytes zero).
 	TArray<uint8> Fl1; Fl1.AddZeroed(16);
 	RudeYbn::PU32(Fl1, 0, RudeYbn::CHILD_FLAGS1); RudeYbn::PU32(Fl1, 4, RudeYbn::CHILD_FLAGS_PAD);
@@ -2291,7 +2291,7 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	const int32 OFl2 = Emit(Fl2);
 
 	// --- phBoundGeometryBVH child header (0x150: 0x140 of fields + the 0x0000ffff
-	// sentinel at +0x140, present in CW's output and EVERY real corpus ybn) ---
+	// sentinel at +0x140, present in the reference output and EVERY real corpus ybn) ---
 	TArray<uint8> Ch; Ch.AddZeroed(0x150);
 	RudeYbn::PF32(Ch, 0x00, VertR); RudeYbn::PU32(Ch, 0x04, 1);
 	Ch[0x10] = 0x08;                                               // BoundType = GeometryBVH
@@ -2306,13 +2306,13 @@ FString URudeToolset::ExportYbnBinary(const FString& AssetPath, const FString& O
 	RudeYbn::PPTR(Ch, 0x88, OPoly);
 	RudeYbn::PVEC3(Ch, 0x90, Quant); RudeYbn::PF32(Ch, 0x9c, RudeYbn::UNK_F1);
 	RudeYbn::PVEC3(Ch, 0xa0, WorldCtr); RudeYbn::PF32(Ch, 0xac, RudeYbn::UNK_F2);  // CenterGeom
-	RudeYbn::PPTR(Ch, 0xb0, OVert);                // +0xb8 (shrunk verts) intentionally NULL, matches CW
+	RudeYbn::PPTR(Ch, 0xb0, OVert);                // +0xb8 (shrunk verts) intentionally NULL, matches the reference
 	RudeYbn::PU32(Ch, 0xd0, (uint32)NV); RudeYbn::PU32(Ch, 0xd4, (uint32)NP);
 	RudeYbn::PPTR(Ch, 0xf0, OF0);                  // materials array (one all-zero default material)
 	RudeYbn::PPTR(Ch, 0x118, OMidx);
-	RudeYbn::PU32(Ch, 0x120, 1);                   // material count = 1 (CW known-good; every real ybn >= 1)
+	RudeYbn::PU32(Ch, 0x120, 1);                   // material count = 1 (reference known-good; every real ybn >= 1)
 	RudeYbn::PPTR(Ch, 0x130, OBvh);
-	RudeYbn::PU16(Ch, 0x140, 0xffff);              // sentinel, universal in CW + real corpus
+	RudeYbn::PU16(Ch, 0x140, 0xffff);              // sentinel, universal in the reference + real corpus
 	const int32 OChild = Emit(Ch);
 
 	TArray<uint8> CArr; CArr.AddZeroed(8); RudeYbn::PPTR(CArr, 0, OChild);

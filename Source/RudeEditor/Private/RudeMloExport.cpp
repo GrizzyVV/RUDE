@@ -2,7 +2,7 @@
 // MLO interior EXPORT lane (GDD Tier 1 interiors: import-author-export): the raw-slice cutter ImportMlo
 // stores per entity, ExportMloYtyp (the interior back into its ytyp by splicing the file's own bytes)
 // and MoveMloEntity (the scriptable edit the gate uses). Measured on the corpus 2026-09-06 -
-// scratchpad/wp11/mlo_export/LAWS.md; every literal below (indents, tag spellings, the ten-per-line
+// maintainer lane `mlo_export` (`LAWS.md`); every literal below (indents, tag spellings, the ten-per-line
 // list rendering) is a measured law, not a guess.
 #include "RudeToolset.h"
 #include "RudeToolsetInternal.h"

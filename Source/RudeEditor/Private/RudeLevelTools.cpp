@@ -99,7 +99,7 @@
 #include "UObject/SavePackage.h"
 
 // =========================== LOD lineage (ENGINEERING_LOG laws 24-28) ===========================
-// Measured on downtown 2026-09-06 (158 ymaps, 14,248 entities; scratchpad/wp7/lod_rules*.py):
+// Measured on downtown 2026-09-06 (158 ymaps, 14,248 entities; maintainer lane `lod_rules`*.py):
 //   24. parentIndex points into the ymap named by CMapData/parent OR into the entity's own ymap -
 //       whichever holds the entity exactly one LOD level coarser (2,813/2,813 unique, 0 ambiguous).
 //   25. numChildren is a pure count (14,236/14,248; the 12 misses have children outside the district).
@@ -489,7 +489,7 @@ static void RudeCountLodKids(UWorld* World, TMap<const AActor*, URudeEntityCompo
 // A number as the game's files spell it: shortest fixed form, no trailing zeros ("1", "15000",
 // "-153.610275"). Only EDITED entities are spelled this way; untouched ones go out verbatim.
 // The game's values are float32 and the corpus spells them the way .NET's "R" format does (the
-// CodeWalker-parity oracle ROUT reproduces byte-for-byte): SEVEN significant digits when that reads
+// reference-parity oracle ROUT reproduces byte-for-byte): SEVEN significant digits when that reads
 // back to the same float, otherwise NINE - never eight (178.533508, 37.2113342, 0.9848078, and
 // 0.17364794 is %.9g with its trailing zero dropped). Measured 2026-09-06 on the re-parent gate:
 // "%.6f" re-spelt 37.2113342 as 37.211334, and a shortest-round-trip search gave 178.53351 (8).

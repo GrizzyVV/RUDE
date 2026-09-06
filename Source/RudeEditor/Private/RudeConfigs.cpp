@@ -1,7 +1,7 @@
 // RUDE - RAGE <-> Unreal Development Environment
 // Three small config lanes (wp10/configs): timecycle modifiers, text (gxt2), the blip catalog.
-// Every layout here was MEASURED on the corpus's own files (scratchpad/wp10/configs/LAWS.md); nothing
-// is derived from CodeWalker or Sollumz. Exporters splice or rebuild bytes, never re-spell a document.
+// Every layout here was MEASURED on the corpus's own files (maintainer lane `configs` (`LAWS.md`)); nothing
+// is derived from any third-party exporter's code. Exporters splice or rebuild bytes, never re-spell a document.
 #include "RudeToolset.h"
 #include "RudeToolsetInternal.h"
 #include "RudeCorpus.h"

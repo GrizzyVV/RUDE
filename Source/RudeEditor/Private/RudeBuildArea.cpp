@@ -8,7 +8,7 @@
 // 2-6 and deliberately absent, so a stage-1 failure cannot be confused with an import failure.
 //
 // ============================ WHAT WAS READ IN THE ENGINE SOURCE ============================
-// Every claim below is from B:\UE_5.8 (Build.version: 5.8.0, ++UE5+Release-5.8, CL 55116800),
+// Every claim below is from the UE 5.8 source tree (Build.version: 5.8.0, ++UE5+Release-5.8, CL 55116800),
 // read for this file - not from documentation and not from memory.
 //
 // (1) THE PIVOT - the one decision that must be right (UX_AND_FEATURE_NOTES 5c).

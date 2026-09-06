@@ -1,7 +1,7 @@
 // RUDE - RAGE <-> Unreal Development Environment
 //
 // WP10 ANIMS lane: clip dictionaries (.ycd) -> UAnimSequence, cutscenes (.cut) -> Level Sequence.
-// Every structural claim below was MEASURED on the corpus (scratchpad/wp10/anims/LAWS.md, 2026-09-06):
+// Every structural claim below was MEASURED on the corpus (maintainer lane `anims` (`LAWS.md`), 2026-09-06):
 // 5 dictionaries (2 ambient, 1 camera, 2 cutscene parts), 30 animations, 44 sequences, 4,109 channels.
 // What is NOT measured is named: the sign of a cached quaternion's omitted component, the camera's look
 // axis, the cutscene part boundary rule. Those are reported in the verdict, never guessed silently.

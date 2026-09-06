@@ -8,7 +8,7 @@
 // has. This lane builds one USkeleton, one skinned USkeletalMesh per dictionary entry, one URudePedOutfit
 // holding the matrix, and a preview actor wearing drawable 0 / letter a of every component.
 //
-// MEASURED FACTS THIS LANE RESTS ON (scratchpad/wp10/peds/LAWS.md, a_m_m_business_01, 2026-09-06):
+// MEASURED FACTS THIS LANE RESTS ON (maintainer lane `peds` (`LAWS.md`), a_m_m_business_01, 2026-09-06):
 //   * BlendIndices are positions in the geometry's own <BoneIDs> table (identity 0..105 in 28/28
 //     geometries), NOT bone tags: the max index carrying weight is 104 < 106 bones, while 105/106 tags
 //     exceed 105. Hair binds 100% to index 80 = SKEL_Head; trousers reach 28 = SKEL_Spine1.
@@ -27,7 +27,7 @@
 // RenderBucket / texture-scope path - and the skeletal mesh borrows the twin's material per slot name.
 //
 // NOT in v1: Medium/Low LOD groups, cloth, the heads' own <Skeleton>, expressions,
-// (pedprops <ped>_p.ydd ARE in since WP11 - RUDE_PEDPROPS regions below; laws in scratchpad/wp11/pedprops/LAWS.md)
+// (pedprops <ped>_p.ydd ARE in since WP11 - RUDE_PEDPROPS regions below; laws in maintainer lane `pedprops` (`LAWS.md`))
 // the peds.ymt row (movement sets, audio). Every one of those is a counted absence, not a silent one.
 #include "RudeToolset.h"
 #include "RudeToolsetInternal.h"
@@ -412,7 +412,7 @@ namespace RudePeds
 		bool bOwnSkeleton = false;
 	};
 	// RUDE_PEDPROPS_BEGIN helpers
-	// ---- ped props (WP11 lane, scratchpad/wp11/pedprops/LAWS.md) ----
+	// ---- ped props (WP11 lane, maintainer lane `pedprops` (`LAWS.md`)) ----
 	// The only anchor ids the game's data spells (1,169/1,169 aAnchors rows over 709 peds) and the yft bone each rides.
 	// id -> enumerant -> entry word are MEASURED (aAnchors in ascending anchorId order on every ped; propId sets equal
 	// the entry ddd sets 1,169/1,169); the BONE per anchor is RUDE's table (the game's own is code, not data) - a
@@ -899,7 +899,7 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 
 	// RUDE_PEDPROPS_BEGIN import
 	// ---- 4b) the props: <ped>_p.ydd entries (RIGID, 977/977 measured) as static meshes under <ped>/props/, <ped>_p.ytd once ----
-	// LAWS: scratchpad/wp11/pedprops/LAWS.md. A streamed ped (mp_m_freemode_01, cs_*) keeps one ydd per prop in a
+	// LAWS: maintainer lane `pedprops` (`LAWS.md.`) A streamed ped (mp_m_freemode_01, cs_*) keeps one ydd per prop in a
 	// <ped>_p/ folder the corpus cannot address by name - counted here as an absence, not read.
 	const bool bHasPropYdd = FPaths::FileExists(PropYddPath);
 	const bool bHasPropYtd = FPaths::FileExists(PropYtdPath);

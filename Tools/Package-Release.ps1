@@ -36,7 +36,7 @@
     correspond to any commit, so it can never be reproduced. Never publish one.
 
 .EXAMPLE
-    .\Tools\Package-Release.ps1 -Version 0.2.0 -OutDir B:\RUDE_Release
+    .\Tools\Package-Release.ps1 -Version 0.2.0 -OutDir C:\RUDE_Release
 #>
 [CmdletBinding()]
 param(

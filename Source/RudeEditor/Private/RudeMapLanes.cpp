@@ -286,14 +286,14 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 	{
 		BaseJson += FString::Printf(TEXT("%s\"%s\""), i ? TEXT(", ") : TEXT(""), *BaseArchives[i]);
 	}
-	// ⭐ SAME SHAPE AS QUARRY'S _FILEBASE.json, deliberately (Matt's call, 2026-07-27): QUARRY OWNS
-	// the project tree, and this is the no-QUARRY fallback. Two tools writing the same contract in
-	// two shapes is how a contract drifts - which already cost us once when QUARRY emitted binary
-	// and the importer read XML with nothing to announce the mismatch. Keys mirror `quarry.py`'s
-	// `write_manifest`; `createdBy` is the only addition, so a consumer can tell which tool cut it.
+	// ⭐ SAME SHAPE AS ROUT'S _FILEBASE.json, deliberately (Matt's call, 2026-07-27): the extractor
+	// owns the project tree, and this is the hand-assembled fallback. Two tools writing the same
+	// contract in two shapes is how a contract drifts - which already cost us once when the exporter
+	// emitted binary and the importer read XML with nothing to announce the mismatch. Keys mirror
+	// ROUT's manifest (`routVersion`, the key FRudeCorpus reads); `createdBy` is the only addition.
 	const FString Manifest = FString::Printf(TEXT(
 		"{\n"
-		" \"quarryVersion\": 1,\n"
+		" \"routVersion\": 1,\n"
 		" \"createdBy\": \"RUDE CreateFilebase\",\n"
 		" \"title\": \"%s\",\n"
 		" \"gameRoot\": \"%s\",\n"
@@ -304,7 +304,7 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 		" \"dlcOrderAuthoritative\": false,\n"
 		" \"dlcOrderNote\": \"HEURISTIC (year-bearing names last, else alphabetical). RUDE cannot "
 		"open update.rpf to read the real dlclist.xml - it ships no archive or crypto code by "
-		"design. Run QUARRY's init/extract for an authoritative order; do not author a DLC "
+		"design. Run ROUT's export for an authoritative order; do not author a DLC "
 		"override against this one.\",\n"
 		" \"baseArchives\": [%s],\n"
 		" \"dlcPacks\": [%s\n ]\n}\n"),
@@ -318,12 +318,10 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 		"# RUDE Filebase\n\n"
 		"This is an EMPTY folder tree, shaped to your own game install. Nothing here was read out\n"
 		"of your game - RUDE only listed directory names. Filling it is a separate step.\n\n"
-		"## The easy path: QUARRY\n\n"
-		"QUARRY reads your own archives and fills this tree for you, in the right order:\n\n"
-		"    quarry.py extract --game \"<your install>\" --out \"<this folder>\" --xml \\\n"
-		"                      --types ydr,ytd,ytyp,ymap\n"
-		"    quarry.py meta    --out \"<this folder>\"\n"
-		"    quarry.py resolve --out \"<this folder>\"\n\n"
+		"## The easy path: ROUT\n\n"
+		"ROUT (the maintainer's public extractor, github.com/GrizzyVV/ROUT---RAGE-Exporter-App) reads\n"
+		"your own archives and writes this tree for you, in the right order, with the two ledgers RUDE\n"
+		"reads (_FILEBASE.json + _PROVENANCE.jsonl). See ROUT's README for the export command.\n\n"
 		"It also reads the real DLC load order out of your update.rpf, which RUDE cannot - RUDE\n"
 		"ships no archive or crypto code by design, so the order below is only a guess.\n\n"
 		"## The other path: an extractor you already have\n\n"
@@ -350,7 +348,7 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 		"    _incoming/    somewhere to dump before ingesting, if you want it\n\n"
 		"WARNING: the DLC order below is a GUESS (year-bearing names last, else alphabetical).\n"
 		"The real order lives in dlclist.xml inside the encrypted update.rpf. If you intend to\n"
-		"author an override that must land above a particular DLC, use QUARRY - guessing wrong\n"
+		"author an override that must land above a particular DLC, use ROUT - guessing wrong\n"
 		"means your override loses silently.\n\n"
 		"## This filebase was cut for\n"
 		"    %s  (%s, %lld bytes, modified %s)\n"
@@ -375,7 +373,7 @@ FString URudeToolset::CreateFilebase(const FString& FilebaseRoot, const FString&
 // ---- gtxd: RAGE's PARENT-TEXTURE-DICTIONARY chain ---------------------------------------
 // ⭐ 2026-08-05 (#43 tier 3). When an asset's own txd does not hold a texture, the engine walks
 // the parent chain declared in CMapParentTxds. That table ships as `gtxd.ymt` - an RBF0 binary,
-// which QUARRY's ymt stage refuses (35 RBF0 refusals on record), so the plugin reads it directly.
+// which the exporter's ymt stage once refused (35 RBF0 refusals on record), so the plugin reads it directly.
 // ⛔ THE FORMAT WAS DERIVED FROM THE BYTES, not from any third-party implementation, and the
 // derivation is checkable: both files in the corpus parse to EXACTLY their own length with a
 // balanced element stack (gtxd.ymt 210,467 bytes -> 2,983 relationships; mph4_gtxd.ymt 3,848 ->
@@ -703,7 +701,7 @@ static bool BuildCorpusArchetypeIndex(const FString& CorpusRoot, FRudeArchetypeI
 			const FXmlNode* TypeN = Item->FindChildNode(TEXT("assetType"));
 			if (!NameN || !AssetN) { continue; }
 			// drawable + fragment + drawable-dictionary archetypes resolve (fragments via
-			// QUARRY's yft.xml, visual drawable v1; dictionary archetypes via the ydd
+			// the extractor's yft.xml, visual drawable v1; dictionary archetypes via the ydd
 			// entry-selection lane). A dictionary archetype's mesh is ONE entry inside
 			// <drawableDictionary>'s ydd, and the ARCHETYPE name names that entry
 			// (measured corpus-wide 2026-07-28: 72,074/72,074 dict archetypes carry a
@@ -1672,7 +1670,7 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 	// ---- 2b) the file's OWN BYTES, cut into per-entity slices - the export (ExportMloYtyp) splices these
 	// back verbatim. A slicing that disagrees with the parse is refused HERE, never carried into the level
 	// (measured 2026-09-06: 539/539 non-empty MLO entity blocks and 2,272/2,272 set blocks cut with zero
-	// leftover bytes - scratchpad/wp11/mlo_export/LAWS.md law 3). RUDE_MLO_RAW_SLICES
+	// leftover bytes - maintainer lane `mlo_export` (`LAWS.md`) law 3). RUDE_MLO_RAW_SLICES
 	FRudeMloRaw Raw;
 	{
 		FString RawText, RawErr;
@@ -2624,7 +2622,7 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	//   Imported + Skipped > 0 - a run that did NOTHING is not a success. An all-skipped batch
 	//                            (nothing to re-import outside Mode=FORCE) IS legitimate, which is
 	//                            why Skipped counts as work done and Imported alone does not.
-	// Same law as `quarry regress --strict`: a gate that cannot fail is worse than no gate.
+	// Same law as ROUT's strict regression gate: a gate that cannot fail is worse than no gate.
 	// See ENGINEERING_LOG "MEASUREMENT LAWS".
 	const bool bOk = (Failed == 0) && (Imported + Skipped > 0);
 	return FString::Printf(
@@ -3059,7 +3057,7 @@ FString URudeToolset::ImportYtdBatch(const FString& ListPath, const FString& Des
 		if (Path.IsEmpty()) { continue; }
 		FString Txd = FPaths::GetBaseFilename(Path);
 		Txd.RemoveFromEnd(TEXT(".ytd"));
-		// The pixel folder is DERIVED: QUARRY writes "<stem>/" beside the XML and resolve
+		// The pixel folder is DERIVED: the extractor writes "<stem>/" beside the XML and resolve
 		// carries the sidecar with the winning copy - the pair is self-describing.
 		const FString PixelFolder = FPaths::GetPath(Path) / Txd;
 		// Skip-if-exists on the txd's CONTENT FOLDER on disk (assets inside are named per

@@ -6,7 +6,7 @@
 // you get a car sitting on the ground with no wheels at all - which is exactly what RUDE did
 // before this file existed.
 //
-// This is the consumer for QUARRY's yft2xml `--extras` output (quarry/yft2xml.py, 2026-07-28):
+// This is the consumer for the extractor's fragment XML with skeleton + child extras (2026-07-28):
 //   <Fragment><Drawable><Skeleton><Bones>   every bone, with its LOCAL T/R/S and its Tag
 //   <Fragment><Physics><LOD1><Groups>       group NAMES (the group<->bone join)
 //   <Fragment><Physics><LOD1><Children>     GroupIndex + BoneTag, and a <Drawable> on the
@@ -14,11 +14,11 @@
 //   <yft>/<vehicle>/<groupName>.ydr.xml     one standalone, directly importable sidecar per
 //                                           geometry-bearing child (the wheel mesh)
 // The sidecar exists because a child drawable carries NO ShaderGroup of its own - its
-// <ShaderIndex> values index the FRAGMENT's shader group - so QUARRY splices the fragment's
+// <ShaderIndex> values index the FRAGMENT's shader group - so the extractor splices the fragment's
 // shader group in and hands us a document ImportYdr already knows how to read. That is the whole
 // reason this file imports meshes by calling ImportYdr rather than growing a second mesh builder.
 //
-// MEASURED FACTS THIS LANE RESTS ON (quarry-side probes, 2026-07-28, vs the reference corpus):
+// MEASURED FACTS THIS LANE RESTS ON (exporter-side probes, 2026-07-28, vs the reference corpus):
 //   * A car carries ONE wheel drawable, authored on bone wheel_lf, instanced at every wheel bone
 //     (23 of 24 sampled vehicles); buses/trucks carry TWO (wheel_lf + wheel_lr, 4 of 24);
 //     helicopters and boats carry none (they still have wheel bones - a heli's skids do not).
@@ -102,7 +102,7 @@ namespace RudeVehicle
 	// or `hexer` and read the FRONT wheel's Y OFFSET from the actor origin, never its tilt.
 	// Correct: sanchez wheel_lf lands at UE (0, -84.6, -16.6) cm. The inverse convention would put
 	// it at UE (0, -27.0, -29.9) cm - tucked under the engine. Oracle:
-	// scratchpad/rude_owner/bone_convention.py (ground-plane spread over the discriminating set).
+	// maintainer lane `bone_convention`.py (ground-plane spread over the discriminating set).
 	static FTransform GtaToUe(const FTransform& G)
 	{
 		const FQuat Q = G.GetRotation();
@@ -321,7 +321,7 @@ FString URudeToolset::ImportVehicle(const FString& CorpusRoot, const FString& Ve
 	if (!FPaths::FileExists(XmlPath))
 	{
 		return Fail(FString::Printf(TEXT("no fragment XML at %s - is the name right, and has "
-			"QUARRY converted this vehicle?"), *XmlPath));
+			"your extractor exported this vehicle?"), *XmlPath));
 	}
 	// One folder per vehicle. The body mesh and every wheel mesh land together, which is also
 	// what keeps wheels from colliding: EVERY car's wheel sidecar is called wheel_lf, so a flat
@@ -356,11 +356,10 @@ FString URudeToolset::ImportVehicle(const FString& CorpusRoot, const FString& Ve
 		if (!ParseSkeleton(DrawableNode, Bones, Why)) { return Fail(Why); }
 		if (Bones.Num() == 0)
 		{
-			// LOUD, and it names the fix: the extras are opt-in on the QUARRY side, so an old corpus
-			// file simply has no <Skeleton> and there is nothing here to place wheels on.
-			return Fail(FString::Printf(TEXT("%s has no <Drawable><Skeleton><Bones> - regenerate it "
-				"with QUARRY's yft2xml --extras (python quarry/yft2xml.py <%s.yft> --extras --out "
-				"<corpus>/yft), then re-run"), *XmlPath, *Name));
+			// LOUD, and it names the fix: an old (prototype-era) export carried no <Skeleton>, and
+			// there is nothing here to place wheels on.
+			return Fail(FString::Printf(TEXT("%s has no <Drawable><Skeleton><Bones> - re-export %s with a "
+				"current ROUT (its fragment XML carries the skeleton), then re-run"), *XmlPath, *Name));
 		}
 		if (!ResolveBoneWorld(Bones, WorldGta, Why)) { return Fail(Why); }
 	}
@@ -389,7 +388,7 @@ FString URudeToolset::ImportVehicle(const FString& CorpusRoot, const FString& Ve
 					// collision-only stubs (17 of the adder's 18 children). ⚠ Measured 2026-09-06 on
 					// ROUT's corpus (blista/taxi/burrito): EVERY child carries a <Drawable> HEADER
 					// (name, bounds, lod distances) and only wheel_lf's carries <DrawableModelsHigh>.
-					// QUARRY emitted <Drawable> on geometry children only, so the old test read 21
+					// the prototype exporter emitted <Drawable> on geometry children only, so the old test read 21
 					// sidecars into "missing" here. Geometry = models present, not a header.
 					const FXmlNode* ChildDrawable = It->FindChildNode(TEXT("Drawable"));
 					if (!ChildDrawable || !ChildDrawable->FindChildNode(TEXT("DrawableModelsHigh"))) { continue; }
@@ -616,7 +615,7 @@ FString URudeToolset::ImportVehicle(const FString& CorpusRoot, const FString& Ve
 }
 
 // ---- ImportVehicleComposite / SetVehicleLivery (WP10 vehicles lane, 2026-09-06) ------------------
-// MEASURED over blista / taxi / burrito, base + _hi (scratchpad/wp10/vehicles/LAWS.md):
+// MEASURED over blista / taxi / burrito, base + _hi (maintainer lane `vehicles` (`LAWS.md`)):
 //   * <Physics><LOD1><Children> = one child per group (21 / 26 / 28). EVERY child carries a <Drawable>
 //     header; ONLY wheel_lf's carries geometry. Doors, bonnet, boot, bumpers, wings and windows are
 //     NOT separate drawables - they are vertices of the main drawable (HasSkin 1, BlendIndices on
@@ -648,7 +647,7 @@ namespace RudeVehicle
 	// under <DrawableModelsHigh> (a base Medium/Low/VeryLow group is re-tagged High so the shared
 	// importer reads it), and optionally a <Bounds> subtree.
 	// The archetype composite for the body's collision, minus the child types ParseBound's catalogue
-	// does not carry. MEASURED IN-ENGINE 2026-09-06 (scratchpad/wp10/vehicles/cli_probe.log): blista's
+	// does not carry. MEASURED IN-ENGINE 2026-09-06 (maintainer lane `vehicles` (`cli_probe.log`)): blista's
 	// four wheel bounds are type="Disc", ParseBound refuses "unknownType:Disc", and its gate
 	// (collisionBoundsMalformed) turned the WHOLE body import ok:false while 16 Geometry + 1 Box had
 	// imported (378 collision triangles). A Disc is a wheel's cylinder - no faithful UE target, the

@@ -103,7 +103,7 @@ struct FRudePedComponent
 
 // RUDE_PEDPROPS_BEGIN outfit structs
 // One prop (hat / glasses / earpiece / watch / bracelet) of the ped: the <ped>_p.ydd entry p_<anchor>_<ddd> joined
-// with its ymt CPedPropMetaData row. Measured (scratchpad/wp11/pedprops/LAWS.md, 709 peds / 1,763 entries): every
+// with its ymt CPedPropMetaData row. Measured (maintainer lane `pedprops` (`LAWS.md`), 709 peds / 1,763 entries): every
 // entry is RIGID (HasSkin 0 on 977/977 base models, no BoneIDs, no Skeleton, no Bounds, High group only), modeled in
 // ped axes with the origin at the anchor bone; anchorId 0 head / 1 eyes / 2 ears / 6 left wrist / 7 right wrist are
 // the only ids the game's data spells (1,169/1,169 anchor rows).

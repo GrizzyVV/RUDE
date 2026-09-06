@@ -1,7 +1,7 @@
 // RUDE - RAGE <-> Unreal Development Environment
 //
 // THE CHAOS TEST-DRIVE, editor side (GDD Tier 2, WP11). Runtime classes: RudeCore/RudeDriveablePawn.h.
-// Design + the handling.meta -> Chaos table with its honesty tags: scratchpad/wp11/drive/DESIGN.md.
+// Design + the handling.meta -> Chaos table with its honesty tags: maintainer lane `drive` (`DESIGN.md.`)
 //
 // From a VehicleComposite_<name> actor (ImportVehicleComposite) and its URudeVehicle asset:
 //   1. the yft skeleton, re-read from the asset's SourceYft (the DataAsset keeps tags, not frames): every bone with

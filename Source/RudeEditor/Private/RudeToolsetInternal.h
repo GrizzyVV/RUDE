@@ -72,7 +72,7 @@ int32 RudeAttachEntityLights(AActor* Actor, class URudeEntityComponent* R);
 // entity keys as edited and only those fields move. Returns the number of instances rewritten.
 int32 RudeSyncEntityLights(AActor* Actor, class URudeEntityComponent* R);
 
-// ---- MLO interiors: raw slices of one CMloArchetypeDef (RudeMloExport.cpp; scratchpad/wp11/mlo_export/LAWS.md) ----
+// ---- MLO interiors: raw slices of one CMloArchetypeDef (RudeMloExport.cpp; maintainer lane `mlo_export` (`LAWS.md`)) ----
 // The ytyp's OWN BYTES cut along the lines the game's writer emits (measured 2026-09-06 over 541 MLO archetypes:
 // one shape). Offsets are into `Arch` (the archetype's "  <Item type=\"CMloArchetypeDef\">" slice) except
 // ArchStart/ArchEnd, which are into the document. Every item slice starts at its own indentation and ends with the

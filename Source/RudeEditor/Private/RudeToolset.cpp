@@ -266,7 +266,7 @@ static UMaterialInterface* EnsureCutoutMaster()
 
 // The detail-map master. RAGE's *_detail presets bind a high-frequency DetailSampler that tiles
 // over the albedo, and until 2026-07-29 we could not use it: the tiling lives in `detailSettings`,
-// which QUARRY was dropping along with every other non-texture shader parameter.
+// which ROUT was dropping along with every other non-texture shader parameter.
 //
 // MEASURED (1,994 samples, whole base set) - `detailSettings` component semantics:
 //   .x  strength      0.0-8.0, typically 0.8-1.5
@@ -2461,7 +2461,7 @@ FString RudeImportYdrScoped(const FString& XmlPath, const FString& DestFolder,
 		return Fail(FString::Printf(TEXT("XML load failed: %s"), *Xml.GetLastError()));
 	}
 	const FXmlNode* Root = Xml.GetRootNode();
-	// A fragment's visual drawable imports through this same lane: QUARRY's yft2xml (v1) emits
+	// A fragment's visual drawable imports through this same lane: ROUT's prototype fragment exporter (v1) emits
 	// <Fragment> wrapping a <Drawable> child. The mesh must keep the FILE's stem - a fragment's
 	// inner drawable names itself "skel", which would otherwise become the asset name.
 	bool bFragment = false;
@@ -2619,7 +2619,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		int32 RenderBucket = 0;              // RAGE draw bucket: 0 opaque, 1 alpha, 2 decal, 3 cutout
 		FString Diffuse, Normal, Specular;   // texture NAMES from the ydr
 		TMap<FString, FString> AllTex;       // every Texture param: samplerName -> texName (terrain layers)
-		// ⭐ VALUE params (2026-07-29). QUARRY used to drop every non-texture shader parameter, so
+		// ⭐ VALUE params (2026-07-29). ROUT used to drop every non-texture shader parameter, so
 		// detail tiling, specular intensity/falloff, bump scale and wetness never reached the
 		// engine at all. They are emitted now as <Item type="Vector">, so carry them through.
 		TMap<FString, FVector4> Values;
@@ -3430,7 +3430,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 				}
 
 				// ---- VALUE params -> the MI, guarded exactly like textures ----
-				// ⭐ These only became available on 2026-07-29, when QUARRY stopped dropping every
+				// ⭐ These only became available on 2026-07-29, when ROUT stopped dropping every
 				// non-texture shader parameter. Same discipline as BindTex: ask the master what it
 				// exposes and count the misses, so an unbindable value is LOUD rather than silent.
 				TSet<FName> MasterVectors, MasterScalars;
@@ -3652,8 +3652,8 @@ int32 RudeSumField(const FString& Json, const TCHAR* Key)
 	return FCString::Atoi(*Json.Mid(At + Needle.Len()));
 }
 
-// Jenkins one-at-a-time over the LOWERCASED name - RAGE's name hash, pinned to QUARRY's
-// convention (quarry/ngcrypto.py joaat: lowercase input; the unresolvable-name fallback is
+// Jenkins one-at-a-time over the LOWERCASED name - RAGE's name hash, pinned to ROUT's
+// convention (ROUT's joaat: lowercase input; the unresolvable-name fallback is
 // spelled "hash_%08X", UPPERCASE hex). ymap<->ytyp<->dictionary joins are hash-to-hash, so
 // matching by hash is the join's native form, not a workaround.
 // JSON string escape for text that rides inside the manifest (extension XML, names with quotes).

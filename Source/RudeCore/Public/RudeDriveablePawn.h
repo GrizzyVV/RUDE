@@ -14,7 +14,7 @@ class USpringArmComponent;
 class UCameraComponent;
 class UInputComponent;
 
-// THE CHAOS TEST-DRIVE (GDD Tier 2, WP11; design + the handling.meta -> Chaos table: scratchpad/wp11/drive/DESIGN.md).
+// THE CHAOS TEST-DRIVE (GDD Tier 2, WP11; design + the handling.meta -> Chaos table: maintainer lane `drive` (`DESIGN.md`)).
 //
 // A driveable is built by URudeToolset::BuildDriveable from an imported composite: a USkeletalMesh carrying the yft's
 // bones (body vertices weighted 1.0 to `chassis`, each placed wheel mesh weighted 1.0 to its wheel_* bone), a

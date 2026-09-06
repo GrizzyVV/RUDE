@@ -8,7 +8,7 @@
 #include "RudeVehicleAsset.generated.h"
 
 // One <Physics><LOD1> child of a vehicle fragment: a bone frame + a bound (+ a mesh when the child carries
-// geometry - the wheel prototype). Measured 2026-09-06 on blista / taxi / burrito (scratchpad/wp10/vehicles/
+// geometry - the wheel prototype). Measured 2026-09-06 on blista / taxi / burrito (maintainer lane `vehicles`
 // LAWS.md): 21 / 26 / 28 children, one per group (burrito: 28 children over 22 groups), EVERY child with a
 // <Drawable> header, only wheel_lf's with models; doors/bonnet/boot are skinned parts of the main drawable.
 // Bound children pair with physics children by ordinal (Geometry per body part, Disc per wheel, one Box).

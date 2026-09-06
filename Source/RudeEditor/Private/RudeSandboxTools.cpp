@@ -240,7 +240,7 @@ FString URudeToolset::EmitNativeSnippet(const FString& Kind, const FString& Name
 		                      TEXT("SetPedIntoVehicle(ped, veh, -1)                               -- SET_PED_INTO_VEHICLE (-1 = driver)\n")
 		                      TEXT("SetModelAsNoLongerNeeded(model)                              -- SET_MODEL_AS_NO_LONGER_NEEDED\n")
 		                      TEXT("-- TaskLeaveVehicle(ped, veh, 0)                              -- TASK_LEAVE_VEHICLE\n"), *N);
-		Note = TEXT("In PIE the car is the ARudeDriveablePawn BuildDriveable spawned - Chaos physics under RUDE's handling.meta mapping (scratchpad/wp11/drive/DESIGN.md), not the game's handling. In game it is the real vehicle. The shim possesses a pawn; the game seats a ped.");
+		Note = TEXT("In PIE the car is the ARudeDriveablePawn BuildDriveable spawned - Chaos physics under RUDE's handling.meta mapping (maintainer lane `drive` (`DESIGN.md`)), not the game's handling. In game it is the real vehicle. The shim possesses a pawn; the game seats a ped.");
 	}
 	else { return Fail(TEXT("Kind = ipl | cutscene | entityset | scenario | clock | vehicle (empty lists them)")); }
 	return FString::Printf(TEXT("{\"ok\":true,\"kind\":\"%s\",\"name\":\"%s\",\"native\":\"%s\",\"side\":\"%s\",\"shim\":\"%s\",\"lua\":\"%s\",\"note\":\"%s\"}"),

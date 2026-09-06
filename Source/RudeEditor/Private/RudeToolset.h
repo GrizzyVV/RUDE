@@ -122,8 +122,8 @@ public:
 	// semantics derived from each entry's Usage (NORMAL -> TC_Normalmap + sRGB off,
 	// SPECULAR -> sRGB off, DIFFUSE -> sRGB on).
 	// XmlPath: absolute path to a *.ytd.xml file.
-	// PixelFolder: folder of decoded PNGs matching the entry names (BC-decode
-	// happens offline until native decode lands).
+	// PixelFolder: folder of pixel sidecars matching the entry names (DDS decoded natively by
+	// FRudeDds; PNG accepted). Empty = the folder named for the XML's stem beside it.
 	// DestFolder: content folder root; assets land in <DestFolder>/<TxdName>/.
 	// Returns JSON: {ok, txd, declared, imported, invalidNames, itemsWithoutName,
 	// usageDefaulted, usageUnknown, missingPixelCount, missingPixels:[...first 30]}.
@@ -297,7 +297,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one ambient-life point by x,y,z centimetres. Name it by its region and its number in that region's file.", RudeAudience="agent"))
 	static FString MoveScenarioPoint(const FString& RegionName, const FString& PointIndex, const FString& DeltaCm);
 
-	// ---- wp10 configs: timecycle modifiers (scratchpad/wp10/configs/LAWS.md) ----
+	// ---- wp10 configs: timecycle modifiers (maintainer lane `configs` (`LAWS.md`)) ----
 	// One URudeTimecycle DataAsset per <modifier> across EVERY timecycle_mods_*.xml the corpus carries (base,
 	// update and each DLC copy are separate documents - the ledger keys them all as one name, the game loads
 	// them additively; a later copy of the same modifier name refills the asset). Fields: mod name ->
@@ -342,7 +342,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build the list of map blip icons the game knows, with the sprite sheets they are drawn from."))
 	static FString BuildBlipCatalog(const FString& CorpusRoot, const FString& DestFolder);
 
-	// ---- vehicle paths (ynd) - WP10 paths lane; laws in scratchpad/wp10/paths/LAWS.md ----------
+	// ---- vehicle paths (ynd) - WP10 paths lane; laws in maintainer lane `paths` (`LAWS.md`) ----------
 	// Import one path cell as editable actors: nodes<N> (N = row*32+col over 512 m cells from -8192 m;
 	// "at:x,y" in GTA metres names the cell that holds a point - downtown (120,-575) is nodes464). One
 	// actor per node with a URudePathNodeComponent (every node field + provenance), in-cell links as
@@ -370,12 +370,12 @@ public:
 	// a skinned USkeletalMesh (real BlendWeights / BlendIndices resolved through the geometry's <BoneIDs>
 	// table), materials through the shared drawable lane, the ymt variation matrix -> a URudePedOutfit
 	// DataAsset, and a preview actor wearing drawable 0 / texture a of every component. Laws + numbers:
-	// scratchpad/wp10/peds/LAWS.md (a_m_m_business_01: 106 bones, 8 drawables, 46 textures, 4 components).
+	// maintainer lane `peds` (`LAWS.md`) (a_m_m_business_01: 106 bones, 8 drawables, 46 textures, 4 components).
 	// Props (WP11, RUDE_PEDPROPS): <ped>_p.ydd entries (rigid, 977/977 measured) as static meshes under <ped>/props/,
 	// <ped>_p.ytd into /Game/RUDE/Textures/<ped>_p/, the ymt propInfo matrix into the outfit's Props (anchor / propId /
 	// texture letters), each prop a HIDDEN component on its anchor bone of the preview actor (SetPedProp shows one).
 	// Counts: props, propsImported, propsInMatrix/Resolved, propsSkinnedRefused, propTextures, anchorsUnmapped,
-	// propsAttached. Laws: scratchpad/wp11/pedprops/LAWS.md. A streamed ped's per-prop folder layout is counted, not read.
+	// propsAttached. Laws: maintainer lane `pedprops` (`LAWS.md.`) A streamed ped's per-prop folder layout is counted, not read.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V character (ped) into Unreal: its skeleton, every clothing piece as a skinned mesh, and its outfit variations."))
 	static FString ImportPed(const FString& CorpusRoot, const FString& PedName, const FString& DestFolder);
 
@@ -415,7 +415,7 @@ public:
 
 	// ---- WP10 ANIMS ----------------------------------------------------------------------------
 	// Import a clip dictionary (.ycd, ROUT XML) as ONE UAnimSequence per <Animations><Item> on the given
-	// USkeleton. Laws measured over 5 dictionaries / 30 animations (scratchpad/wp10/anims/LAWS.md):
+	// USkeleton. Laws measured over 5 dictionaries / 30 animations (maintainer lane `anims` (`LAWS.md`)):
 	//   * frames = <FrameCount>; frame rate = round((FrameCount-1)/Duration) - 30 fps in 27/30, 10 fps in 3/30.
 	//   * <BoneIds><Item> = {BoneId = skeleton bone TAG, Track, Unk0 = kind 0 vec3 / 1 quat / 2 float}; the
 	//     <SequenceData><Item>s of every sequence are parallel to it (44/44 sequences). Track 0 = bone
@@ -475,7 +475,7 @@ public:
 	// from carvariations colors/Item/liveries) and the child/bone/bound table. Every drawable goes
 	// through ImportDrawableNode from a re-spelled self-contained <Drawable> buffer (a child has no
 	// ShaderGroup of its own; its ShaderIndex indexes the fragment's). Measured on blista / taxi /
-	// burrito 2026-09-06 (scratchpad/wp10/vehicles/LAWS.md): doors/bonnet/boot are skinned parts of the
+	// burrito 2026-09-06 (maintainer lane `vehicles` (`LAWS.md`)): doors/bonnet/boot are skinned parts of the
 	// main drawable, only wheel_lf carries child geometry. Verdict: bones, children, childComponents,
 	// wheelBones/wheelsPlaced, lodCount/lodSources, liveries, boundTypes, field counts, missing[] (capped,
 	// total beside it); ok is COMPUTED (every child placed, wheels where the skeleton has them, no LOD failed).
@@ -540,12 +540,12 @@ public:
 	// joaat(name), e.g. "uppr_000_u"). Returns JSON {ok, yddPath, drawables:[{name, hash, geometries, vertices,
 	// triangles, bonesReferenced, influencesUnmapped, influencesTruncated, verticesRebound, uv1Dropped,
 	// texturesMissing, textures}], rigBones, rig, bytes, segSize, pages, sysFlags, selfCheck}.
-	// Laws + denominators: scratchpad/wp11/ydd_writer/LAWS.md. In-game load: NOT yet verified (Matt's test).
+	// Laws + denominators: maintainer lane `ydd_writer` (`LAWS.md.`) In-game load: NOT yet verified (Matt's test).
 	// RIGID entries (WP11 ped props, RUDE_PEDPROPS): a UStaticMesh content path writes an UNSKINNED entry - grmModel
 	// +0x28/+0x29/+0x2D = 0, geometry +0x68 raw NULL / +0x72 = 0, the game's own prop layout (mask 0x40F9 stride 64:
 	// Position Normal Colour0 Colour1 TexCoord0 TexCoord1 Tangent, 2,674/2,677 prop geometries), `ped` or `ped_alpha`
 	// (bucket 1, 12 params, registers 0/2/5/6) by the slot's preset, entry +0x80 = 0xFF00 | OR(1<<bucket) (1,763/1,763).
-	// Mixed lists are fine (a rig is required only when a skinned mesh is present). scratchpad/wp11/pedprops/LAWS.md.
+	// Mixed lists are fine (a rig is required only when a skinned mesh is present). maintainer lane `pedprops` (`LAWS.md.`)
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save clothing pieces (skinned meshes on a ped skeleton) as a finished GTA V clothing file the game loads directly."))
 	static FString ExportYddBinary(const FString& SkeletalMeshAssetPaths, const FString& DrawableNames,
 	                               const FString& OutYddPath, const FString& Options);
@@ -567,7 +567,7 @@ public:
 	// ARudeDriveablePawn spawned 6 m beside the composite with one FChaosWheelSetup per wheel_* bone (front axle
 	// steers, rear handbrakes) and the handling.meta row mapped onto Chaos - every mapped line lands in the
 	// component's MappingNotes with its tag (as-read / kinematics / inferred / placeholder; the table is
-	// scratchpad/wp11/drive/DESIGN.md). Tagged RUDE_DRIVEABLE:<name>. Verdict: bones, body/wheel vertices and
+	// maintainer lane `drive` (`DESIGN.md`)). Tagged RUDE_DRIVEABLE:<name>. Verdict: bones, body/wheel vertices and
 	// triangles, wheels bound/mirrored, radii read off the meshes, chassis shape, ground clearance, the Chaos
 	// numbers, the handling fields that were missing (defaults named), problems[]; ok is COMPUTED.
 	// Then SandboxSetup + Play: `Rude.Native EnterVehicle <name>` possesses it; F or `Rude.Native ExitVehicle` returns.
@@ -595,12 +595,12 @@ public:
 	// letter a; empty/-1 = leave the materials). PropIndex -1 = nothing on that anchor. One prop per anchor, like the
 	// game. The prop rides its anchor bone (SKEL_Head for head/eyes/ears, SKEL_L_Hand / SKEL_R_Hand for the wrists -
 	// RUDE's table) with the bone's bind rotation inverted: props are modeled in ped axes at the bone's origin
-	// (scratchpad/wp11/pedprops/LAWS.md law 7). Verdict: anchor, bone, prop, entry, mesh, texture, hidden, component.
+	// (maintainer lane `pedprops` (`LAWS.md`) law 7). Verdict: anchor, bone, prop, entry, mesh, texture, hidden, component.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Put a hat, glasses, earpiece or watch on a character, or take it off (-1), and pick its colour variant.", RudeAudience="agent"))
 	static FString SetPedProp(const FString& ActorLabel, const FString& Anchor, const FString& PropIndex, const FString& TextureIndex);
 	// RUDE_PEDPROPS_END header
 
-	// THE INTERIOR EXPORTER (GDD Tier 1 interiors: import-author-EXPORT; scratchpad/wp11/mlo_export). The
+	// THE INTERIOR EXPORTER (GDD Tier 1 interiors: import-author-EXPORT; maintainer lane `mlo_export`). The
 	// interior's entity actors (ImportMlo since 2026-09-06 spawns one actor per entity carrying a
 	// URudeMloEntityComponent: interior, set, ordinal, raw slice, source transform) go back into the ytyp
 	// that declared the CMloArchetypeDef, as a FiveM resource: <OutDir>/stream/<ytyp>.ytyp (XML form,
@@ -624,7 +624,7 @@ public:
 
 	// Nudge one interior entity by x,y,z centimetres. Index = the ordinal in the archetype's <entities>, or
 	// "<setName>:<ordinal>" for an entity-set entity. Identity = interior + set + ordinal. The scriptable edit
-	// the MLO export gate uses (scratchpad/wp11/mlo_export/gate.jsonl).
+	// the MLO export gate uses (maintainer lane `mlo_export` (`gate.jsonl`)).
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one prop of an interior by x,y,z centimetres.", RudeAudience="agent"))
 	static FString MoveMloEntity(const FString& InteriorName, const FString& Index, const FString& DeltaCm);
 
@@ -798,7 +798,7 @@ public:
 	static FString SetWorldHour(const FString& Hour);
 
 	// Batch ImportYtd: ListPath = a text file of absolute *.ytd.xml paths, one per line.
-	// Each entry's PixelFolder is DERIVED - QUARRY writes the decoded pixels to a sibling
+	// Each entry's PixelFolder is DERIVED - the extractor writes the pixels to a sibling
 	// "<stem>/" folder beside the XML (and resolve carries that sidecar with the winning copy),
 	// so the pair is self-describing and no per-file pixel argument exists to get wrong.
 	// Assets land in <DestFolder>/<TxdName>/ via the same path as ImportYtd. A txd whose content
@@ -858,7 +858,7 @@ public:
 	                          const FString& CorpusRoot, const FString& DestMeshFolder,
 	                          const FString& Filter, const FString& Mode);
 
-	// THE INTERIOR IMPORTER (v1) - the consumer for the MLO data QUARRY now emits
+	// THE INTERIOR IMPORTER (v1) - the consumer for the MLO data the extractor emits
 	// (ENGINEERING_LOG "MLO EMISSION" / "EXTENSIONS DECODED"). Locates the named
 	// CMloArchetypeDef across <CorpusRoot>/ytyp/*.xml - name matching is hash-tolerant
 	// BOTH ways, the ImportYddEntry convention (MLO names are usually hash_XXXXXXXX in
@@ -897,7 +897,7 @@ public:
 	// wrong props to the wrong rooms with badAttachedRefs still reading 0. The per-mesh counters
 	// are new: this lane and ImportMapArea are the only consumers of the yft/ydd import paths and
 	// both used to discard the whole unit verdict.
-	// 2026-09-06 (scratchpad/wp11/mlo_export): EVERY entity - room entities and entity-set entities - is now
+	// 2026-09-06 (maintainer lane `mlo_export`): EVERY entity - room entities and entity-set entities - is now
 	// its OWN ACTOR under its room / set actor, carrying a URudeMloEntityComponent (interior, set, ordinal,
 	// the entity's raw <Item> slice, the source transform). The ISM path is retired: an instance had no
 	// identity, so nothing could be moved and written back. Cost = one actor per entity (v_franklinshouse:
@@ -941,10 +941,10 @@ public:
 	static FString ExportTexture(const FString& TexturePath, const FString& OutPngPath);
 
 	// Export UTexture2D(s) directly to a binary FiveM .ytd (RSC7 v13) - CLEAN-ROOM,
-	// no CodeWalker. The RSC7 container (pgDictionary<grcTexture> system segment +
+	// clean-room. The RSC7 container (pgDictionary<grcTexture> system segment +
 	// page-aligned graphics segment + segment flags + raw deflate) was reversed from
-	// our own CW diff pair and byte-verified (tools/write_ytd.py; ENGINEERING_LOG
-	// "RSC7 binary container"). This is P5 step 1 - deleting CodeWalker for textures.
+	// our own reference diff pair and byte-verified (tools/write_ytd.py; ENGINEERING_LOG
+	// "RSC7 binary container"). This is P5 step 1 - the texture writer needs no third-party exporter.
 	// TextureSpecs: comma-separated entries "ContentPath;RageName[;Usage[;Format]]".
 	//   Usage  = DIFFUSE|NORMAL|SPECULAR (drives grcTexture semantics).
 	//   Format = AUTO|DXT1|DXT5|ATI2|RAW. AUTO (default) picks ATI2 for NORMAL, DXT5 when
@@ -966,7 +966,7 @@ public:
 	static FString ExportMeshTextures(const FString& AssetPath, const FString& OutYtdPath, const FString& MaxDim);
 
 	// Export a UStaticMesh directly to a binary FiveM .ydr (RSC7 v165) - CLEAN-ROOM,
-	// no CodeWalker. P5 step 3, the LAST CodeWalker dependency. Emits a gtaDrawable:
+	// clean-room. P5 step 3, the last third-party-exporter dependency, retired. Emits a gtaDrawable:
 	// GTAV1 vertex buffers (Pos/Normal/Colour0/UV, 36B stride) + u16 index buffers per
 	// polygon group, ShaderGroup with the normal_spec/spec parameter template (external
 	// -ytd texture stubs resolved by name), and the EMBEDDED phBoundComposite collision
@@ -1000,7 +1000,7 @@ public:
 
 	// Parse a BINARY FiveM/GTA V .ydr (RSC7 v165) and report its whole drawable graph as JSON.
 	// This is the READ side's foundation: RUDE can write binary but until now could only READ
-	// the XML interchange form, so real game binaries (e.g. from a QUARRY-extracted filebase) could not
+	// the XML interchange form, so real game binaries (e.g. from an extracted filebase) could not
 	// reach the importer. Verifies the parse before it is wired to the mesh builder.
 	// Reads untrusted files: every access is bounds-checked, malformed input returns {ok:false}.
 	// A v159 drawable is reported as GTA V ENHANCED rather than silently misread.
@@ -1039,7 +1039,7 @@ public:
 	                             const FString& DestFolder);
 
 	// Export a UStaticMesh's collision directly to a binary FiveM .ybn (RSC7 v43) -
-	// CLEAN-ROOM, no CodeWalker. P5 step 2. Emits a phBoundComposite wrapping one
+	// CLEAN-ROOM. P5 step 2. Emits a phBoundComposite wrapping one
 	// phBoundGeometryBVH: quantized vertices, 16-byte triangles, u8 material indices,
 	// and a CONSTRUCTED stackless phOptimizedBvh (escape-index tree + the mandatory
 	// m_Trees subtree table: maximal <=127-node subtree ranges). Every phBound

@@ -8,7 +8,7 @@
 // coordinate does not fail at load - it time-bombs until the region streams in. Authoring them
 // in context, on the imported city, is the workflow RUDE uniquely has; seeing them is step one.
 //
-// Formats: QUARRY's meta2xml emits <CScenarioPointRegion> XML (LOG "SCENARIO REGION EMITTER":
+// Formats: ROUT's meta stage emits <CScenarioPointRegion> XML (LOG "SCENARIO REGION EMITTER":
 // 204/204 binaries convert, 5,534,470 leaf comparisons, FMT_BUG = 0). Nothing in RUDE consumed
 // it until now.
 #include "RudeToolset.h"
@@ -434,11 +434,11 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 	if (!World) { return Fail(TEXT("no editor world")); }
 
 	// ---- 1) LOCATE THE REGION FILE -------------------------------------------------------
-	// WHERE the emitter's output lands: meta2xml.convert() returns kind "ymt" and quarry's meta
+	// WHERE the emitter's output lands: the meta stage returns kind "ymt" and ROUT's meta
 	// pass writes "<stem>.<kind>.xml" beside the binary, which `resolve` then flattens into
 	// `_resolved/<kind>/`. So the corpus convention is <CorpusRoot>/ymt/<region>.ymt.xml -
 	// character-for-character the ytyp/ymap shape ImportMapArea already globs.
-	// ⭐ PIPELINE STAGE WIRED 2026-07-30: quarry.py's cmd_meta now loops ('ytyp','ymap','ymt'),
+	// ⭐ PIPELINE STAGE WIRED 2026-07-30: ROUT's meta stage loops ('ytyp','ymap','ymt'),
 	// so an extraction that passes --types ymt yields <slot>/ymt/<region>.ymt.xml with no hand
 	// conversion (PSO 'PSIN' manifests are counted-skipped there - a different container).
 	// ⚠ EXISTING filebases predate that and still have no ymt folder until re-extracted with
@@ -521,7 +521,7 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 		return Fail(FString::Printf(
 			TEXT("scenario region '%s' not found among %d *.ymt.xml under %s%s - run with an empty RegionName to list them. Leading names: %s"),
 			*Region, Found.Num(), *Dir,
-			Found.Num() == 0 ? TEXT(" (the corpus has no scenario XML yet: quarry's meta pass does not convert ymt)") : TEXT(""),
+			Found.Num() == 0 ? TEXT(" (the corpus has no scenario XML for it: the extractor did not convert this ymt)") : TEXT(""),
 			*FString::Join(Sample, TEXT(", "))));
 	}
 	const FString RegionStem = StemOf(RegionFile);

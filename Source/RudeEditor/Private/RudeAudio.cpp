@@ -3,8 +3,8 @@
 //
 // CLEAN-ROOM. The container laws below are measured on the game's own files (corpus chicken.awc.xml,
 // rapid_distant.awc.xml, halloween_2015.awc.xml + ROUT's population census; see
-// scratchpad/wp10/audio_passthrough/LAWS.md) and ported from ROUT's own awc_write.py / awc2xml.py
-// (house code, Matt's). No CodeWalker / Sollumz code was read.
+// maintainer lane `audio_passthrough` (`LAWS.md`)) and ported from ROUT's own awc_write.py / awc2xml.py
+// (house code, Matt's). Clean-room: no third-party exporter code was read.
 //
 // THE PLAINTEXT 'ADAT' CONTAINER (little-endian; ROUT round-trips 5,642/5,642 plaintext files byte-exact):
 //   +0x00 u32 magic 'ADAT'   +0x04 u16 version(1)   +0x06 u16 flags   +0x08 u32 streamCount   +0x0C u32 dataStart

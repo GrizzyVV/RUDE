@@ -5,14 +5,14 @@
 // .yft skeleton by rig index. This lane writes that container from USkeletalMesh assets (ImportPed's outputs,
 // or anything skinned to the same USkeleton) and parses it back.
 //
-// EVERYTHING BYTE-LEVEL HERE WAS MEASURED (scratchpad/wp11/ydd_writer/LAWS.md, denominators there):
+// EVERYTHING BYTE-LEVEL HERE WAS MEASURED (maintainer lane `ydd_writer` (`LAWS.md`), denominators there):
 //   container   3/3 game binaries + ROUT's 400/400: RSC7 v165, 0x40 header, ascending hash array, 8-byte entry
 //               pointers, 0xD0 records; entry +0x08 (blockmap) / +0x18 (skeleton) / +0xC8 (bound) raw NULL.
 //   skinned     52/52 XML models + 7/7 binary: grmModel +0x28 = rig bone count, +0x29 = 1, +0x2D = 1;
 //               grmGeometry +0x68 -> identity u16 bone-id table (56/56, ROUT 3,960/3,960), +0x72 = count;
 //               fvf mask 0x7F / stride 48 / 7 channels with the GTAV1 nibble constant (the game's own Med/Low
 //               layout and 16/28 High geometries); VB +0x0A = 0 in the game (the static writer's 0x59 is a
-//               CW-oracle residue - both load); BlendWeights sum to 255 on 27,808/27,808 + 17,223/17,223.
+//               reference-oracle residue - both load); BlendWeights sum to 255 on 27,808/27,808 + 17,223/17,223.
 //   shader      the `ped` template, identical in 12/12 XML + 3/3 binary shaders; +0x14 = 16*(13+8) = 336,
 //               +0x16 = 432 (allocation law roundup16(16*(npar+nvec)+4*npar+32), fitted 11/11), +0x24 = 5<<24.
 // NOT verified: an in-game load of a RUDE ydd (Matt's test). Unknowns are counted in the verdict, never
@@ -94,7 +94,7 @@ namespace RudeYdd
 	// skinned GTAV1 layout: Position(0) BlendWeights(1) BlendIndices(2) Normal(3) Colour0(4) Colour1(5) TexCoord0(6)
 	static const uint32 kSkinMask = 0x7F; static const int32 kSkinStride = 48; static const uint8 kSkinChans = 7;
 	// RUDE_PEDPROPS_BEGIN templates
-	// ---- ped props (WP11, scratchpad/wp11/pedprops/LAWS.md): the RIGID entry and the `ped_alpha` template ----
+	// ---- ped props (WP11, maintainer lane `pedprops` (`LAWS.md`)): the RIGID entry and the `ped_alpha` template ----
 	// The game's prop layout: Position(0) Normal(3) Colour0(4) Colour1(5) TexCoord0(6) TexCoord1(7) Tangent(14) ->
 	// mask 0x40F9, stride 64, 7 channels (2,674/2,677 prop geometries over 709 peds). The fvf nibble word is the same
 	// GTAV1 constant (channel 14 = type 7 = float4). Bytes: +0 pos | +12 nrm | +24 c0 | +28 c1 | +32 uv0 | +40 uv1 | +48 tan.
@@ -270,7 +270,7 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 
 	// ---- 1) the meshes and the rig (bone ORDER = the ped's yft order, as ImportPed built the USkeleton) ----
 	// RUDE_PEDPROPS: an entry is a USkeletalMesh (skinned - clothing) or a UStaticMesh (RIGID - a ped prop: hats /
-	// glasses / earpieces / watches; 977/977 game prop models are unskinned, scratchpad/wp11/pedprops/LAWS.md). The
+	// glasses / earpieces / watches; 977/977 game prop models are unskinned, maintainer lane `pedprops` (`LAWS.md`)). The
 	// rig is needed only when a skinned mesh is present.
 	TArray<USkeletalMesh*> Meshes;
 	TArray<UStaticMesh*> Statics;   // parallel to Meshes: exactly one of the two is non-null per entry

@@ -7,12 +7,15 @@ build with real level-editor tools, and write finished files straight back out t
 
 Free forever. No paywall, no premium tier, no strings. Ever. [Apache-2.0](LICENSE).
 
-> **Status: early alpha.** Import and export are both real and both proven — a
-> 100% RUDE-authored asset (binary `.ydr` + `.ytd` + `.ytyp`/`.ymap`) loads, renders and
-> collides in live FiveM Legacy, and on the way in, one call has built Downtown Los Santos
-> in an Unreal level (158 ymaps → 13,135 placed instances, 0 failures). It is young
-> software under heavy development, with sharp edges and honest gaps — both are listed
-> below, in the same table, on purpose.
+> **Status: alpha, whole surface present, most of it unconfirmed in the running game.** Import
+> and export are both real: a 100% RUDE-authored asset (binary `.ydr` + `.ytd`, XML `.ytyp`/`.ymap`)
+> loads, renders and collides in live FiveM Legacy, one call builds Downtown Los Santos in an
+> Unreal level (`BuildDistrictLevel`: 158 ymaps → 14,248 entities as editable actors, written
+> back byte-identical when untouched), and the rest of the game's content - interiors, scenarios,
+> paths, vehicles, peds, clothing, props, animations, cutscenes, timecycles, text, audio - has an
+> import and, where a writer exists, an export. **Most of that newer surface has been measured
+> against the game's own files but never yet confirmed in the running game.** The tables below
+> say which is which, on purpose.
 
 ---
 
@@ -31,8 +34,8 @@ Two things surprise people coming from a Blender-based mapping workflow:
   decryption code in it, and never will — see [Why RUDE reads a folder](#why-rude-reads-a-folder-and-not-your-game-archives).
   Getting the assets out is a **separate step with a separate tool**.
 - **RUDE reads the plain-text XML form of RAGE assets** (`prop_x.ydr.xml`), not the packed
-  binaries — on the way *in*. On the way *out* it writes the real packed binaries the game
-  loads directly.
+  binaries — on the way *in*. On the way *out* it writes packed binaries for models, textures,
+  collision and clothing, and the XML form FiveM Legacy loads for placement and definition files.
 
 ## What you still cannot do — read before you download
 
@@ -40,11 +43,12 @@ Being straight about this is more useful than a feature list.
 
 | | |
 |---|---|
-| ⛔ **You cannot go from a fresh game install to a working project with RUDE alone.** | RUDE needs a *filebase* — a folder of extracted assets. It does not produce one and ships no tool that does. You supply it. |
-| 🔴 **We do not yet publish an extractor you can download.** | Its companion tool, QUARRY, does this job, but **QUARRY has no public release** — how it gets distributed is an unsolved product question, not a finished thing we are hiding. Until then RUDE works with a folder produced by **any** extractor you already own, as long as the folder matches [the contract](#the-folder-contract). |
+| ⛔ **You cannot go from a fresh game install to a working project with RUDE alone.** | RUDE needs a *filebase* — a folder of extracted assets in a documented shape. It does not produce one and ships no code that reads a game archive. You run an extractor yourself. |
+| 🟡 **The extractor is a separate, public tool.** | The maintainer's own extractor, [ROUT](https://github.com/GrizzyVV/ROUT---RAGE-Exporter-App), writes exactly the filebase RUDE reads (see [the folder contract](#the-folder-contract)). Any other tool that produces that shape works too; RUDE never asks which one wrote it. Getting the assets out is still the longest part of day one. |
 | 🔴 **`ImportArea "Downtown"` needs a district catalog that is not in this repo yet.** | The named-district lane reads a JSON catalog of ymap prefixes. It is not published. Use `ImportMapArea` with a raw filename prefix in the meantime — same code path underneath. |
-| 🔴 **No importer for standalone collision (`.ybn`), scenarios, water, timecycles, navmesh, particles or audio.** | Map geometry, textures, placements and interiors import. Everything else in a ymap's orbit does not. |
-| 🔴 **No export path for interiors (MLO) or fragments (`.yft`).** | You can *read* an interior into Unreal. You cannot yet write one back out — the binary metadata writer does not exist. |
+| ❓ **Everything newer than the map lane is measured, not yet played.** | Interiors, scenarios, paths, vehicles, peds, clothing, props, animations, cutscenes, timecycles, text and audio all import; their exports are checked byte-for-byte or field-by-field against the game's own files, and some XML-form outputs (`.ymt`, `.ynd`, `.ytyp` interiors) have **not** yet been streamed by FiveM to prove the game accepts that form. The tables below mark every such row ❓. |
+| 🔴 **No fragment (`.yft`) writer, no ped-variation table writer, no navmesh, water or particle lanes.** | Vehicles import and drive in the editor sandbox but cannot be written back as new vehicles; new clothing goes into the game by *replacing* a ped's own dictionary, not by adding a variation row. |
+| ◑ **Game audio: only plain PCM tracks import.** | `ImportAwc` imports PCM tracks and counts ADPCM and encrypted ones honestly; the game's own banks are encrypted per chunk, so no game sound has been imported yet. Your **own** sounds export to the game's format. |
 | ⛔ **`.ysc` compiled game scripts are permanently out of scope.** | Not a gap. A decision. |
 | ⛔ **RUDE will never ship Rockstar assets.** | It is machinery. Everything it converts comes from *your* legally-owned GTA V install, on *your* machine, and goes back into GTA V via FiveM. There is no game data in this repository and there never will be. |
 
@@ -55,11 +59,12 @@ Being straight about this is more useful than a feature list.
 | | |
 |---|---|
 | **Unreal Engine** | **5.8**, Windows. RUDE is built and tested only against 5.8, and depends on the `ToolsetRegistry` plugin that ships with it. No other version is supported. |
-| **Visual Studio** | Only if you are building RUDE from source (see [INSTALL.md](INSTALL.md)). A precompiled release needs none. |
+| **Visual Studio** | Needed today: RUDE is built from source (see [INSTALL.md](INSTALL.md)). A precompiled release, when one exists, will need none. |
 | **A GTA V installation** | Yours. RUDE never reads it directly, but it is where your filebase comes from. |
-| **An extractor** | Any tool that can produce the XML form of `.ydr`/`.ydd`/`.yft`/`.ytd`/`.ytyp`/`.ymap`. Not supplied by RUDE. |
+| **An extractor** | [ROUT](https://github.com/GrizzyVV/ROUT---RAGE-Exporter-App) (public, the maintainer's own), or any tool that writes the filebase shape in [the folder contract](#the-folder-contract). Not part of RUDE. |
 | **Engine plugin: `ToolsetRegistry`** | Ships with 5.8 as Experimental. RUDE declares it as a dependency, so enabling RUDE enables it. |
 | **Engine plugin: `ModelContextProtocol`** | **Only** if you want AI agents to drive RUDE. Humans and scripts do not need it. |
+| **Engine plugin: `ChaosVehiclesPlugin`** | Ships with the engine; RUDE declares it for the editor test-drive (`BuildDriveable`). Enabling RUDE enables it. |
 | **Cfx Alchemist** | **Only** for FiveM **Enhanced**. RUDE writes Legacy; Alchemist converts Legacy → Enhanced. Run it as a separate step. |
 
 **Install:** see [INSTALL.md](INSTALL.md). It is a separate file because installing a
@@ -72,46 +77,47 @@ source) and a first-time Unreal user needs the long version, not three lines.
 
 This is the acceptance test RUDE is built against. Each step says plainly where it stands.
 
-### 1 · Get the tools — 🟡 partly solved
+### 1 · Get the tools — 🟡 clone and build; releases follow
 
-Download a RUDE release and put it in your project. That part is real and documented.
-**You will also need an extractor to fill a filebase, and we do not publish one yet.**
-That is the honest state of step 1 and the largest open problem in the product.
+There is no precompiled RUDE release yet: clone this repository and build it into your project
+([INSTALL.md](INSTALL.md), route B - four lines once Visual Studio is installed). Then get an
+extractor: the maintainer's, [ROUT](https://github.com/GrizzyVV/ROUT---RAGE-Exporter-App), is
+public and writes the filebase RUDE reads. It is a separate program with its own README; RUDE
+contains none of it and none of its key material.
 
-### 2 · Prepare a project folder from your game files — 🟡 you supply the extractor
+### 2 · Prepare a filebase from your game files — 🟡 you run the extractor
 
-RUDE gives you the *shape* of the folder and files things into it; it does not fill it.
+Run the extractor against your own install. It writes a **filebase**: a load-order tree
+(`00_base/`, `10_update/`, `20_dlc/NNN_<pack>/`) of one XML per asset plus two ledgers at the
+root, and, when asked, the texture pixels beside each dictionary. That root is what every RUDE
+importer takes as `CorpusRoot`. The shape is documented in [the folder contract](#the-folder-contract)
+so that any other extractor can produce it.
 
-```
-CreateFilebase(FilebaseRoot, GameRoot, "CORE")
-```
+The whole game is large (hundreds of gigabytes as XML with pixels) and you do not need all of
+it: an extractor that can target a district, a vehicle or a ped by name gets you working in
+minutes. Texture pixels are optional per dictionary - a dictionary exported without them
+imports as names only, and RUDE says so in its verdict.
 
-seeds a load-order-aware tree matched to *your* install. It reads **directory names only** —
-it opens no archive and decrypts nothing. Then, for each source you extract:
-
-```
-IngestExport(DumpFolder, SourceName, FilebaseRoot, "MOVE")
-```
-
-files a flat dump into the right slot by type, so you never sort anything by hand.
-`SourceName` is `base`, `update`, or a DLC pack name such as `mpbiker`.
-
-⚠ **The importers do not read that tree directly.** They read a *flat* view of it — see
-[the folder contract](#the-folder-contract). Flattening means resolving load order (the same
-asset name exists in the base game, in `update.rpf` and in several DLC packs, and the last
-one wins). Whatever produces your filebase should also produce that flat view.
+`CreateFilebase` and `IngestExport` are still here for a filebase assembled by hand from
+several dumps (they read directory names only and open no archive), but with a ledger-writing
+extractor you do not need them.
 
 ### 3 · Open it in Unreal, in context — ✅ works
 
 ```
-ImportMapArea(CorpusRoot, "dt1_", "/Game/RUDE/Meshes", "HD")
+ImportMapArea(CorpusRoot, "dt1_", "/Game/RUDE/Meshes", "HD", "ACTORS")
 ```
 
 One call walks every archetype definition, parses the matching placement files, imports every
-model they reference, and spawns the area into your open level as instanced meshes. Textures
-come in with `ImportYtdBatch`. Interiors come in with `ImportMlo`.
+model they reference, and spawns the area into your open level - with `Mode = "ACTORS"` as one
+editable actor per entity, which is the form every export lane reads; leave `Mode` empty for
+fast, view-only instanced meshes. Textures are a separate pass: `ImportYtdBatch` on the
+dictionaries the area names (they resolve through the game's own parent-dictionary tables), then
+`ImportYdrBatch` with `FORCE` to rebind. For a whole district as a World Partition level with
+run-time layers per ymap, use `BuildDistrictLevel` instead. Interiors come in with `ImportMlo`,
+every prop as its own editable actor.
 
-*Measured 2026-07-28:* Downtown Los Santos — 158 placement files, **13,135 instances placed,
+*Measured 2026-07-28 (`ImportMapArea`, instanced mode):* Downtown Los Santos — 158 placement files, **13,135 instances placed,
 17 unresolved proxies, 0 failures** — rendered and textured, seen on screen, not inferred
 from a success code.
 
@@ -125,7 +131,13 @@ Author in Unreal like it is Unreal. Then:
 | its textures | `ExportYtdBinary(TextureSpecs, "out/stream/prop_x.ytd", "0")` |
 | standalone / world collision | `ExportYbnBinary(AssetPath, "out/stream/x.ybn", WorldOffset)` |
 | the definitions that tell the game what those models are | `ExportYtyp(YdrSpecs, "my_map", "out/stream/my_map.ytyp")` |
-| a complete, drop-in FiveM resource | `ExportYmap(EntitiesJsonPath, "my_map", "out/")` |
+| a complete, drop-in FiveM resource for new placements | `ExportYmap(EntitiesJsonPath, "my_map", "out/")` |
+| the district you edited, written back into the game's own ymaps (untouched entities byte-identical) | `ExportLevelYmaps(OutDir, YmapFilter, CorpusRoot, NewEntitiesYmap)` |
+| an interior you edited, written back into its ytyp | `ExportMloYtyp(OutDir, MloArchetypeName, CorpusRoot)` |
+| a ped's clothing and props as a resource that replaces the game's own files | `ExportPedReplace(OutfitAssetPath /* or just the ped name */, OutDir, Options)` |
+| an edited texture dictionary as a replace resource | `ExportTxdReplace(DictName, OutDir, MaxDim)` |
+
+Trailing parameters may be omitted on every surface; the tool sees them as empty strings.
 
 `ExportYmap` writes `stream/<name>.ymap` **and** an `fxmanifest.lua` containing the required
 `this_is_a_map 'yes'` — without that line FiveM loads your resource and silently does nothing.
@@ -146,39 +158,45 @@ returns a JSON string with an `ok` field; failures are loud and say why.
 
 ## The folder contract
 
-RUDE's importers read a **flat corpus**: one file per asset name, extensions doubled
-(`<name>.<type>.xml`), no load-order slots. Point `CorpusRoot` at a folder shaped like this:
+RUDE's importers read a **filebase**: a staging tree cut from your game files by an extractor you
+run yourself, kept in load order, described by two ledgers at its root. Point `CorpusRoot` at
+that root:
 
 ```
 <CorpusRoot>/
-  ytyp/<anything>.xml          archetype definitions — RUDE indexes every file here
-  ymap/<prefix>*.xml           placements — ImportMapArea globs these by prefix
-  ydr/<assetname>.ydr.xml      one drawable per file
-  yft/<assetname>.yft.xml      one fragment per file
-  ydd/<dictname>.ydd.xml       a dictionary — RUDE picks the entry it needs by name
-  ytd/<txdname>.ytd.xml        a texture dictionary
-  ytd/<txdname>/*.png          its decoded pixels, in a folder beside the XML
+  _FILEBASE.json                 which install it was cut from, the slot precedence, a build fingerprint
+  _PROVENANCE.jsonl              one line per exported file: slot, in-archive path, type, name, sha1
+  00_base/<archive path>/<name>.<type>.xml      the base game, one XML per asset, path mirrors the archive
+  10_update/<archive path>/...                  the title update
+  20_dlc/NNN_<pack>/<archive path>/...          each DLC pack, numbered in load order
+  .../<txdname>/<texture>.dds                   a texture dictionary's pixels, in a folder beside its XML
 ```
 
 Rules, stated so any extractor can satisfy them:
 
-- **Any producer.** RUDE cares about the shape of this folder and nothing else. It does not
-  know or ask which tool wrote it, and it must stay that way.
-- **Flat and already resolved.** RUDE walks no precedence. If the same asset name exists in
-  several sources, the *one* file present here must already be the winning copy — otherwise
-  you are authoring against the wrong build and it fails silently, which is the worst way to
-  fail. Load order is the extractor's job because the extractor is what can read it.
+- **Any producer.** RUDE cares about the shape of this tree and its two ledgers, and nothing
+  else. It does not know or ask which tool wrote it. The maintainer's own extractor is public and
+  writes exactly this shape; anything else that does is equally welcome.
+- **Load order is resolved by RUDE, from the ledger.** Every copy of an asset across base, update
+  and DLC slots stays on disk; RUDE picks the copy the game would load (highest slot wins, ties
+  broken by path so the answer is machine-independent). In the ped and vehicle lanes a texture
+  dictionary copy that carries its pixel folder wins over a higher-slot copy without one - an
+  extractor may export pixels for only part of the game, and that must not blank a texture the
+  base game has. The prop lane imports the dictionary path you list.
+- **The metadata joins need the ledger.** Vehicles (`vehicles.meta`, `handling.meta`,
+  `carvariations`), peds (`<ped>.ymt`), texture-parent tables (`gtxd`) and the vehicle
+  texture-sharing table are found by content through the ledger, across every copy. A flat folder
+  cannot answer those questions.
+- **Without the ledgers, only the by-name lanes fall back to a flat folder.** `ImportPed`,
+  `ImportVehicle` (the v1 single-fragment lane), `ImportScenarioRegion` and `ImportClipDictionary`
+  accept `<CorpusRoot>/<name>.<type>.xml` files beside each other when the two ledgers are absent -
+  one file per name, already the winning copy, pixels in a sibling folder named for the XML's stem
+  (DDS or PNG). The single-file tools (`ImportYdr`, `ImportYtd`, `ImportYddEntry`) take an XML path
+  directly and never see `CorpusRoot`. Every map, interior and vehicle-composite lane needs the
+  ledgers and says so when they are missing.
 - **Names are lowercase asset names**, matching the drawable name the `.ytyp` refers to.
-- **Texture pixels are a sibling folder** named for the XML's stem. `ImportYtdBatch` derives
-  that path rather than taking it as an argument, so the pair cannot be mismatched.
-- **`_FILEBASE.json`** at the staging root records which install the folder was cut from,
-  the precedence order, and a build fingerprint — so a project can notice it is being fed a
-  different game build than it was authored against.
-
-The staging tree that `CreateFilebase` seeds is a *different* shape — `00_base/`,
-`10_update/`, `20_dlc/NNN_<name>/`, each with type subfolders. That tree preserves load
-order; the flat corpus is the resolved view of it. **Do not point `CorpusRoot` at the
-staging root** — the importers will find nothing and say so.
+- **Texture pixels are a sibling folder** named for the XML's stem. `ImportYtdBatch` derives that
+  path; `ImportYtd` derives it when `PixelFolder` is left empty, so the pair cannot be mismatched.
 
 ## Why RUDE reads a folder and not your game archives
 
@@ -199,7 +217,11 @@ producing one is currently the hardest part of getting started.
 ## Capability and limits — what actually works today
 
 Everything marked ✅ has been loaded by the real game or the real editor and looked at by a
-human. ◑ means it works within a stated boundary. 🔴 means it does not exist.
+human. ◑ means it works within a stated boundary. **❓ means the output was measured against
+the game's own files (byte-identical where a writer exists, field-by-field otherwise) but has
+not yet been confirmed in the running game.** 🔴 means it does not exist. The authoritative,
+per-tool list with every gate's numbers is [AGENTS.md](AGENTS.md) §3; the compiled tool
+surface is `RudeToolset.h`.
 
 ### Import — game files into Unreal
 
@@ -207,32 +229,44 @@ human. ◑ means it works within a stated boundary. 🔴 means it does not exist
 |---|---|---|
 | Model (`.ydr`) → `StaticMesh`, materials, textures bound by name, walkable collision | `ImportYdr`, `ImportYdrBatch` | ✅ |
 | One model out of a dictionary (`.ydd`) | `ImportYddEntry` | ✅ |
-| Fragment (`.yft`) → its **main visual mesh** | via the area importers | ◑ visual drawable only — no breakable pieces, no cloth, no child parts |
-| Texture dictionary (`.ytd`) → `Texture2D` with correct normal/spec/sRGB handling | `ImportYtd`, `ImportYtdBatch` | ✅ needs decoded PNGs beside the XML |
-| A whole map area: archetypes → placements → models → spawned in your level | `ImportMapArea` | ✅ 13,135 instances / 0 failures, measured |
-| The same, by human district name | `ImportArea` | ◑ code works; **the district catalog is not published yet** |
-| Re-place an area you already imported, without re-importing models | `ImportScene` | ✅ |
-| Interior (MLO): rooms, props and lights | `ImportMlo` | ◑ v1 — spawns at the world origin; portals and entity sets are summarised, not spawned; several light fields are deliberately unmapped and listed in the tool's own docs |
-| Seed / fill a filebase | `CreateFilebase`, `IngestExport` | ✅ directory names only; no archive is opened |
-| Inspect a binary `.ydr` without importing it | `ProbeYdrBinary` | ✅ diagnostic JSON |
-| Standalone collision (`.ybn`) | — | 🔴 no importer |
-| Scenarios · water · timecycle · navmesh · particles · audio occlusion | — | 🔴 none |
-| Vehicles · peds · clothing as *systems* | — | 🔴 none |
+| Fragment (`.yft`) → its main visual mesh | via the area importers | ◑ visual drawable only |
+| Texture dictionary (`.ytd`) → `Texture2D` with normal/spec/sRGB handling | `ImportYtd`, `ImportYtdBatch` | ✅ needs pixels beside the XML (DDS or PNG) |
+| A whole map area: archetypes → placements → models → **one editable actor per entity**, LOD lineage, lights, time-of-day flags, script-controlled maps | `ImportMapArea`, `ImportArea`, `ImportScene` | ✅ Downtown: 158 ymaps, 14,248 entities |
+| Interior (MLO): rooms, every prop as its own actor, entity sets, lights (portal data carried, not spawned) | `ImportMlo`, `SetEntitySet` | ✅ in editor · ❓ sets in-game |
+| Car generators (parking spawns) as markers | `ImportCarGenerators`, `MoveCarGenerator` | ❓ |
+| Scenario regions (ambient life) as editable points | `ImportScenarioRegion` | ❓ |
+| Vehicle and footpath node graphs (`.ynd`) | `ImportPaths`, `MovePathNode` | ❓ |
+| Vehicles as composites: 5 LODs, every part at its bone, handling and colours joined by the game's own tables, liveries, shared interior textures | `ImportVehicleComposite`, `SetVehicleLivery` | ✅ in editor · ❓ never driven in-game |
+| A drivable version of an imported vehicle (Chaos) for the editor sandbox | `BuildDriveable` | ❓ built, never played |
+| Peds: skeleton, skinned parts, the variation matrix, outfits, props (hats, glasses) | `ImportPed`, `SetPedOutfit`, `SetPedProp` | ✅ in editor · ❓ prop attach frame |
+| Animations (`.ycd`) → `AnimSequence`, cutscenes → Level Sequence | `ImportClipDictionary`, `ImportCutscene` | ❓ axis conventions |
+| Timecycles, game text (`.gxt2`), blip catalog | `ImportTimecycles`, `ImportText`, `BuildBlipCatalog` | ❓ |
+| Seed / fill a filebase by hand | `CreateFilebase`, `IngestExport` | ✅ directory names only |
+| Inspect a binary `.ydr` / `.ydd` / a mesh's materials without importing | `ProbeYdrBinary`, `ProbeYddBinary`, `InspectMesh` | ✅ diagnostic JSON |
+| Standalone collision (`.ybn`) as an import | — | 🔴 |
+| Game audio (`.awc`) | `ImportAwc` | ◑ plain PCM tracks import; ADPCM and encrypted tracks are counted and skipped - no game sound imported yet |
+| Navmesh · water | `DebugDrawNavmesh`, `SpawnSeaLevel` | ◑ view-only aids; no authoring lane |
+| Particles and the game's remaining file types | `CatalogLane` | ◑ carried through as a catalogued passthrough, not edited |
 
 ### Export — Unreal back out to FiveM
 
 | Capability | Tool | State |
 |---|---|---|
-| `StaticMesh` → binary `.ydr` the game loads directly, collision embedded | `ExportYdrBinary` | ✅ **proven in live FiveM Legacy** — renders, textures, collides |
+| `StaticMesh` → binary `.ydr` the game loads directly, collision embedded | `ExportYdrBinary` | ✅ **proven in live FiveM Legacy** |
 | `Texture2D`(s) → binary `.ytd` with real BC compression and mip chains | `ExportYtdBinary` | ✅ proven in-game |
-| Collision → binary `.ybn`, optionally placed in absolute world coordinates | `ExportYbnBinary` | ✅ proven in-game |
-| Archetype definitions → `.ytyp`, with the in-game-proven collision flag model | `ExportYtyp` | ✅ |
-| Placements → a complete resource: `stream/<name>.ymap` + `fxmanifest.lua` | `ExportYmap` | ✅ |
-| Model / collision → the editable XML form | `ExportYdr`, `ExportYbn` | ✅ |
-| Texture → PNG | `ExportTexture` | ✅ |
-| Interior (MLO) → `.ytyp` | — | 🔴 the binary metadata writer does not exist |
-| Fragment (`.yft`) | — | 🔴 |
-| FiveM **Enhanced** | — | ◑ export Legacy, then convert with Cfx Alchemist. Enhanced never loads XML-form assets, so Legacy binaries first, always. |
+| Collision → binary `.ybn` | `ExportYbnBinary` | ✅ proven in-game |
+| Archetype definitions → `.ytyp` | `ExportYtyp`, `ExportPaletteYtyps` | ✅ `ExportYtyp` proven in-game · ❓ `ExportPaletteYtyps` byte-identical on 73/73 untouched, not yet streamed |
+| New placements → a complete resource (`stream/<name>.ymap` + `fxmanifest.lua`) | `ExportYmap` | ✅ |
+| **The map you edited, back into the game's own ymaps** — untouched entities byte-identical, moved ones re-spelled, LOD lineage, lights and car generators written back | `ExportLevelYmaps` | ✅ byte-identical on 148/148 untouched · ❓ an edited district ymap has not yet been streamed in-game |
+| Rebuilt LOD models and distant-light bakes | `MakeLodArchetype`, `RebuildLodChunk`, `RebakeLodLights` | ❓ |
+| Interior (MLO) you edited → its `.ytyp` (byte-safe splice) | `ExportMloYtyp` | ❓ XML-form ytyp acceptance |
+| Scenario region / path cell you edited → `.ymt` / `.ynd` (byte-safe) | `ExportScenarioRegion`, `ExportPaths` | ❓ XML-form acceptance |
+| Skinned clothing → binary `.ydd`; a ped's whole outfit + props + textures as a replace resource | `ExportYddBinary`, `ExportPedReplace` | ❓ never loaded in-game |
+| A texture dictionary → replace resource | `ExportTxdReplace` | ❓ |
+| Timecycles / text / your own sounds | `ExportTimecycles`, `ExportText`, `ExportAwc` | ❓ registration in-game |
+| Model / collision → the editable XML form; texture → PNG | `ExportYdr`, `ExportYbn`, `ExportTexture` | ✅ interchange and inspection output (the XML form itself is not game-loadable) |
+| Fragment (`.yft`) — a new vehicle or breakable | — | 🔴 |
+| FiveM **Enhanced** | — | ◑ export Legacy, then convert with Cfx Alchemist. Enhanced never loads XML-form assets. |
 
 ### Conventions worth knowing before you drive anything
 

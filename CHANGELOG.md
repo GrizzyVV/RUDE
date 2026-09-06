@@ -15,7 +15,60 @@ looked at it. Anything marked **measured** carries the number it was measured at
 
 ## [Unreleased]
 
-Nothing yet.
+Everything after the 0.2.0 draft, 2026-07-31 → 2026-09-06. The tool surface went from **24
+tools to 90**; the authoritative per-tool list with each gate's numbers is `AGENTS.md` §3.
+Nothing below is **proven in-game** unless it says so; **measured** means checked against the
+game's own files (byte-identical where a writer exists, field-by-field otherwise) on the
+maintainer's filebase and never yet loaded by the running game.
+
+### Added
+- **Map lane, complete round trip:** every placed entity is its own editable actor with its
+  source bytes; `ExportLevelYmaps` writes edited districts back into the game's own ymaps -
+  untouched entities byte-identical (measured 148/148 on Downtown), moved ones re-spelled,
+  LOD lineage (`SetLodParent`, `LodAudit`), entity lights (`SetLightField`), car generators
+  (`ImportCarGenerators`, `MoveCarGenerator`) and script-controlled maps (`SetYmapVisible`)
+  written back. World Partition district build (`BuildDistrictLevel`), archetype palette and its
+  readback (`ExportPaletteYtyps`), `SetLodView`, `SetWorldHour`, `PickAt`, `InspectMesh`.
+- **Bake loop:** `MakeLodArchetype`, `RebuildLodChunk` (needs `-AllowCommandletRendering`),
+  `RebakeLodLights` (measured; the distant-light hash is unconfirmed).
+- **Interiors:** `ImportMlo` spawns every prop as its own actor with entity sets and lights;
+  `SetEntitySet`; `ExportMloYtyp` writes the interior back by byte-safe splice (measured:
+  clean export identical, one nudge = one line); `MoveMloEntity`.
+- **Living world:** scenario regions (`ImportScenarioRegion`, `MoveScenarioPoint`,
+  `ExportScenarioRegion`), path graphs (`ImportPaths`, `MovePathNode`, `ExportPaths`) - both
+  byte-safe, both measured, both XML-form outputs whose acceptance by FiveM is unconfirmed.
+- **Vehicles:** `ImportVehicleComposite` (5 LODs, parts at their bones, handling and colours
+  joined through the game's own tables, liveries, shared interior textures through the
+  game's texture-parent table), `SetVehicleLivery`, `BuildDriveable` (a Chaos test-drive for
+  the editor sandbox - built, never driven), `EmitNativeSnippet`.
+- **Peds and clothing:** `ImportPed` (skeleton, skinned parts, the variation matrix, outfits,
+  props), `SetPedOutfit`, `SetPedProp`, `ExportYddBinary` / `ProbeYddBinary` (skinned and
+  rigid entries; measured against the corpus entry by entry), `ExportPedReplace` and
+  `ExportTxdReplace` (replace resources: the game's own file names, no variation-table
+  writer needed).
+- **Motion, story, sound, config:** `ImportClipDictionary`, `ImportCutscene`,
+  `ImportTimecycles` / `ExportTimecycles`, `ImportText` / `ExportText`, `BuildBlipCatalog`,
+  `ImportAwc` (counts the game's encrypted banks honestly) / `ExportAwc` (your own sounds),
+  `CatalogLane` (passthrough catalogs of the game's remaining file types), `DebugDrawNavmesh` (view-only).
+- **Editor sandbox (PIE):** `SandboxSetup`, a walkable pawn, `Rude.Native` console words that
+  mirror FiveM natives (map toggles, clock, interiors, cutscenes, entering a vehicle).
+- **Corpus:** RUDE reads a ledgered filebase (load-order slots + `_FILEBASE.json` /
+  `_PROVENANCE.jsonl`) through `FRudeCorpus`; the flat folder remains a fallback for the
+  single-file lanes.
+
+### Changed
+- Texture dictionaries resolve through the game's own tables (`gtxd` parents for props,
+  `vehicles.meta` texture relationships for vehicles) and prefer a corpus copy that carries
+  its pixels over a higher-slot copy without them.
+- `ImportYtd` edits an existing texture in place (loads it from disk first) and leaves an
+  unchanged one untouched.
+- Ped part material instances are keyed per ped (`<ped>__<entry>`), not per entry name.
+
+### Fixed
+- Saving after a re-import no longer fails with "invalid payload" on textures that existed on
+  disk (two objects had claimed one package).
+- Car-generator and entity readback keep the file's own float spelling on unchanged values.
+
 
 ---
 

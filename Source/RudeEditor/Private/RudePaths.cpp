@@ -1,7 +1,7 @@
 // RUDE - RAGE <-> Unreal Development Environment
 // Vehicle paths (ynd): one path cell as node actors + link splines, and the byte-safe splice back out.
 // Every constant below was measured 2026-09-06 over five cells of the corpus (nodes464 = downtown, its
-// neighbours 432 / 465 / 496, and the 8-node coastal cell 184): scratchpad/wp10/paths/LAWS.md.
+// neighbours 432 / 465 / 496, and the 8-node coastal cell 184): maintainer lane `paths` (`LAWS.md.`)
 // Helper names carry the "RudePaths" prefix on purpose: this file may share a unity-build blob with
 // RudeLevelTools.cpp, whose own file-static RudeNum / RudeRawItems would otherwise collide.
 #include "RudeToolset.h"
