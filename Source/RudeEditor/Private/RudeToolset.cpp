@@ -300,6 +300,7 @@ struct FRudeMasterSpec
 {
 	bool bNormal = false, bSpec = false, bDetail = false, bTint = false;
 	bool bEmissive = false;
+	bool bLivery = false;                   // a second diffuse (vehicle_paint*'s DiffuseSampler2: the livery) over the base
 	int32 Bucket = 0;                       // 0 opaque - 1 alpha - 2 decal - 3 cutout
 
 	FString Key() const                     // stable, readable asset name
@@ -310,6 +311,7 @@ struct FRudeMasterSpec
 		if (bDetail) { K += TEXT("Dt"); }
 		if (bTint)   { K += TEXT("T"); }
 		if (bEmissive) { K += TEXT("E"); }
+		if (bLivery) { K += TEXT("L"); }
 		return FString::Printf(TEXT("M_RUDE_%s_b%d"), *K, Bucket);
 	}
 };
@@ -428,6 +430,21 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 		UMaterialExpressionMultiply* Mul = NewObject<UMaterialExpressionMultiply>(M);
 		Mul->A.Expression = BaseColor; Mul->B.Expression = Gain; Add(Mul, -170, -60);
 		BaseColor = Mul;
+	}
+
+	if (Spec.bLivery)
+	{
+		// The livery: a second diffuse whose alpha masks it over the base colour (vehicle_paint3's
+		// DiffuseSampler2, measured on burrito 2026-09-06). LiveryAmount defaults to 0 so a master
+		// without a bound livery renders exactly as before; the MI sets it to 1 when Diffuse2 binds.
+		UMaterialExpressionTextureSampleParameter2D* Liv = MakeTex(TEXT("Diffuse2"), DefWhite, SAMPLERTYPE_Color, -700);
+		UMaterialExpressionScalarParameter* LivAmt = MakeScalar(TEXT("LiveryAmount"), 0.f, -760);
+		UMaterialExpressionMultiply* Mask = NewObject<UMaterialExpressionMultiply>(M);
+		Mask->A.Expression = Liv; Mask->A.OutputIndex = 4;   // the alpha output of the sample
+		Mask->B.Expression = LivAmt; Add(Mask, -420, -700);
+		UMaterialExpressionLinearInterpolate* Lerp = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Lerp->A.Expression = BaseColor; Lerp->B.Expression = Liv; Lerp->Alpha.Expression = Mask; Add(Lerp, -170, -640);
+		BaseColor = Lerp;
 	}
 
 	if (Spec.bTint)
@@ -2916,6 +2933,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 			else if (S.StartsWith(TEXT("Spec"), ESearchCase::IgnoreCase))     { Spec.bSpec = true; }
 			else if (S.StartsWith(TEXT("Detail"), ESearchCase::IgnoreCase))   { Spec.bDetail = true; }
 			else if (S.StartsWith(TEXT("TintPalette"), ESearchCase::IgnoreCase)) { Spec.bTint = true; }
+			else if (S.Equals(TEXT("DiffuseSampler2"), ESearchCase::IgnoreCase)) { Spec.bLivery = true; }
 		}
 		// The preset name still tells us a surface EMITS; when it emits is archetype data
 		// (timeFlags), not shader data - see the comment in EnsureGeneratedMaster.
@@ -3181,6 +3199,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 	// (fur shells), hash_* (runtime-bound, carry no texture).
 	static const TPair<const TCHAR*, const TCHAR*> GSamplerBinds[] = {
 		{ TEXT("DiffuseSampler"),     TEXT("Diffuse")     },
+		{ TEXT("DiffuseSampler2"),    TEXT("Diffuse2")    },  // the livery (vehicle_paint*): masters with the L flag
 		{ TEXT("BumpSampler"),        TEXT("Normal")      },
 		{ TEXT("SpecSampler"),        TEXT("Specular")    },
 		{ TEXT("TextureSamp"),        TEXT("Diffuse")     },  // cable's albedo: 152/152 resolve
@@ -3342,6 +3361,10 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 						continue;
 					}
 					BindTex(Param, Tex.Value);
+					if (FCString::Stricmp(Param, TEXT("Diffuse2")) == 0)
+					{
+						MIC->SetScalarParameterValueEditorOnly(FMaterialParameterInfo(TEXT("LiveryAmount")), 1.f);
+					}
 				}
 
 				// A decal whose texture isn't in the corpus must render as NOTHING, not as
@@ -4006,6 +4029,7 @@ FString URudeToolset::RegenerateMasters()
 			else if (Rest.StartsWith(TEXT("S"))) { Spec.bSpec = true; Rest = Rest.Mid(1); }
 			else if (Rest.StartsWith(TEXT("T"))) { Spec.bTint = true; Rest = Rest.Mid(1); }
 			else if (Rest.StartsWith(TEXT("E"))) { Spec.bEmissive = true; Rest = Rest.Mid(1); }
+			else if (Rest.StartsWith(TEXT("L"))) { Spec.bLivery = true; Rest = Rest.Mid(1); }
 			else { break; }
 		}
 		if (!Rest.IsEmpty() || Spec.Key() != N) { ++Unparsed; continue; }

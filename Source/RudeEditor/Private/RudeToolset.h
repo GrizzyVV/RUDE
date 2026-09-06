@@ -458,6 +458,34 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V cutscene into Unreal as a Level Sequence with its camera moves and cuts, plus a data asset listing every event."))
 	static FString ImportCutscene(const FString& CorpusRoot, const FString& CutName, const FString& DestFolder);
 
+	// Vehicle composite (GDD Tier 2). One actor: the body drawable as a Static Mesh whose LOD0 is the
+	// _hi fragment's DrawableModelsHigh and LOD1..4 the base fragment's High/Medium/Low/VeryLow (the
+	// detail toggle = LOD); a named component per <Physics><LOD1> child at its bone's model-space frame
+	// (Child_NN_<group>; bone frames composed up the parent chain, GTA->UE (x,-y,z) cm + plain
+	// quaternion mirror); the wheel child's mesh at every wheel_* bone (mirrored across local X for the
+	// other side); collision from <Archetype><Bounds> grafted onto the LOD0 drawable; a URudeVehicle
+	// DataAsset (<DestFolder>/<veh>/<veh>_vehicle) with vehicles.meta -> handlingId -> handling.meta ->
+	// carvariations (meta or PSO, hash tags resolved by joaat) flattened by field name as spelled plus
+	// each row's re-spelled item XML, the livery list (<veh>_sign_<n> in <veh>.ytd / <veh>+hi.ytd, flags
+	// from carvariations colors/Item/liveries) and the child/bone/bound table. Every drawable goes
+	// through ImportDrawableNode from a re-spelled self-contained <Drawable> buffer (a child has no
+	// ShaderGroup of its own; its ShaderIndex indexes the fragment's). Measured on blista / taxi /
+	// burrito 2026-09-06 (scratchpad/wp10/vehicles/LAWS.md): doors/bonnet/boot are skinned parts of the
+	// main drawable, only wheel_lf carries child geometry. Verdict: bones, children, childComponents,
+	// wheelBones/wheelsPlaced, lodCount/lodSources, liveries, boundTypes, field counts, missing[] (capped,
+	// total beside it); ok is COMPUTED (every child placed, wheels where the skeleton has them, no LOD failed).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V vehicle into Unreal as one assembled car: body with a detail level, every door/bonnet/boot pivot, wheels, its paint liveries and its handling numbers."))
+	static FString ImportVehicleComposite(const FString& CorpusRoot, const FString& VehicleName,
+	                                      const FString& DestFolder);
+
+	// Swap the body's livery: sets the master parameter the livery sampler maps to (DiffuseSampler ->
+	// Diffuse) on every body material slot whose geometry uses the livery shader (LOD0 by recorded slot,
+	// LOD1.. by preset) to livery LiveryIndex's texture (the DataAsset's Liveries[].Index; +hi texture
+	// preferred). Refuses: no liveries, a texture not imported (textureMissing), or a sampler the masters
+	// have no parameter for (vehicle_paint3's DiffuseSampler2 - the burrito case).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Change which paint-job (livery) an imported vehicle shows. Give the vehicle actor's name and the livery number."))
+	static FString SetVehicleLivery(const FString& ActorLabel, const FString& LiveryIndex);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);
