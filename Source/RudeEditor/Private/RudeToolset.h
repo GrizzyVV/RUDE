@@ -281,6 +281,22 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show the size numbers of an imported model: bounds, real vertex extents, collision pieces.", RudeAudience="agent"))
 	static FString InspectMesh(const FString& AssetPath);
 
+	// Scenario region export (WP10): the point actors ImportScenarioRegion placed go back to their
+	// region file as a FiveM resource (<OutDir>/stream/<region>.ymt, XML form, + fxmanifest.lua). The
+	// source file's bytes are SPLICED - only the top-level <Points>/<MyPoints> block is replaced; an
+	// untouched point re-emits its own XML verbatim (the slice on its URudeScenarioPointComponent), a
+	// moved/rotated/edited one is rebuilt in the file's field order (heading text kept when unrotated).
+	// Refuses deletions (AccelGridNodeIndices index points by ordinal). Verdict: sourcePoints, kept,
+	// edited, added, sourceDrift, cellCrossings (a moved point that left its 64 m accel-grid cell - the
+	// grid is written verbatim and is then stale; the in-game test judges), byteIdentical.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save the ambient-life points you moved back out as a game scenario file, ready to stream in FiveM. Points you did not touch go back exactly as they came in."))
+	static FString ExportScenarioRegion(const FString& OutDir, const FString& RegionName, const FString& CorpusRoot);
+
+	// Nudge one imported scenario point by x,y,z centimetres (optionally ",yawDeg"). Identity = region +
+	// ordinal in the file's MyPoints list. The scriptable edit the scenario export gate uses.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one ambient-life point by x,y,z centimetres. Name it by its region and its number in that region's file.", RudeAudience="agent"))
+	static FString MoveScenarioPoint(const FString& RegionName, const FString& PointIndex, const FString& DeltaCm);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

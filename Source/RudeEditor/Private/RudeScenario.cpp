@@ -26,6 +26,9 @@
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
 #include "XmlFile.h"
+#include "Misc/FileHelper.h"
+#include "RudeScenarioPointComponent.h"
+#include "RudeToolsetInternal.h"
 
 namespace RudeScenario
 {
@@ -64,6 +67,169 @@ namespace RudeScenario
 	{
 		const FXmlNode* N = Parent ? Parent->FindChildNode(Tag) : nullptr;
 		return N ? N->GetContent().TrimStartAndEnd() : FString();
+	}
+
+	// ---- THE BYTE-SAFE SEAM (WP10 export lane) ----------------------------------------------
+	// Raw item slices of the TOP-LEVEL <Points>/<MyPoints> block: the text of each "   <Item>" ...
+	// "   </Item>" (indent 3) in file order, each ending with its newline. Measured over all 144
+	// effective regions 2026-09-06: the joined slices reproduce the block byte-for-byte in 143/143
+	// regions that have one (nw_countryside's is the self-closing empty form), and every one of the
+	// 109,198 items opens "   <Item>\n" and carries the same 13 children in the same order. The
+	// opener carries its indent, so a cluster-level <MyPoints> (indent 4, inside <Clusters>) can never
+	// be mistaken for it. This is the scenario lane's RudeRawItems: FXmlFile flattens text, so the
+	// bytes an untouched point goes back out with are these, never a re-spelling.
+	struct FScenRawBlock
+	{
+		int32 ItemsStart = INDEX_NONE;   // first byte after the opener line
+		int32 ItemsEnd = INDEX_NONE;     // first byte of the "  </MyPoints>" line (== ItemsStart when empty)
+		bool bSelfClosing = false;       // "  <MyPoints itemType="CScenarioPoint" />": no items, no close tag
+		int32 EmptyStart = INDEX_NONE;   // the self-closing line's span (when bSelfClosing)
+		int32 EmptyEnd = INDEX_NONE;
+		TArray<FString> Items;
+	};
+
+	static bool SliceRawPoints(const FString& Text, FScenRawBlock& Out)
+	{
+		const FString Open = TEXT("\n  <MyPoints itemType=\"CScenarioPoint\">\n");
+		const FString Close = TEXT("\n  </MyPoints>\n");
+		const FString Empty = TEXT("\n  <MyPoints itemType=\"CScenarioPoint\" />\n");
+		const int32 B = Text.Find(Open, ESearchCase::CaseSensitive);
+		if (B == INDEX_NONE)
+		{
+			const int32 E0 = Text.Find(Empty, ESearchCase::CaseSensitive);
+			if (E0 == INDEX_NONE) { return false; }
+			Out.bSelfClosing = true;
+			Out.EmptyStart = E0 + 1;                 // keep the newline that ends the previous line
+			Out.EmptyEnd = E0 + Empty.Len();         // past the line's own newline
+			Out.ItemsStart = Out.ItemsEnd = Out.EmptyStart;
+			return true;
+		}
+		// Close begins with the newline that ends the last item, so the item text runs to E + 1.
+		const int32 E = Text.Find(Close, ESearchCase::CaseSensitive, ESearchDir::FromStart, B + Open.Len() - 1);
+		if (E == INDEX_NONE) { return false; }
+		Out.ItemsStart = B + Open.Len();
+		Out.ItemsEnd = E + 1;
+		const FString ItemOpen = TEXT("   <Item>\n");
+		const FString ItemClose = TEXT("\n   </Item>\n");
+		int32 Pos = Out.ItemsStart;
+		while (Pos < Out.ItemsEnd)
+		{
+			if (!Text.Mid(Pos, ItemOpen.Len()).Equals(ItemOpen, ESearchCase::CaseSensitive)) { break; }
+			const int32 C = Text.Find(ItemClose, ESearchCase::CaseSensitive, ESearchDir::FromStart, Pos);
+			if (C == INDEX_NONE || C + ItemClose.Len() > Out.ItemsEnd) { break; }
+			Out.Items.Add(Text.Mid(Pos, C + ItemClose.Len() - Pos));
+			Pos = C + ItemClose.Len();
+		}
+		return true;
+	}
+
+	// True when the slices account for every byte between the opener and the close tag - the only
+	// condition under which a slice may stand in for the file's bytes.
+	static bool RawSlicesCoverBlock(const FString& Text, const FScenRawBlock& Raw)
+	{
+		int32 Len = 0;
+		for (const FString& S : Raw.Items) { Len += S.Len(); }
+		if (Len != Raw.ItemsEnd - Raw.ItemsStart) { return false; }
+		int32 Pos = Raw.ItemsStart;
+		for (const FString& S : Raw.Items)
+		{
+			if (!Text.Mid(Pos, S.Len()).Equals(S, ESearchCase::CaseSensitive)) { return false; }
+			Pos += S.Len();
+		}
+		return true;
+	}
+
+	// A number as the game's files spell it - the SAME rule as RudeNum (RudeLevelTools.cpp): seven
+	// significant digits when that reads back to the same float32, else nine; tiny magnitudes as a
+	// plain decimal; "-0" as "0". Copied, not shared: RudeNum is file-static in a lane another session
+	// was editing while this was written, and this lane must not take a link dependency on it.
+	// Plus one rule RudeNum lacks, measured here: the game's exporter rounds an EXACT decimal tie at the
+	// ninth digit away from zero ("165.007813" for 165.0078125) where printf rounds it to even
+	// ("165.007812") - 3 of downtown's 2,469 coordinates are such ties. With the tie rule the spelling
+	// reproduces 2,469/2,469 x/y/z and 823/823 w on downtown (Python model, 2026-09-06).
+	// Only EDITED points are spelled at all; untouched ones go out verbatim.
+	static FString ScenNum(double V)
+	{
+		const float F = (float)V;
+		FString S = FString::Printf(TEXT("%.7g"), (double)F);
+		if ((float)FCString::Atod(*S) != F)
+		{
+			S = FString::Printf(TEXT("%.9g"), (double)F);
+			const FString S10 = FString::Printf(TEXT("%.10g"), (double)F);
+			if (S10.Len() == S.Len() + 1 && S10.EndsWith(TEXT("5")) && S10.StartsWith(S)
+				&& FCString::Atod(*S10) == (double)F && !S.Contains(TEXT("e")))
+			{
+				// an exact tie that printf rounded down to even: round it away from zero instead
+				// (the truncated last digit is even, so +1 never carries)
+				S[S.Len() - 1] = (TCHAR)(S[S.Len() - 1] + 1);
+			}
+		}
+		if (S.Contains(TEXT("e")))
+		{
+			S = FString::Printf(TEXT("%.9f"), (double)F);
+			while (S.EndsWith(TEXT("0"))) { S.LeftChopInline(1); }
+			if (S.EndsWith(TEXT("."))) { S.LeftChopInline(1); }
+		}
+		if (S == TEXT("-0")) { S = TEXT("0"); }
+		return S;
+	}
+
+	// Inverse of HeadingToUeYawDegrees: UE yaw -> RAGE heading w in radians from +Y, counter-clockwise,
+	// wrapped into (-pi, pi] - the stored range measured corpus-wide is [-3.141451, 3.141593]: +pi
+	// occurs, -pi does not.
+	static double UeYawDegreesToHeading(double Yaw)
+	{
+		double W = FMath::DegreesToRadians(-Yaw - 90.0);
+		while (W > PI) { W -= 2.0 * PI; }
+		while (W <= -PI) { W += 2.0 * PI; }
+		return W;
+	}
+
+	// A CScenarioPoint item from the component + the actor's transform, in the file's field order
+	// (one order over 109,198 items in 144 regions, measured 2026-09-06). UE -> RAGE: position /100
+	// with Y mirrored. The heading is the stored text when the actor was not rotated, else re-derived.
+	static FString PointItemXml(const URudeScenarioPointComponent* C, const FTransform& Xf, bool& bOutHeadingRespelled)
+	{
+		const FVector P = Xf.GetLocation();
+		const double Yaw = Xf.Rotator().Yaw;
+		FString W;
+		if (!C->SourceHeadingText.IsEmpty() && FMath::Abs(FRotator::NormalizeAxis(Yaw - (double)C->SourceYaw)) < 1e-3)
+		{
+			W = C->SourceHeadingText;
+		}
+		else
+		{
+			W = ScenNum(UeYawDegreesToHeading(Yaw));
+			bOutHeadingRespelled = true;
+		}
+		FString O;
+		O += TEXT("   <Item>\n");
+		O += FString::Printf(TEXT("    <iType value=\"%d\" />\n"), C->IType);
+		O += FString::Printf(TEXT("    <ModelSetId value=\"%d\" />\n"), C->ModelSetId);
+		O += FString::Printf(TEXT("    <iInterior value=\"%d\" />\n"), C->Interior);
+		O += FString::Printf(TEXT("    <iRequiredIMapId value=\"%d\" />\n"), C->RequiredIMapId);
+		O += FString::Printf(TEXT("    <iProbability value=\"%d\" />\n"), C->Probability);
+		O += FString::Printf(TEXT("    <uAvailableInMpSp value=\"%d\" />\n"), C->AvailableInMpSp);
+		O += FString::Printf(TEXT("    <iTimeStartOverride value=\"%d\" />\n"), C->TimeStartOverride);
+		O += FString::Printf(TEXT("    <iTimeEndOverride value=\"%d\" />\n"), C->TimeEndOverride);
+		O += FString::Printf(TEXT("    <iRadius value=\"%d\" />\n"), C->Radius);
+		O += FString::Printf(TEXT("    <iTimeTillPedLeaves value=\"%d\" />\n"), C->TimeTillPedLeaves);
+		O += FString::Printf(TEXT("    <iScenarioGroup value=\"%d\" />\n"), C->ScenarioGroup);
+		const FString Flags = C->Flags.TrimStartAndEnd();
+		if (Flags.IsEmpty()) { O += TEXT("    <Flags />\n"); }
+		else { O += TEXT("    <Flags>"); RudeXmlEscapeInto(O, Flags); O += TEXT("</Flags>\n"); }
+		O += FString::Printf(TEXT("    <vPositionAndDirection x=\"%s\" y=\"%s\" z=\"%s\" w=\"%s\" />\n"),
+			*ScenNum(P.X / 100.0), *ScenNum(-P.Y / 100.0), *ScenNum(P.Z / 100.0), *W);
+		O += TEXT("   </Item>\n");
+		return O;
+	}
+
+	// One integer attribute out of the raw text ("<Tag value="N" />"), for the AccelGrid cell size.
+	static int32 RawIntAttr(const FString& Text, const TCHAR* Tag, int32 Default)
+	{
+		const FString Needle = FString::Printf(TEXT("<%s value=\""), Tag);
+		const int32 At = Text.Find(Needle, ESearchCase::CaseSensitive);
+		return At == INDEX_NONE ? Default : FCString::Atoi(*Text.Mid(At + Needle.Len(), 16));
 	}
 
 	// THE IMPORT-LANE TRANSFORM, reused not reinvented: RUDE's pinned RAGE->UE convention is
@@ -137,6 +303,7 @@ namespace RudeScenario
 		int32 Rec[11] = { 0 };      // iType, ModelSetId, iInterior, iRequiredIMapId, iProbability,
 		                            // uAvailableInMpSp, iTimeStartOverride, iTimeEndOverride,
 		                            // iRadius, iTimeTillPedLeaves, iScenarioGroup
+		FString RawW;               // the w attribute as spelled (the export writes it back verbatim when unrotated)
 		// ⛔ A malformed record keeps its SLOT and is marked invalid instead of being dropped:
 		// the point's array index IS its identity (the RUDE_SCEN_Point:<i> tag promises the
 		// MyPoints index, and an exporter will address it that way). Compacting the array
@@ -282,6 +449,7 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 	// tables) through the ledger; any other folder is an ad-hoc drop of *.ymt.xml files.
 	FString Dir = CorpusRoot;
 	TArray<FString> Found;   // full paths
+	TMap<FString, FString> SlotOf;   // full path -> build slot (corpus regions only)
 	if (FRudeCorpus::LooksLikeCorpus(CorpusRoot))
 	{
 		FString CorpusErr;
@@ -291,7 +459,11 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 		Corpus->ByPrefix(TEXT("ymt"), TEXT(""), Rows);
 		for (const FRudeCorpusEntry* E : Rows)
 		{
-			if (E->SourceName.EndsWith(TEXT(".ymt.xml"), ESearchCase::IgnoreCase)) { Found.Add(Corpus->PathOf(*E)); }
+			if (E->SourceName.EndsWith(TEXT(".ymt.xml"), ESearchCase::IgnoreCase))
+			{
+				Found.Add(Corpus->PathOf(*E));
+				SlotOf.Add(Corpus->PathOf(*E), E->Slot);
+			}
 		}
 	}
 	else
@@ -353,6 +525,15 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 			*FString::Join(Sample, TEXT(", "))));
 	}
 	const FString RegionStem = StemOf(RegionFile);
+	const FString RegionSlot = SlotOf.FindRef(RegionFile);
+
+	// ---- 1b) THE RAW BYTES (WP10): the file as it is, sliced into per-point items, so every point
+	// actor can carry its own XML verbatim for the export. Trusted only when the slices cover the
+	// block byte-for-byte AND count exactly what the parse counts (checked after the parse below).
+	FString RawText;
+	FScenRawBlock Raw;
+	bool bRawSliced = FFileHelper::LoadFileToString(RawText, *RegionFile) && SliceRawPoints(RawText, Raw)
+		&& RawSlicesCoverBlock(RawText, Raw);
 
 	// ---- 2) PARSE ------------------------------------------------------------------------
 	FXmlFile Xml(RegionFile);
@@ -458,7 +639,8 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 				continue;
 			}
 			P.UeLoc = RageToUe(V, TEXT("x"), TEXT("y"), TEXT("z"));
-			P.Yaw = HeadingToUeYawDegrees(FCString::Atod(*V->GetAttribute(TEXT("w"))));
+			P.RawW = V->GetAttribute(TEXT("w"));
+			P.Yaw = HeadingToUeYawDegrees(FCString::Atod(*P.RawW));
 			for (int32 i = 0; i < 11; ++i)
 			{
 				// Same read IVal() performs (Atod then narrow), but an ABSENT tag is counted
@@ -692,6 +874,17 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 		return Fail(TEXT("engine marker meshes missing (/Engine/BasicShapes/Cone|Sphere) - cannot draw scenario points"));
 	}
 
+	// The raw slices are usable only when they line up 1:1 with the parsed list (a count mismatch
+	// means the file has a shape this slicer does not know; the points then carry NO SourceXml and the
+	// export rebuilds every one of them - correct, but not byte-identical, and the verdict says so).
+	const bool bRawTrusted = bRawSliced && Raw.Items.Num() == Points.Num();
+	if (!bRawTrusted)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[RUDE] ImportScenarioRegion %s: raw point slices NOT trusted (sliced %d, parsed %d, covered %s) - points carry no verbatim XML"),
+			*RegionStem, Raw.Items.Num(), Points.Num(), bRawSliced ? TEXT("yes") : TEXT("no"));
+	}
+	int32 PointsWithProvenance = 0;
+
 	// ---- 4) CLEAR-BY-TAG, THEN SPAWN ------------------------------------------------------
 	// The idempotency pattern is ImportMlo's, unchanged and for its reasons: OFPA can rewrite
 	// folder paths, so clearing a FOLDER is unreliable and would also kill other imported
@@ -768,6 +961,31 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 			P.Rec[0], P.Rec[1], P.Rec[2], P.Rec[3], P.Rec[4], P.Rec[5],
 			P.Rec[6], P.Rec[7], P.Rec[8], P.Rec[9], P.Rec[10])));
 		A->Tags.Add(FName(*(TEXT("RUDE_SCEN_Flags:") + P.Flags)));
+		// ---- WP10: the round-trip seam as a COMPONENT (the tags above stay for readers that use
+		// them). Everything ExportScenarioRegion needs lives on the actor: identity (region, slot,
+		// ordinal), the eleven ints + Flags, the raw item bytes, the transform and field key at
+		// import, and the heading text as spelled.
+		{
+			URudeScenarioPointComponent* C = NewObject<URudeScenarioPointComponent>(A, TEXT("ScenarioPoint"));
+			C->SourceRegion = RegionStem;
+			C->SourceSlot = RegionSlot;
+			C->SourceIndex = i;
+			C->TypeName = P.TypeName;
+			C->ModelSetName = P.ModelSetName;
+			C->IType = P.Rec[0]; C->ModelSetId = P.Rec[1]; C->Interior = P.Rec[2];
+			C->RequiredIMapId = P.Rec[3]; C->Probability = P.Rec[4]; C->AvailableInMpSp = P.Rec[5];
+			C->TimeStartOverride = P.Rec[6]; C->TimeEndOverride = P.Rec[7]; C->Radius = P.Rec[8];
+			C->TimeTillPedLeaves = P.Rec[9]; C->ScenarioGroup = P.Rec[10];
+			C->Flags = P.Flags;
+			C->SourceXml = bRawTrusted ? Raw.Items[i] : FString();
+			C->SourceTransform = A->GetActorTransform();
+			C->SourceHeadingText = P.RawW;
+			C->SourceYaw = P.Yaw;
+			C->SourceFieldsKey = C->FieldsKey();
+			C->RegisterComponent();
+			A->AddInstanceComponent(C);
+			if (!C->SourceXml.IsEmpty()) { ++PointsWithProvenance; }
+		}
 		++Spawned;
 		if (Spawned % 500 == 0)
 		{
@@ -986,7 +1204,8 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 		"\"pointsFiltered\":%d,\"nodesFiltered\":%d,\"loadSaveFiltered\":%d,"
 		"\"markerSpawnFailures\":%d,\"pointFieldsDefaulted\":%d,\"chainsWithoutEdgeIds\":%d,"
 		"\"badEdgeRefs\":%d,"
-		"\"badChainEdgeIds\":%d,\"clearedActors\":%d,\"filter\":\"%s\"}"),
+		"\"badChainEdgeIds\":%d,\"clearedActors\":%d,\"filter\":\"%s\","
+		"\"slot\":\"%s\",\"rawPointsSliced\":%d,\"rawTrusted\":%s,\"pointsWithProvenance\":%d}"),
 		bIntact ? TEXT("true") : TEXT("false"),
 		*Esc(RegionStem), *Esc(FPaths::GetCleanFilename(RegionFile)),
 		Points.Num(), NumChains, Nodes.Num(), Edges.Num(), Spawned, Skipped,
@@ -998,5 +1217,232 @@ FString URudeToolset::ImportScenarioRegion(const FString& CorpusRoot, const FStr
 		PointsFiltered, NodesFiltered, LoadSaveFiltered,
 		MarkerSpawnFailures, PointFieldsDefaulted, ChainsWithoutEdgeIds,
 		BadEdgeRefs,
-		BadChainEdgeIds, Cleared, *Esc(Filter.TrimStartAndEnd()));
+		BadChainEdgeIds, Cleared, *Esc(Filter.TrimStartAndEnd()),
+		*Esc(RegionSlot), Raw.Items.Num(), bRawTrusted ? TEXT("true") : TEXT("false"), PointsWithProvenance);
+}
+
+// ---- ExportScenarioRegion (WP10) ----------------------------------------------------------------
+// THE SCENARIO LANE, WRITE HALF. The actors ImportScenarioRegion placed go back to their region file
+// as a FiveM resource: <OutDir>/stream/<region>.ymt (the XML interchange form, the way ExportLevelYmaps
+// writes <ymap>.ymap) + fxmanifest.lua. The source file's bytes are SPLICED: only the top-level
+// <Points>/<MyPoints> block is replaced. An untouched point re-emits the slice it carries verbatim; a
+// moved/rotated/edited one is rebuilt from its component in the file's field order. Everything else -
+// chaining graph, clusters, entity overrides, accel grid, LookUps, the two schema blobs - is the file's
+// own bytes, untouched (v1: nodes/edges/clusters/overrides are not authorable yet, so there is nothing
+// to write back for them; their actors are display).
+//
+// What the format cannot express and is therefore REFUSED or COUNTED (measured on downtown 2026-09-06):
+//  - deletion: AccelGridNodeIndices index MyPoints by ordinal (320 cells, non-decreasing 0..823 = the
+//    point count) - dropping a point shifts every later one. Refused; hide the actor instead.
+//  - a move across a 64 m accel-grid cell (points are stored sorted by cell, y-major, 823/823): the
+//    grid is written verbatim and is then STALE for that point. Counted (cellCrossings), never hidden;
+//    whether the game tolerates it is the in-game test's call, not this tool's.
+//  - an added point (SourceIndex -1, or a duplicated actor claiming an ordinal already taken): appended
+//    after the source list, counted (added); the grid does not know it (accelGridStale).
+FString URudeToolset::ExportScenarioRegion(const FString& OutDir, const FString& RegionName, const FString& CorpusRoot)
+{
+	using namespace RudeScenario;
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Esc(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	if (OutDir.TrimStartAndEnd().IsEmpty()) { return Fail(TEXT("give an OutDir for the FiveM resource")); }
+	const FString Region = RegionName.TrimStartAndEnd().ToLower();
+
+	// ---- 1) the level: every scenario point component of this region
+	struct FExportPoint { URudeScenarioPointComponent* C = nullptr; FTransform Xf; int32 Ordinal = -1; bool bNew = false; bool bUntouched = false; };
+	TArray<FExportPoint> Pts;
+	TSet<FString> RegionsPresent;
+	int32 Seen = 0;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		URudeScenarioPointComponent* C = It->FindComponentByClass<URudeScenarioPointComponent>();
+		if (!C) { continue; }
+		++Seen;
+		RegionsPresent.Add(C->SourceRegion.ToLower());
+		if (Region.IsEmpty() || !C->SourceRegion.Equals(Region, ESearchCase::IgnoreCase)) { continue; }
+		FExportPoint E; E.C = C; E.Xf = It->GetActorTransform();
+		Pts.Add(E);
+	}
+	if (Region.IsEmpty() || Pts.Num() == 0)
+	{
+		TArray<FString> Names = RegionsPresent.Array(); Names.Sort();
+		return Fail(FString::Printf(TEXT("%s - scenario regions in this level (%d point actors): %s"),
+			Region.IsEmpty() ? TEXT("give a RegionName") : *FString::Printf(TEXT("no scenario points of region '%s' in the level"), *Region),
+			Seen, Names.Num() ? *FString::Join(Names, TEXT(", ")) : TEXT("(none - run ImportScenarioRegion first)")));
+	}
+
+	// ---- 2) the source document: the copy the game loads (ledger), or an ad-hoc folder like the import
+	FString RegionFile, Slot;
+	if (FRudeCorpus::LooksLikeCorpus(CorpusRoot))
+	{
+		FString CorpusErr;
+		const TSharedPtr<FRudeCorpus> Corpus = FRudeCorpus::Open(CorpusRoot, CorpusErr);
+		if (!Corpus.IsValid()) { return Fail(CorpusErr); }
+		const FRudeCorpusEntry* Row = Corpus->Effective(TEXT("ymt"), Region);
+		if (!Row) { return Fail(FString::Printf(TEXT("the corpus has no ymt named '%s'"), *Region)); }
+		if (!Row->SourceName.EndsWith(TEXT(".ymt.xml"), ESearchCase::IgnoreCase) || !Row->File.Contains(TEXT("/scenario/")))
+		{
+			return Fail(FString::Printf(TEXT("ymt '%s' resolves to %s/%s, which is not a scenario region"), *Region, *Row->Slot, *Row->File));
+		}
+		RegionFile = Corpus->PathOf(*Row);
+		Slot = Row->Slot;
+	}
+	else
+	{
+		const FString Dir = FPaths::DirectoryExists(CorpusRoot / TEXT("ymt")) ? CorpusRoot / TEXT("ymt") : CorpusRoot;
+		RegionFile = Dir / (Region + TEXT(".ymt.xml"));
+	}
+	if (!FPaths::FileExists(RegionFile)) { return Fail(FString::Printf(TEXT("region file not found: %s"), *RegionFile)); }
+	FString SrcText;
+	if (!FFileHelper::LoadFileToString(SrcText, *RegionFile)) { return Fail(FString::Printf(TEXT("cannot read %s"), *RegionFile)); }
+	FScenRawBlock Raw;
+	if (!SliceRawPoints(SrcText, Raw)) { return Fail(FString::Printf(TEXT("no top-level <Points>/<MyPoints> block in %s"), *RegionFile)); }
+	if (!RawSlicesCoverBlock(SrcText, Raw)) { return Fail(FString::Printf(TEXT("the MyPoints block of %s has a shape this splicer does not cover byte-for-byte - refusing rather than guessing"), *RegionFile)); }
+	const int32 SourceCount = Raw.Items.Num();
+
+	// ---- 3) ordinals: the first actor claiming an ordinal keeps it; anything else is appended as new
+	Pts.Sort([](const FExportPoint& A, const FExportPoint& B)
+	{
+		const int32 IA = A.C->SourceIndex < 0 ? INT32_MAX : A.C->SourceIndex;
+		const int32 IB = B.C->SourceIndex < 0 ? INT32_MAX : B.C->SourceIndex;
+		if (IA != IB) { return IA < IB; }
+		return A.C->GetOwner()->GetActorLabel() < B.C->GetOwner()->GetActorLabel();
+	});
+	TSet<int32> Claimed;
+	int32 Next = SourceCount, Added = 0;
+	for (FExportPoint& E : Pts)
+	{
+		const int32 I = E.C->SourceIndex;
+		if (I >= 0 && I < SourceCount && !Claimed.Contains(I)) { E.Ordinal = I; Claimed.Add(I); }
+		else { E.Ordinal = Next++; E.bNew = true; ++Added; }
+	}
+	Pts.Sort([](const FExportPoint& A, const FExportPoint& B) { return A.Ordinal < B.Ordinal; });
+	const int32 Present = Claimed.Num();
+	const int32 Removed = SourceCount - Present;
+	if (Removed > 0)
+	{
+		return Fail(FString::Printf(TEXT("%d of %d source points are missing from the level - the region's AccelGrid indexes points by ordinal, so a deletion cannot be written; hide the actor instead (a FILTERED import is a view, re-import with an empty Filter to export)"), Removed, SourceCount));
+	}
+
+	// ---- 4) the block: verbatim slices for untouched points, rebuilt items for the rest
+	const int32 CellX = RawIntAttr(SrcText, TEXT("CellDimX"), 0);
+	const int32 CellY = RawIntAttr(SrcText, TEXT("CellDimY"), 0);
+	int32 Kept = 0, Edited = 0, SourceDrift = 0, NoProvenance = 0, HeadingRespelled = 0, CellCrossings = 0;
+	FString Block;
+	for (FExportPoint& E : Pts)
+	{
+		const URudeScenarioPointComponent* C = E.C;
+		E.bUntouched = !E.bNew && !C->SourceXml.IsEmpty()
+			&& E.Xf.Equals(C->SourceTransform, 1e-3f)
+			&& C->FieldsKey() == C->SourceFieldsKey;
+		if (!E.bNew && C->SourceXml.IsEmpty()) { ++NoProvenance; }
+		if (!E.bNew && !C->SourceXml.IsEmpty() && !C->SourceXml.Equals(Raw.Items[E.Ordinal], ESearchCase::CaseSensitive))
+		{
+			// the corpus copy changed under the level (a --patch, another slot): the actor's own bytes
+			// are what was imported and are what goes out; counted so nobody mistakes it for identity
+			++SourceDrift;
+		}
+		if (E.bUntouched)
+		{
+			Block += C->SourceXml;
+			if (!C->SourceXml.EndsWith(TEXT("\n"))) { Block += TEXT("\n"); }
+			++Kept;
+		}
+		else
+		{
+			bool bRespelled = false;
+			Block += PointItemXml(C, E.Xf, bRespelled);
+			if (bRespelled) { ++HeadingRespelled; }
+			if (!E.bNew)
+			{
+				++Edited;
+				if (CellX > 0 && CellY > 0)
+				{
+					const FVector S = C->SourceTransform.GetLocation(), N = E.Xf.GetLocation();
+					const int32 Sx = FMath::FloorToInt32(S.X / 100.0 / CellX), Sy = FMath::FloorToInt32(-S.Y / 100.0 / CellY);
+					const int32 Nx = FMath::FloorToInt32(N.X / 100.0 / CellX), Ny = FMath::FloorToInt32(-N.Y / 100.0 / CellY);
+					if (Sx != Nx || Sy != Ny) { ++CellCrossings; }
+				}
+			}
+		}
+	}
+
+	// ---- 5) SPLICE: the source bytes with only the top-level MyPoints block replaced
+	FString Doc;
+	if (Raw.bSelfClosing)
+	{
+		Doc = Pts.Num() == 0 ? SrcText
+			: SrcText.Left(Raw.EmptyStart) + TEXT("  <MyPoints itemType=\"CScenarioPoint\">\n") + Block + TEXT("  </MyPoints>\n") + SrcText.Mid(Raw.EmptyEnd);
+	}
+	else
+	{
+		Doc = SrcText.Left(Raw.ItemsStart) + Block + SrcText.Mid(Raw.ItemsEnd);
+	}
+	IFileManager::Get().MakeDirectory(*(OutDir / TEXT("stream")), true);
+	const FString OutPath = OutDir / TEXT("stream") / (Region + TEXT(".ymt"));
+	if (!FFileHelper::SaveStringToFile(Doc, *OutPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		return Fail(FString::Printf(TEXT("cannot write %s"), *OutPath));
+	}
+	// The manifest is written once and then KEPT (the ymap lane's unconditional overwrite is a known
+	// gap): a resource that already carries one keeps its hand-added lines.
+	const FString ManifestPath = OutDir / TEXT("fxmanifest.lua");
+	FString ManifestState = TEXT("kept");
+	if (!FPaths::FileExists(ManifestPath))
+	{
+		const FString Manifest = FString::Printf(TEXT(
+			"fx_version 'cerulean'\ngame 'gta5'\nthis_is_a_map 'yes'\n\n"
+			"-- Scenario region '%s': stream/%s.ymt streams under the game's own asset name, which the game's\n"
+			"-- sp_manifest.ymt already declares (RegionDef Name = joaat(\"platform:/levels/gta5/scenario/%s\"),\n"
+			"-- AABB = the points' box grown 80 m in X/Y). A NEW region name needs its own RegionDef in a streamed\n"
+			"-- sp_manifest.ymt, which RUDE does not write. This file is XML-form; whether FiveM Legacy converts\n"
+			"-- an XML .ymt the way it converts XML .ymap/.ytyp is UNVERIFIED - if the region does not stream,\n"
+			"-- convert it to the binary form with your exporter and stream that instead.\n"),
+			*Region, *Region, *Region);
+		ManifestState = FFileHelper::SaveStringToFile(Manifest, *ManifestPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ? TEXT("written") : TEXT("writeFailed");
+	}
+	const bool bIdentical = Doc.Equals(SrcText, ESearchCase::CaseSensitive);
+	UE_LOG(LogTemp, Display, TEXT("[RUDE] ExportScenarioRegion %s: %d source points, kept %d, edited %d, added %d, drift %d, cellCrossings %d -> %s (%s)"),
+		*Region, SourceCount, Kept, Edited, Added, SourceDrift, CellCrossings, *OutPath, bIdentical ? TEXT("byte-identical to the source") : TEXT("changed"));
+	return FString::Printf(TEXT(
+		"{\"ok\":true,\"region\":\"%s\",\"slot\":\"%s\",\"regionFile\":\"%s\",\"outFile\":\"%s\",\"bytes\":%d,"
+		"\"sourcePoints\":%d,\"present\":%d,\"kept\":%d,\"edited\":%d,\"added\":%d,\"removed\":%d,"
+		"\"sourceDrift\":%d,\"noProvenance\":%d,\"headingRespelled\":%d,\"cellCrossings\":%d,\"accelGridStale\":%s,"
+		"\"byteIdentical\":%s,\"manifest\":\"%s\"}"),
+		*Esc(Region), *Esc(Slot), *Esc(RegionFile), *Esc(OutPath), Doc.Len(),
+		SourceCount, Present, Kept, Edited, Added, Removed,
+		SourceDrift, NoProvenance, HeadingRespelled, CellCrossings, (Added > 0 || CellCrossings > 0) ? TEXT("true") : TEXT("false"),
+		bIdentical ? TEXT("true") : TEXT("false"), *ManifestState);
+}
+
+// ---- MoveScenarioPoint (agent) --------------------------------------------------------------------
+// The scriptable edit the scenario export gate needs: nudge one point by x,y,z centimetres, optionally
+// rotate it by a fourth ",yawDeg" component. Identity = region + ordinal.
+FString URudeToolset::MoveScenarioPoint(const FString& RegionName, const FString& PointIndex, const FString& DeltaCm)
+{
+	using namespace RudeScenario;
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Esc(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	const FString Region = RegionName.TrimStartAndEnd();
+	const int32 Index = FCString::Atoi(*PointIndex);
+	TArray<FString> Parts;
+	DeltaCm.ParseIntoArray(Parts, TEXT(","), true);
+	if (Parts.Num() < 3) { return Fail(TEXT("DeltaCm must be \"x,y,z\" or \"x,y,z,yawDeg\" (centimetres, degrees)")); }
+	const FVector D(FCString::Atod(*Parts[0]), FCString::Atod(*Parts[1]), FCString::Atod(*Parts[2]));
+	const double YawDeg = Parts.Num() > 3 ? FCString::Atod(*Parts[3]) : 0.0;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		URudeScenarioPointComponent* C = It->FindComponentByClass<URudeScenarioPointComponent>();
+		if (!C || C->SourceIndex != Index || !C->SourceRegion.Equals(Region, ESearchCase::IgnoreCase)) { continue; }
+		It->Modify();
+		It->AddActorWorldOffset(D);
+		if (YawDeg != 0.0) { It->AddActorWorldRotation(FRotator(0.0, YawDeg, 0.0)); }
+		It->MarkPackageDirty();
+		const FVector L = It->GetActorLocation();
+		return FString::Printf(TEXT("{\"ok\":true,\"actor\":\"%s\",\"region\":\"%s\",\"index\":%d,\"locationCm\":[%.3f,%.3f,%.3f],\"yawDeg\":%.4f,\"gta\":[%s,%s,%s]}"),
+			*Esc(It->GetActorLabel()), *Esc(C->SourceRegion), Index, L.X, L.Y, L.Z, It->GetActorRotation().Yaw,
+			*ScenNum(L.X / 100.0), *ScenNum(-L.Y / 100.0), *ScenNum(L.Z / 100.0));
+	}
+	return Fail(FString::Printf(TEXT("no scenario point %s:%d in the level (import the region first; the index is the ordinal in the file's MyPoints list)"), *Region, Index));
 }
