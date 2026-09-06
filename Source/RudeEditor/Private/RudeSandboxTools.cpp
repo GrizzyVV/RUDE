@@ -150,8 +150,8 @@ FString URudeToolset::EmitNativeSnippet(const FString& Kind, const FString& Name
 	FString Native, Shim, Lua, Note, Side = TEXT("client");
 	if (K.IsEmpty() || K == TEXT("list"))
 	{
-		return TEXT("{\"ok\":true,\"kinds\":[\"ipl\",\"cutscene\",\"entityset\",\"scenario\",\"clock\"],")
-		       TEXT("\"name\":\"ipl: the ymap | cutscene: the cut | entityset: interior|set | scenario: the group | clock: HH:MM\"}");
+		return TEXT("{\"ok\":true,\"kinds\":[\"ipl\",\"cutscene\",\"entityset\",\"scenario\",\"clock\",\"vehicle\"],")
+		       TEXT("\"name\":\"ipl: the ymap | cutscene: the cut | entityset: interior|set | scenario: the group | clock: HH:MM | vehicle: the model\"}");
 	}
 	if (K == TEXT("ipl") || K == TEXT("ymap"))
 	{
@@ -225,7 +225,24 @@ FString URudeToolset::EmitNativeSnippet(const FString& Kind, const FString& Name
 		                      TEXT("-- PauseClock(true)                   -- PAUSE_CLOCK\n"), H, M, H, M);
 		Note = TEXT("The sandbox clock runs (one game minute per two real seconds, GTA's rate) until PauseClock; the Lua sets the hour once.");
 	}
-	else { return Fail(TEXT("Kind = ipl | cutscene | entityset | scenario | clock (empty lists them)")); }
+	else if (K == TEXT("vehicle") || K == TEXT("drive"))
+	{
+		N = N.ToLower();
+		if (N.IsEmpty()) { return Fail(TEXT("Name = the vehicle model (e.g. blista)")); }
+		Native = TEXT("RequestModel / CreateVehicle / SetPedIntoVehicle / TaskLeaveVehicle");
+		Shim = TEXT("Rude.Native EnterVehicle ") + N + TEXT("  then  F  or  Rude.Native ExitVehicle");
+		Lua = FString::Printf(TEXT("local model = GetHashKey('%s')\n")
+		                      TEXT("RequestModel(model)                                          -- REQUEST_MODEL\n")
+		                      TEXT("while not HasModelLoaded(model) do Wait(0) end               -- HAS_MODEL_LOADED\n")
+		                      TEXT("local ped = PlayerPedId()\n")
+		                      TEXT("local x, y, z = table.unpack(GetEntityCoords(ped))\n")
+		                      TEXT("local veh = CreateVehicle(model, x + 3.0, y, z, GetEntityHeading(ped), true, false)   -- CREATE_VEHICLE\n")
+		                      TEXT("SetPedIntoVehicle(ped, veh, -1)                               -- SET_PED_INTO_VEHICLE (-1 = driver)\n")
+		                      TEXT("SetModelAsNoLongerNeeded(model)                              -- SET_MODEL_AS_NO_LONGER_NEEDED\n")
+		                      TEXT("-- TaskLeaveVehicle(ped, veh, 0)                              -- TASK_LEAVE_VEHICLE\n"), *N);
+		Note = TEXT("In PIE the car is the ARudeDriveablePawn BuildDriveable spawned - Chaos physics under RUDE's handling.meta mapping (scratchpad/wp11/drive/DESIGN.md), not the game's handling. In game it is the real vehicle. The shim possesses a pawn; the game seats a ped.");
+	}
+	else { return Fail(TEXT("Kind = ipl | cutscene | entityset | scenario | clock | vehicle (empty lists them)")); }
 	return FString::Printf(TEXT("{\"ok\":true,\"kind\":\"%s\",\"name\":\"%s\",\"native\":\"%s\",\"side\":\"%s\",\"shim\":\"%s\",\"lua\":\"%s\",\"note\":\"%s\"}"),
 		*RudeJsonEscape(K), *RudeJsonEscape(N), *RudeJsonEscape(Native), *Side, *RudeJsonEscape(Shim), *RudeJsonEscape(Lua), *RudeJsonEscape(Note));
 }

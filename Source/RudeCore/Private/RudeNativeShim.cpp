@@ -2,6 +2,10 @@
 #include "RudeNativeShim.h"
 #include "RudeEntityComponent.h"
 #include "RudeScenarioAgent.h"
+#include "RudeDriveablePawn.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/GameModeBase.h"
+#include "GameFramework/PlayerController.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -498,6 +502,90 @@ void URudeNativeShim::StopAmbientAgents()
 }
 
 // ---- the event log -----------------------------------------------------------------------------------
+// ---- vehicles (WP11 THE CHAOS TEST-DRIVE) --------------------------------------------------------------
+bool URudeNativeShim::IsInVehicle() const
+{
+	const UWorld* World = GetWorld();
+	const APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	return PC && Cast<ARudeDriveablePawn>(PC->GetPawn()) != nullptr;
+}
+
+bool URudeNativeShim::EnterVehicle(const FString& Name)
+{
+	UWorld* World = GetWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!PC) { Log(TEXT("EnterVehicle"), Name, TEXT("no player controller in this world"), false); return false; }
+	const FString Want = Name.TrimStartAndEnd().ToLower();
+	ARudeDriveablePawn* Target = nullptr;
+	TArray<FString> Present;
+	for (TActorIterator<ARudeDriveablePawn> It(World); It; ++It)
+	{
+		const FString N = It->VehicleName.ToLower();
+		Present.Add(N);
+		if (Want.IsEmpty() || N == Want || It->ActorHasTag(FName(*(TEXT("RUDE_DRIVEABLE:") + Want))))
+		{
+			Target = *It;
+			if (!Want.IsEmpty()) { break; }
+		}
+	}
+	if (!Target)
+	{
+		Log(TEXT("EnterVehicle"), Want, FString::Printf(TEXT("no driveable '%s' in this level (BuildDriveable makes one from an imported composite); present: [%s]"),
+			*Want, *FString::Join(Present, TEXT(","))), false);
+		return false;
+	}
+	if (PC->GetPawn() == Target) { Log(TEXT("EnterVehicle"), Target->VehicleName, TEXT("already driving it")); return true; }
+	if (APawn* Current = PC->GetPawn())
+	{
+		if (!Current->IsA<ARudeDriveablePawn>()) { OnFootPawn = Current; }
+	}
+	// park the walker beside the car - hidden and collision-free, so the test-drive cannot run it over
+	if (APawn* P = OnFootPawn.Get())
+	{
+		const FTransform VT = Target->GetActorTransform();
+		P->SetActorLocation(VT.TransformPosition(FVector(0.f, -350.f, 60.f)), false, nullptr, ETeleportType::TeleportPhysics);
+		if (ACharacter* C = Cast<ACharacter>(P)) { if (UCharacterMovementComponent* M = C->GetCharacterMovement()) { M->StopMovementImmediately(); } }
+		P->SetActorEnableCollision(false);
+		P->SetActorHiddenInGame(true);
+	}
+	PC->Possess(Target);
+	if (UChaosVehicleMovementComponent* Mv = Target->GetVehicleMovement()) { Mv->SetHandbrakeInput(false); Mv->SetSleeping(false); }
+	DrivingPawn = Target;
+	Log(TEXT("EnterVehicle"), Target->VehicleName, FString::Printf(TEXT("driving %s - W/S throttle-brake, A/D steer, Space handbrake, F exit, R upright"), *Target->GetName()));
+	return true;
+}
+
+bool URudeNativeShim::ExitVehicle()
+{
+	UWorld* World = GetWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	ARudeDriveablePawn* V = PC ? Cast<ARudeDriveablePawn>(PC->GetPawn()) : nullptr;
+	if (!V) { Log(TEXT("ExitVehicle"), TEXT(""), TEXT("not in a vehicle"), false); return false; }
+	PC->UnPossess();   // the pawn's UnPossessed zeroes the inputs and sets the handbrake
+	APawn* P = OnFootPawn.Get();
+	if (!P)
+	{
+		// nothing to come back to (entered from a spectator, or the walker was destroyed): ask the game mode for a new one
+		if (AGameModeBase* GM = World->GetAuthGameMode()) { GM->RestartPlayer(PC); P = PC->GetPawn(); }
+	}
+	const FTransform VT = V->GetActorTransform();
+	// the driver's door: GTA cars are left-hand drive; in this mesh the left side is -Y
+	const FVector Door = VT.TransformPosition(FVector(0.f, -250.f, 0.f)) + FVector(0.f, 0.f, 120.f);
+	if (P)
+	{
+		P->SetActorEnableCollision(true);
+		P->SetActorHiddenInGame(false);
+		P->SetActorLocation(Door, false, nullptr, ETeleportType::TeleportPhysics);
+		P->SetActorRotation(FRotator(0.f, VT.Rotator().Yaw, 0.f));
+		if (ACharacter* C = Cast<ACharacter>(P)) { if (UCharacterMovementComponent* M = C->GetCharacterMovement()) { M->SetMovementMode(MOVE_Walking); } }
+		if (PC->GetPawn() != P) { PC->Possess(P); }
+	}
+	DrivingPawn = nullptr;
+	OnFootPawn = nullptr;
+	Log(TEXT("ExitVehicle"), V->VehicleName, P ? TEXT("on foot beside the driver's door") : TEXT("unpossessed; no on-foot pawn to return to"), P != nullptr);
+	return P != nullptr;
+}
+
 void URudeNativeShim::DumpEventLog()
 {
 	UE_LOG(LogRudeSandbox, Display, TEXT("[RUDE Sandbox] event log: %d entries"), EventLog.Num());
@@ -546,6 +634,9 @@ FString URudeNativeShim::Dispatch(const FString& Native, const TArray<FString>& 
 	else if (N == TEXT("setscenariotypeenabled")) { SetScenarioTypeEnabled(Arg(0), ArgB(1, true)); }
 	else if (N == TEXT("startambientagents")) { StartAmbientAgents(ArgI(0, 8), Arg(1)); }
 	else if (N == TEXT("stopambientagents")) { StopAmbientAgents(); }
+	else if (N == TEXT("entervehicle")) { EnterVehicle(Arg(0)); }
+	else if (N == TEXT("exitvehicle")) { ExitVehicle(); }
+	else if (N == TEXT("isinvehicle")) { Log(TEXT("IsInVehicle"), TEXT(""), IsInVehicle() ? TEXT("true") : TEXT("false")); }
 	else if (N == TEXT("log") || N == TEXT("dumpeventlog")) { DumpEventLog(); return FString::Printf(TEXT("%d entries"), EventLog.Num()); }
 	else if (N == TEXT("clearlog") || N == TEXT("cleareventlog")) { ClearEventLog(); return TEXT("cleared"); }
 	else if (N == TEXT("onscreen")) { bOnScreen = ArgB(0, true); return bOnScreen ? TEXT("on") : TEXT("off"); }
@@ -557,6 +648,7 @@ FString URudeNativeShim::Dispatch(const FString& Native, const TArray<FString>& 
 			"SetClockTime <h> <m> [s] | NetworkOverrideClockTime <h> <m> [s] | PauseClock <0|1> | GetClockHours | "
 			"ActivateInteriorEntitySet <interior> <set> | DeactivateInteriorEntitySet <interior> <set> | "
 			"SetScenarioGroupEnabled <group|all> <0|1> | SetScenarioTypeEnabled <type> <0|1> | StartAmbientAgents [count] [region] | StopAmbientAgents | "
+			"EnterVehicle [model] | ExitVehicle | IsInVehicle | "
 			"Log | ClearLog | OnScreen <0|1> | Fly <0|1>");
 		if (N != TEXT("help") && !N.IsEmpty()) { Log(Native, FString::Join(Args, TEXT(" ")), TEXT("unknown native"), false); }
 		UE_LOG(LogRudeSandbox, Display, TEXT("%s"), *Help);

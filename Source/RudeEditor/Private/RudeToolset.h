@@ -548,6 +548,22 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Inspect a GTA V clothing file and report its internals as raw JSON, without importing.", RudeAudience="agent"))
 	static FString ProbeYddBinary(const FString& BinPath);
 
+	// ---- THE CHAOS TEST-DRIVE (GDD Tier 2 / WP11; RudeDrive.cpp; runtime classes RudeCore/RudeDriveablePawn.h) ----
+	// From a VehicleComposite_<name> actor (ImportVehicleComposite) and its URudeVehicle asset: a USkeletalMesh with
+	// the yft's bones (re-read from the asset's SourceYft; the ROOT gets a +90 deg yaw so the nose is the pawn's +X,
+	// which is what Chaos drives), every body vertex weighted 1.0 to `chassis`, every placed Wheel_* component's
+	// vertices (mirror folded in, winding flipped) weighted 1.0 to its wheel bone, materials borrowed per slot; a
+	// PhysicsAsset with one chassis body (the body's convex collision when it has any, else its bounds box); an
+	// ARudeDriveablePawn spawned 6 m beside the composite with one FChaosWheelSetup per wheel_* bone (front axle
+	// steers, rear handbrakes) and the handling.meta row mapped onto Chaos - every mapped line lands in the
+	// component's MappingNotes with its tag (as-read / kinematics / inferred / placeholder; the table is
+	// scratchpad/wp11/drive/DESIGN.md). Tagged RUDE_DRIVEABLE:<name>. Verdict: bones, body/wheel vertices and
+	// triangles, wheels bound/mirrored, radii read off the meshes, chassis shape, ground clearance, the Chaos
+	// numbers, the handling fields that were missing (defaults named), problems[]; ok is COMPUTED.
+	// Then SandboxSetup + Play: `Rude.Native EnterVehicle <name>` possesses it; F or `Rude.Native ExitVehicle` returns.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Turn an imported vehicle into one you can drive in Play: builds its drivable body and wheels and parks a test-drive car next to it. Then press Play and type Rude.Native EnterVehicle <name>."))
+	static FString BuildDriveable(const FString& ActorLabel, const FString& LocationCm);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

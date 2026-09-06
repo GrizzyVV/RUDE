@@ -29,6 +29,10 @@
 		{
 			"Name": "ToolsetRegistry",
 			"Enabled": true
+		},
+		{
+			"Name": "ChaosVehiclesPlugin",
+			"Enabled": true
 		}
 	],
 	"CreatedByURL": "https://github.com/GrizzyVV",

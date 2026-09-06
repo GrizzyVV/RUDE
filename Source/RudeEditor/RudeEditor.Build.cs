@@ -44,6 +44,10 @@ public class RudeEditor : ModuleRules
 			// WP10 audio lane: USoundFactory is the engine's own WAV importer (ImportAwc).
 			"AudioEditor",
 			"RudeCore",
+			// WP11 BuildDriveable: FChaosWheelSetup / the wheel classes (ChaosVehicles), UBodySetupCore fields (PhysicsCore).
+			"ChaosVehicles",
+			"ChaosVehiclesCore",
+			"PhysicsCore",
 			// WP10 ANIMS: ycd -> UAnimSequence (IAnimationDataController lives in Engine; the controller
 			// implementation module is named so the headless CLI has it loaded), cut -> Level Sequence.
 			"AnimationDataController",

@@ -12,6 +12,7 @@ class ULevelSequencePlayer;
 class ALevelSequenceActor;
 class ADirectionalLight;
 class ARudeScenarioAgent;
+class ARudeDriveablePawn;
 struct FRudeScenarioGraph;
 
 // One line of the script-event log (GDD 1b.4): which hook fired, with what, and what the sandbox did.
@@ -50,6 +51,9 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FRudeNativeCalled, const FString&
 //        <- SET_SCENARIO_GROUP_ENABLED / IS_SCENARIO_GROUP_ENABLED / SET_SCENARIO_TYPE_ENABLED
 //        agents of that group (= region, a RUDE convention) stop and hide; the region's markers follow
 //   StartAmbientAgents / StopAmbientAgents      (no native: the sandbox's own crowd)
+//   EnterVehicle / ExitVehicle                  <- SET_PED_INTO_VEHICLE / TASK_LEAVE_VEHICLE (WP11: possess the
+//        ARudeDriveablePawn BuildDriveable spawned, tagged RUDE_DRIVEABLE:<name>; the on-foot pawn parks beside
+//        the car, hidden, and comes back at the driver's door on exit - F in the car does the same)
 // Every call appends to EventLog, prints on screen, logs to LogRudeSandbox and broadcasts OnNativeCalled.
 // Console: `Rude.Native <Native> [args]` (RudeNativeShim.cpp) and, where the engine routes Exec to
 // world subsystems, the bare method names.
@@ -104,6 +108,13 @@ public:
 	UFUNCTION(Exec, BlueprintCallable, Category = "RUDE|Native") int32 StartAmbientAgents(int32 Count, const FString& Region);
 	UFUNCTION(Exec, BlueprintCallable, Category = "RUDE|Native") void StopAmbientAgents();
 
+	// ---- vehicles (WP11 THE CHAOS TEST-DRIVE) ------------------------------------------------------------------
+	// Name = the model (blista) or empty for the first driveable in the level. Possesses the ARudeDriveablePawn; the
+	// on-foot pawn is parked beside it (hidden, collision off) and comes back at the driver's door on ExitVehicle.
+	UFUNCTION(Exec, BlueprintCallable, Category = "RUDE|Native") bool EnterVehicle(const FString& Name);
+	UFUNCTION(Exec, BlueprintCallable, Category = "RUDE|Native") bool ExitVehicle();
+	UFUNCTION(BlueprintCallable, Category = "RUDE|Native") bool IsInVehicle() const;
+
 	// ---- the event log ----------------------------------------------------------------------------
 	UFUNCTION(BlueprintCallable, Category = "RUDE|Native") TArray<FRudeNativeEvent> GetEventLog() const { return EventLog; }
 	UFUNCTION(Exec, BlueprintCallable, Category = "RUDE|Native") void DumpEventLog();
@@ -138,6 +149,8 @@ private:
 	UPROPERTY() TObjectPtr<ALevelSequenceActor> CutsceneActor;
 	UPROPERTY() TArray<TObjectPtr<ARudeScenarioAgent>> Agents;
 	TSharedPtr<FRudeScenarioGraph> Graph;
+	TWeakObjectPtr<APawn> OnFootPawn;          // who was walking before EnterVehicle
+	TWeakObjectPtr<ARudeDriveablePawn> DrivingPawn;
 
 	void Log(const FString& Native, const FString& Args, const FString& Result, bool bOk = true);
 	bool SetIpl(const FString& Native, const FString& Name, bool bOn);

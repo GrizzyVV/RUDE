@@ -1676,7 +1676,7 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 	IImageWrapperModule& ImageWrapper =
 		FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
 
-	int32 Imported = 0;
+	int32 Imported = 0, Unchanged = 0;
 	int32 InvalidNames = 0;
 	// ⛔ THREE SILENT SUBSTITUTIONS, NOW COUNTED (2026-08-04). Each one is latent in today's corpus
 	// and each one is invisible if it ever stops being latent - which is the definition of the bug
@@ -1830,6 +1830,19 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 		{
 			Tex = NewObject<UTexture2D>(Package, FName(*TexName), RF_Public | RF_Standalone);
 		}
+		// An UNCHANGED texture is left alone (2026-09-06): re-initialising a disk-loaded texture with the
+		// same pixels dirtied it, and its lazily-loaded bulkdata then refused to save ("invalid payload",
+		// 11 of the blista/vehshare set on the Downtown drive gate). Same size, format and bytes = no edit.
+		{
+			bool bSame = false;
+			if (Tex->Source.IsValid() && Tex->Source.GetSizeX() == W && Tex->Source.GetSizeY() == H && Tex->Source.GetFormat() == TSF_BGRA8)
+			{
+				TArray64<uint8> Existing;
+				if (Tex->Source.GetMipData(Existing, 0) && Existing.Num() == BGRA.Num()
+					&& FMemory::Memcmp(Existing.GetData(), BGRA.GetData(), BGRA.Num()) == 0) { bSame = true; }
+			}
+			if (bSame) { ++Imported; ++Unchanged; continue; }
+		}
 		Tex->PreEditChange(nullptr);
 		Tex->Source.Init(W, H, 1, 1, TSF_BGRA8, BGRA.GetData());
 
@@ -1872,12 +1885,12 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 	// genuinely declare no texture, and "nothing to do" is not "nothing worked".
 	const bool bTotalLoss = (Declared > 0 && Imported == 0 && InvalidNames > 0);
 	return FString::Printf(
-		TEXT("{\"ok\":%s,\"txd\":\"%s\",\"declared\":%d,\"imported\":%d,\"invalidNames\":%d,")
+		TEXT("{\"ok\":%s,\"txd\":\"%s\",\"declared\":%d,\"imported\":%d,\"unchanged\":%d,\"invalidNames\":%d,")
 		TEXT("\"itemsWithoutName\":%d,\"usageDefaulted\":%d,\"usageUnknown\":%d,")
 		TEXT("\"missingPixelCount\":%d,\"missingPixels\":[%s],")
 		TEXT("\"pixelsFromDds\":%d,\"pixelsFromPng\":%d,\"pixelsRefused\":%d,\"pixelsRefusedReasons\":[%s]}"),
 		bTotalLoss ? TEXT("false") : TEXT("true"),
-		*TxdName, Declared, Imported, InvalidNames, ItemsWithoutName, UsageDefaulted, UsageUnknown,
+		*TxdName, Declared, Imported, Unchanged, InvalidNames, ItemsWithoutName, UsageDefaulted, UsageUnknown,
 		MissingPixelCount, *Missing, PixelsFromDds, PixelsFromPng, PixelsRefused, *RefusedReasons);
 }
 
