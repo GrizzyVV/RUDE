@@ -83,6 +83,11 @@
 #include "RudeToolsetInternal.h"
 #include "MeshReductionSettings.h"
 #include "IMeshReductionManagerModule.h"
+#include "IMeshMergeUtilities.h"
+#include "MeshMergeModule.h"
+#include "MeshMerge/MeshMergingSettings.h"
+#include "Engine/MaterialMerging.h"
+#include "Materials/MaterialInstanceConstant.h"
 #include "IMeshReductionInterfaces.h"
 #include "OverlappingCorners.h"
 #include "StaticMeshAttributes.h"
@@ -1797,7 +1802,8 @@ FString URudeToolset::MakeLodArchetype(const FString& ActorLabel, const FString&
 	if (!HdArch) { return Fail(FString::Printf(TEXT("no palette asset for '%s' under %s - build the palette first"), *HdName, *Palette)); }
 	FString NewName = NewArchetypeName.TrimStartAndEnd().ToLower();
 	if (NewName.IsEmpty()) { NewName = HdName + TEXT("_rlod"); }
-	const double Pct = FMath::Clamp(TrianglePercent.TrimStartAndEnd().IsEmpty() ? 30.0 : FCString::Atod(*TrianglePercent), 1.0, 100.0);
+	// default 20: the game's own _lod drawables measure ~18% of their HD (dt1_05_hedge2 2,520 -> 446, 2026-09-06)
+	const double Pct = FMath::Clamp(TrianglePercent.TrimStartAndEnd().IsEmpty() ? 20.0 : FCString::Atod(*TrianglePercent), 1.0, 100.0);
 
 	// the existing LOD parent, if any (re-pointed, never re-linked)
 	AActor* PA = R->LodParent.Get();
@@ -1967,6 +1973,230 @@ FString URudeToolset::MakeLodArchetype(const FString& ActorLabel, const FString&
 		TEXT("\"note\":\"then: ExportYdrBinary(mesh, <name>.ydr, NOBOUND) + ExportMeshTextures(mesh, <name>.ytd, 256) + ExportPaletteYtyps + ExportLevelYmaps; existing lodDist/childLodDist untouched (law 26)\"}"),
 		*Mode, *RudeJsonEscape(R->ArchetypeName), *RudeJsonEscape(NewName), *RudeJsonEscape(MeshPkgName), TrisBefore, TrisAfter,
 		NewLodDist, PR ? PR->ChildLodDist : R->LodDist, NA->BsRadius, *RudeJsonEscape(NA->SourceYtyp), *RudeJsonEscape(Touched));
+}
+
+// ---- RebuildLodChunk (Wave 2 / WP8 step 2) --------------------------------------------------
+// The game's SLOD chunk, measured on downtown 2026-09-06: dt1_lod_03_04_05_11 (SLOD2) is FOUR blocks'
+// LOD shells baked into ONE 7,984-triangle drawable over a 498 x 397 m footprint, textured by two
+// 1024^2 atlases (+ 512^2 speculars) in its own txd, lodDist 1,500. That is what Unreal's merge-with-
+// material-baking produces, so: merge the parent's children (the next-finer shells placed under it),
+// bake their materials to an atlas of AtlasSize, reduce the merged geometry to TrianglePercent, wrap
+// it in a palette archetype (own txd, the old parent's lodDist, bounds from the mesh) and re-point the
+// parent entity at it. Lineage is untouched: ordinals, parentIndex, numChildren stay; the parent's
+// position moves to the merged pivot (the export rebuilds that one entity).
+// The baked textures are re-instanced onto RUDE's opaque master (Diffuse / Normal) so the ydr and ytd
+// writers see the parameters they already know.
+FString URudeToolset::RebuildLodChunk(const FString& ParentLabel, const FString& NewArchetypeName,
+                                      const FString& TrianglePercent, const FString& AtlasSize, const FString& PaletteFolder)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	AActor* PA = RudeFindActorByLabel(World, ParentLabel);
+	if (!PA) { return Fail(FString::Printf(TEXT("no actor labelled '%s'"), *ParentLabel)); }
+	URudeEntityComponent* PR = PA->FindComponentByClass<URudeEntityComponent>();
+	if (!PR) { return Fail(TEXT("that actor carries no RUDE entity")); }
+	if (RudeIsHdLevel(PR->LodLevel)) { return Fail(TEXT("give a LOD/SLOD parent, not an HD entity (MakeLodArchetype rebuilds an HD's own LOD)")); }
+	if (PR->LodChildren.Num() == 0) { return Fail(TEXT("that parent has no children placed in this level - nothing to merge")); }
+	if (PR->bLodPartial) { return Fail(TEXT("that parent's children are not all in this level (RUDE_LOD_PARTIAL); merging a partial set would drop the rest from the chunk")); }
+	const FString Palette = PaletteFolder.TrimStartAndEnd().IsEmpty() ? FString(TEXT("/Game/RUDE/Palette/Downtown")) : PaletteFolder.TrimStartAndEnd();
+	const FString OldName = PR->ArchetypeName.ToLower();
+	URudeArchetype* OldArch = LoadObject<URudeArchetype>(nullptr, *(Palette / OldName + TEXT(".") + OldName));
+	FString NewName = NewArchetypeName.TrimStartAndEnd().ToLower();
+	if (NewName.IsEmpty()) { NewName = OldName + TEXT("_rchunk"); }
+	if (URudeArchetype* Existing = LoadObject<URudeArchetype>(nullptr, *(Palette / NewName + TEXT(".") + NewName)))
+	{
+		if (Existing->SourceIndex >= 0 || !Existing->SourceXml.IsEmpty()) { return Fail(FString::Printf(TEXT("'%s' is a game archetype in the palette; choose a NewArchetypeName the game does not use"), *NewName)); }
+	}
+	const double Pct = FMath::Clamp(TrianglePercent.TrimStartAndEnd().IsEmpty() ? 50.0 : FCString::Atod(*TrianglePercent), 1.0, 100.0);
+	const int32 Atlas = FMath::Clamp(AtlasSize.TrimStartAndEnd().IsEmpty() ? 1024 : FCString::Atoi(*AtlasSize), 128, 4096);
+
+	// 1) the components to merge: every child's mesh (proxies and missing meshes are skipped and counted)
+	TArray<UPrimitiveComponent*> Comps;
+	int32 ChildTris = 0, Skipped = 0;
+	FString MeshFolder;
+	for (const TSoftObjectPtr<AActor>& C : PR->LodChildren)
+	{
+		AActor* CA = C.Get();
+		UStaticMeshComponent* SMC = CA ? CA->FindComponentByClass<UStaticMeshComponent>() : nullptr;
+		if (!SMC || !SMC->GetStaticMesh() || CA->Tags.Contains(FName(TEXT("RUDE_PROXY")))) { ++Skipped; continue; }
+		Comps.Add(SMC);
+		if (const FMeshDescription* D = SMC->GetStaticMesh()->GetMeshDescription(0)) { ChildTris += D->Triangles().Num(); }
+		if (MeshFolder.IsEmpty()) { MeshFolder = FPackageName::GetLongPackagePath(SMC->GetStaticMesh()->GetOutermost()->GetName()); }
+	}
+	if (Comps.Num() == 0) { return Fail(TEXT("none of the children has a real mesh to merge")); }
+
+	// 2) merge + bake (the engine's flatten material; re-instanced onto the RUDE master below)
+	IMeshMergeUtilities& Merge = FModuleManager::Get().LoadModuleChecked<IMeshMergeModule>("MeshMergeUtilities").GetUtilities();
+	FMeshMergingSettings MS;
+	MS.bMergeMaterials = true;
+	MS.bMergePhysicsData = false;
+	MS.bGenerateLightMapUV = false;
+	MS.bComputedLightMapResolution = false;
+	MS.bBakeVertexDataToMesh = false;
+	MS.bUseVertexDataForBakingMaterial = false;
+	MS.bReuseMeshLightmapUVs = false;
+	MS.bMergeEquivalentMaterials = true;
+	MS.bAllowDistanceField = false;
+	MS.bSupportRayTracing = false;
+	MS.LODSelectionType = EMeshLODSelectionType::SpecificLOD;
+	MS.SpecificLOD = 0;
+	MS.MaterialSettings.TextureSizingType = TextureSizingType_UseSingleTextureSize;
+	MS.MaterialSettings.TextureSize = FIntPoint(Atlas, Atlas);
+	MS.MaterialSettings.bNormalMap = true;
+	MS.MaterialSettings.bSpecularMap = false;
+	MS.MaterialSettings.bMetallicMap = false;
+	MS.MaterialSettings.bRoughnessMap = false;
+	MS.MaterialSettings.bEmissiveMap = false;
+	MS.MaterialSettings.bOpacityMap = false;
+	MS.MaterialSettings.bOpacityMaskMap = false;
+	MS.MaterialSettings.bAmbientOcclusionMap = false;
+	TArray<UObject*> Assets;
+	FVector MergedLocation = FVector::ZeroVector;
+	const FString MergePkgBase = MeshFolder / (NewName + TEXT("_merge"));
+	// the engine's flatten material is the bake target (a null base material is dereferenced inside the
+	// merge - measured as an access violation 2026-09-06); the result is re-instanced onto RUDE's master below
+	UMaterialInterface* Flatten = GEngine ? GEngine->DefaultFlattenMaterial : nullptr;
+	if (!Flatten) { return Fail(TEXT("no DefaultFlattenMaterial in this editor (Engine.DefaultFlattenMaterialName)")); }
+	Merge.MergeComponentsToStaticMesh(Comps, World, MS, Flatten, nullptr, MergePkgBase, Assets, MergedLocation, 1.0f, /*bSilent*/ true);
+	UStaticMesh* Merged = nullptr;
+	UMaterialInstanceConstant* BakedMI = nullptr;
+	TArray<UTexture2D*> BakedTex;
+	for (UObject* O : Assets)
+	{
+		if (UStaticMesh* M = Cast<UStaticMesh>(O)) { Merged = M; }
+		else if (UMaterialInstanceConstant* MI = Cast<UMaterialInstanceConstant>(O)) { BakedMI = MI; }
+		else if (UTexture2D* T = Cast<UTexture2D>(O)) { BakedTex.Add(T); }
+	}
+	if (!Merged) { return Fail(TEXT("the merge produced no static mesh")); }
+	const FMeshDescription* MergedDesc = Merged->GetMeshDescription(0);
+	if (!MergedDesc) { return Fail(TEXT("the merged mesh has no source geometry")); }
+	const int32 MergedTris = MergedDesc->Triangles().Num();
+
+	// 3) the chunk drawable: the merged geometry reduced to TrianglePercent, as its own asset
+	const FString MeshPkgName = MeshFolder / NewName;
+	UPackage* MeshPkg = CreatePackage(*MeshPkgName);
+	MeshPkg->FullyLoad();
+	if (UObject* Stale = StaticFindObject(UStaticMesh::StaticClass(), MeshPkg, *NewName)) { Stale->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors | REN_NonTransactional); }
+	UStaticMesh* NewMesh = DuplicateObject<UStaticMesh>(Merged, MeshPkg, FName(*NewName));
+	if (!NewMesh) { return Fail(TEXT("could not copy the merged mesh")); }
+	NewMesh->SetFlags(RF_Public | RF_Standalone);
+	NewMesh->ClearFlags(RF_Transient);
+	IMeshReduction* Reducer = FModuleManager::LoadModuleChecked<IMeshReductionManagerModule>("MeshReductionInterface").GetStaticMeshReductionInterface();
+	if (!Reducer) { return Fail(TEXT("no static mesh reduction module is available in this editor")); }
+	FMeshDescription Reduced;
+	FStaticMeshAttributes(Reduced).Register();
+	{
+		FOverlappingCorners Corners;
+		FStaticMeshOperations::FindOverlappingCorners(Corners, *MergedDesc, THRESH_POINTS_ARE_SAME);
+		FMeshReductionSettings RS;
+		RS.TerminationCriterion = EStaticMeshReductionTerimationCriterion::Triangles;
+		RS.PercentTriangles = (float)(Pct / 100.0);
+		RS.PercentVertices = 1.0f;
+		float MaxDeviation = 0.f;
+		Reducer->ReduceMeshDescription(Reduced, MaxDeviation, *MergedDesc, Corners, RS);
+	}
+	const int32 TrisAfter = Reduced.Triangles().Num();
+	NewMesh->SetNumSourceModels(1);
+	{
+		FMeshDescription* Dst = NewMesh->CreateMeshDescription(0, MoveTemp(Reduced));
+		if (!Dst) { return Fail(TEXT("could not store the reduced chunk geometry")); }
+		NewMesh->CommitMeshDescription(0);
+		FStaticMeshSourceModel& SM = NewMesh->GetSourceModel(0);
+		SM.ReductionSettings.PercentTriangles = 1.0f;
+		SM.ReductionSettings.PercentVertices = 1.0f;
+		SM.BuildSettings.bRecomputeNormals = false;
+		SM.BuildSettings.bRecomputeTangents = false;
+	}
+	// the baked textures onto the RUDE opaque master, under the sampler names the writers know
+	FString TexNames;
+	{
+		UMaterial* Master = LoadObject<UMaterial>(nullptr, TEXT("/RUDE/Masters/M_RUDE_Opaque.M_RUDE_Opaque"));
+		UTexture* Diffuse = nullptr; UTexture* Normal = nullptr;
+		if (BakedMI)
+		{
+			TArray<FMaterialParameterInfo> Infos; TArray<FGuid> Ids;
+			BakedMI->GetAllTextureParameterInfo(Infos, Ids);
+			for (const FMaterialParameterInfo& I : Infos)
+			{
+				UTexture* T = nullptr;
+				if (!BakedMI->GetTextureParameterValue(I, T) || !T) { continue; }
+				const FString N = I.Name.ToString();
+				if (N.Contains(TEXT("Diffuse")) || N.Contains(TEXT("BaseColor"))) { Diffuse = T; }
+				else if (N.Contains(TEXT("Normal"))) { Normal = T; }
+			}
+		}
+		// RAGE names for the atlases: <chunk>_a / <chunk>_n, by renaming the baked texture objects
+		if (Diffuse) { Diffuse->Rename(*(NewName + TEXT("_a")), nullptr, REN_DontCreateRedirectors | REN_NonTransactional); Diffuse->MarkPackageDirty(); TexNames += TEXT("\"") + NewName + TEXT("_a\""); }
+		if (Normal) { Normal->Rename(*(NewName + TEXT("_n")), nullptr, REN_DontCreateRedirectors | REN_NonTransactional); Normal->MarkPackageDirty(); TexNames += FString(TexNames.IsEmpty() ? TEXT("") : TEXT(",")) + TEXT("\"") + NewName + TEXT("_n\""); }
+		if (Master)
+		{
+			const FString MIName = TEXT("MI_") + NewName;
+			UPackage* MIPkg = CreatePackage(*(MeshFolder / MIName));
+			MIPkg->FullyLoad();
+			UMaterialInstanceConstant* MI = FindObject<UMaterialInstanceConstant>(MIPkg, *MIName);
+			if (!MI) { MI = NewObject<UMaterialInstanceConstant>(MIPkg, FName(*MIName), RF_Public | RF_Standalone); }
+			MI->SetParentEditorOnly(Master);
+			if (Diffuse) { MI->SetTextureParameterValueEditorOnly(FMaterialParameterInfo(TEXT("Diffuse")), Diffuse); }
+			if (Normal) { MI->SetTextureParameterValueEditorOnly(FMaterialParameterInfo(TEXT("Normal")), Normal); }
+			MI->PostEditChange();
+			MI->MarkPackageDirty();
+			TArray<FStaticMaterial> Mats = NewMesh->GetStaticMaterials();
+			for (FStaticMaterial& SMat : Mats) { SMat.MaterialInterface = MI; }
+			if (Mats.Num() == 0) { Mats.Add(FStaticMaterial(MI, FName(TEXT("chunk")))); }
+			NewMesh->SetStaticMaterials(Mats);
+		}
+	}
+	NewMesh->Build(/*bSilent*/ true);
+	NewMesh->PostEditChange();
+	NewMesh->MarkPackageDirty();
+
+	// 4) the palette archetype
+	const FString ArchPkgName = Palette / NewName;
+	UPackage* ArchPkg = CreatePackage(*ArchPkgName);
+	ArchPkg->FullyLoad();
+	URudeArchetype* NA = FindObject<URudeArchetype>(ArchPkg, *NewName);
+	if (!NA) { NA = NewObject<URudeArchetype>(ArchPkg, FName(*NewName), RF_Public | RF_Standalone); }
+	NA->ArchetypeKind = TEXT("CBaseArchetypeDef");
+	NA->Name = NewName; NA->AssetName = NewName; NA->AssetType = TEXT("ASSET_TYPE_DRAWABLE");
+	NA->TextureDictionary = NewName;
+	NA->PhysicsDictionary.Reset(); NA->DrawableDictionary.Reset(); NA->ClipDictionary.Reset();
+	NA->LodDist = PR->LodDist > 0.f ? PR->LodDist : (OldArch ? OldArch->LodDist : 1500.f);
+	NA->HdTextureDist = OldArch ? OldArch->HdTextureDist : 0.f;
+	NA->Flags = OldArch ? OldArch->Flags : 0u;
+	NA->SpecialAttribute = 0; NA->TimeFlags = 0; NA->ExtensionsXml.Reset(); NA->MloXml.Reset();
+	{
+		const FBox B = NewMesh->GetBoundingBox();
+		const FVector Mn(B.Min.X / 100.0, -B.Max.Y / 100.0, B.Min.Z / 100.0);
+		const FVector Mx(B.Max.X / 100.0, -B.Min.Y / 100.0, B.Max.Z / 100.0);
+		NA->BbMin = Mn; NA->BbMax = Mx; NA->BsCentre = (Mn + Mx) * 0.5; NA->BsRadius = (float)((Mx - Mn).Size() * 0.5);
+	}
+	NA->Mesh = NewMesh;
+	NA->SourceYtyp = OldArch ? OldArch->SourceYtyp : FString();
+	NA->SourceSlot = OldArch ? OldArch->SourceSlot : FString();
+	NA->SourceIndex = -1; NA->SourceXml.Reset(); NA->SourceFieldsKey.Reset();
+	NA->MarkPackageDirty();
+	{
+		FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+		ARM.Get().AssetCreated(NewMesh); ARM.Get().AssetCreated(NA);
+	}
+
+	// 5) re-point the parent: new archetype, new mesh, the merged pivot as its position
+	PA->Modify();
+	PR->ArchetypeName = NewName;
+	if (UStaticMeshComponent* PS = PA->FindComponentByClass<UStaticMeshComponent>()) { PS->SetStaticMesh(NewMesh); }
+	PA->Tags.Remove(FName(TEXT("RUDE_PROXY")));
+	PA->SetActorTransform(FTransform(FQuat::Identity, MergedLocation, FVector::OneVector));
+	PA->MarkPackageDirty();
+	// the scratch merge assets are not kept (the reduced copy is the deliverable)
+	if (Merged) { Merged->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors | REN_NonTransactional); Merged->MarkAsGarbage(); }
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"parent\":\"%s:%d\",\"level\":\"%s\",\"childrenMerged\":%d,\"childrenSkipped\":%d,\"childTriangles\":%d,\"mergedTriangles\":%d,\"chunkTriangles\":%d,")
+		TEXT("\"newArchetype\":\"%s\",\"mesh\":\"%s\",\"atlas\":%d,\"textures\":[%s],\"lodDist\":%g,\"bsRadius\":%g,\"pivotUE\":[%.1f,%.1f,%.1f],\"targetYtyp\":\"%s\",")
+		TEXT("\"note\":\"then: ExportYdrBinary(mesh, <name>.ydr, NOBOUND) + ExportMeshTextures(mesh, <name>.ytd, %d) + ExportPaletteYtyps + ExportLevelYmaps\"}"),
+		*RudeJsonEscape(PR->SourceYmap), PR->SourceIndex, *PR->LodLevel, Comps.Num(), Skipped, ChildTris, MergedTris, TrisAfter,
+		*RudeJsonEscape(NewName), *RudeJsonEscape(MeshPkgName), Atlas, *TexNames, NA->LodDist, NA->BsRadius, MergedLocation.X, MergedLocation.Y, MergedLocation.Z,
+		*RudeJsonEscape(NA->SourceYtyp), Atlas);
 }
 
 // ---- PickAt (agent) -----------------------------------------------------------------------

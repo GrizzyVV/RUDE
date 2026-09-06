@@ -301,6 +301,12 @@ public:
 	static FString MakeLodArchetype(const FString& ActorLabel, const FString& NewArchetypeName,
 	                                const FString& TrianglePercent, const FString& LodDist, const FString& PaletteFolder);
 
+	// Rebuild an SLOD chunk: merge the parent's children (the next-finer shells under it) into one
+	// baked-atlas drawable, reduce it, wrap it in a palette archetype, re-point the parent entity.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Rebuild a far-distance chunk: merge everything under it into one simplified model with one texture sheet.", RudeAudience="agent"))
+	static FString RebuildLodChunk(const FString& ParentLabel, const FString& NewArchetypeName,
+	                               const FString& TrianglePercent, const FString& AtlasSize, const FString& PaletteFolder);
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);

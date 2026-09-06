@@ -28,6 +28,7 @@ public class RudeEditor : ModuleRules
 			"MeshDescription",
 			"StaticMeshDescription",
 			"MeshReductionInterface",
+			"MeshMergeUtilities",
 			"MeshUtilitiesCommon",
 			"AssetRegistry",
 			"ToolsetRegistry",

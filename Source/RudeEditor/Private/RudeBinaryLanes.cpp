@@ -698,6 +698,7 @@ FString URudeToolset::ExportMeshTextures(const FString& AssetPath, const FString
 			UTexture* T = nullptr;
 			if (!MIC->GetTextureParameterValue(FMaterialParameterInfo(Param), T) || !T) { continue; }
 			const FString Path = T->GetPathName();
+			if (Path.StartsWith(TEXT("/Engine/"))) { continue; }   // a master's unused slot holds an engine default: not the mesh's texture
 			if (Seen.Contains(Path)) { continue; }
 			Seen.Add(Path);
 			const FString Usage = FString(Param).ToUpper();
