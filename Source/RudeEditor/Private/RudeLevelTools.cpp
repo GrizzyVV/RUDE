@@ -1587,6 +1587,18 @@ static AActor* RudeFindActorByLabel(UWorld* World, const FString& Label)
 {
 	const FString L = Label.TrimStartAndEnd();
 	FString Ymap, Idx;
+	if (L.Split(TEXT(":"), &Ymap, &Idx) && (Idx == TEXT("new") || Idx.StartsWith(TEXT("new:"))))
+	{
+		// "<ymap>:new" / "<ymap>:new:<archetype>": an entity authored in RUDE (no source ordinal yet)
+		const FString Arch = Idx.StartsWith(TEXT("new:")) ? Idx.Mid(4).ToLower() : FString();
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			const URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>();
+			if (R && R->SourceIndex < 0 && R->SourceYmap.Equals(Ymap, ESearchCase::IgnoreCase)
+				&& (Arch.IsEmpty() || R->ArchetypeName.ToLower() == Arch)) { return *It; }
+		}
+		return nullptr;
+	}
 	if (L.Split(TEXT(":"), &Ymap, &Idx) && Idx.IsNumeric())
 	{
 		const int32 I = FCString::Atoi(*Idx);
@@ -1720,7 +1732,7 @@ FString URudeToolset::LodAudit()
 	TArray<URudeEntityComponent*> All;
 	RudeCountLodKids(World, Comp, Kids, All);
 	const TMap<const URudeEntityComponent*, int32> NoOrdinals;
-	int32 Links = 0, Partial = 0, Unresolved = 0, Diffs = 0, Refusals = 0, DiffParent = 0, DiffCount = 0, DiffLevel = 0;
+	int32 Links = 0, Partial = 0, Unresolved = 0, Diffs = 0, Refusals = 0, DiffParent = 0, DiffCount = 0, DiffLevel = 0, Pending = 0;
 	FString Rows;
 	for (const URudeEntityComponent* R : All)
 	{
@@ -1736,6 +1748,9 @@ FString URudeToolset::LodAudit()
 			continue;
 		}
 		if (!D.bChanged) { continue; }
+		// an entity authored in RUDE (no source ordinal) or whose link was edited derives at export:
+		// that is PENDING, not a disagreement with the game's data
+		if (R->SourceIndex < 0 || R->SourceFieldsKey.IsEmpty() || R->FieldsKey() != R->SourceFieldsKey) { ++Pending; continue; }
 		++Diffs;
 		if (D.ParentIndex != R->ParentIndex) { ++DiffParent; }
 		if (D.NumChildren != R->NumChildren) { ++DiffCount; }
@@ -1747,8 +1762,8 @@ FString URudeToolset::LodAudit()
 				R->ParentIndex, R->NumChildren, *R->LodLevel, D.ParentIndex, D.NumChildren, *D.LodLevel);
 		}
 	}
-	return FString::Printf(TEXT("{\"ok\":%s,\"entities\":%d,\"links\":%d,\"unresolved\":%d,\"partial\":%d,\"diffs\":%d,\"diffParentIndex\":%d,\"diffNumChildren\":%d,\"diffLodLevel\":%d,\"refusals\":%d,\"first\":[%s]}"),
-		(Diffs == 0 && Refusals == 0) ? TEXT("true") : TEXT("false"), All.Num(), Links, Unresolved, Partial, Diffs, DiffParent, DiffCount, DiffLevel, Refusals, *Rows);
+	return FString::Printf(TEXT("{\"ok\":%s,\"entities\":%d,\"links\":%d,\"unresolved\":%d,\"partial\":%d,\"diffs\":%d,\"diffParentIndex\":%d,\"diffNumChildren\":%d,\"diffLodLevel\":%d,\"pendingAtExport\":%d,\"refusals\":%d,\"first\":[%s]}"),
+		(Diffs == 0 && Refusals == 0) ? TEXT("true") : TEXT("false"), All.Num(), Links, Unresolved, Partial, Diffs, DiffParent, DiffCount, DiffLevel, Pending, Refusals, *Rows);
 }
 
 // ---- MakeLodArchetype (Wave 2 / WP8 step 1) ------------------------------------------------
@@ -1940,6 +1955,7 @@ FString URudeToolset::MakeLodArchetype(const FString& ActorLabel, const FString&
 		NR->LodChildren.Add(A);
 		A->Modify();
 		R->LodParent = NewA;
+		R->LodLevel = TEXT("LODTYPES_DEPTH_HD");   // it has a parent now; parentIndex is assigned at export (ordinals)
 		NewA->MarkPackageDirty();
 		A->MarkPackageDirty();
 		Mode = TEXT("placed");
