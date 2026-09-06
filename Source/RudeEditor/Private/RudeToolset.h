@@ -564,6 +564,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Turn an imported vehicle into one you can drive in Play: builds its drivable body and wheels and parks a test-drive car next to it. Then press Play and type Rude.Native EnterVehicle <name>."))
 	static FString BuildDriveable(const FString& ActorLabel, const FString& LocationCm);
 
+	// A REPLACE resource for one ped (custom clothing without a variation-table writer): every drawable the
+	// outfit knows -> stream/<ped>.ydd under the game's entry names, every imported texture -> stream/<ped>.ytd,
+	// + fxmanifest.lua. OutfitAssetPath = the outfit asset or just the ped name. Options pass to ExportYddBinary.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Pack a ped's clothing and textures as a FiveM resource that replaces the game's own files for that ped.", RudeAudience="agent"))
+	static FString ExportPedReplace(const FString& OutfitAssetPath, const FString& OutDir, const FString& Options);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

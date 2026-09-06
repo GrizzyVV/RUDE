@@ -36,6 +36,8 @@
 #include "Animation/Skeleton.h"
 #include "Animation/SkeletalMeshActor.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Misc/FileHelper.h"
+#include "HAL/FileManager.h"
 #include "AssetCompilingManager.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "BoneWeights.h"
@@ -1004,4 +1006,97 @@ FString URudeToolset::SetPedOutfit(const FString& ActorLabel, const FString& Slo
 	A->MarkPackageDirty();
 	return FString::Printf(TEXT("{\"ok\":true,\"ped\":\"%s\",\"slot\":\"%s\",\"drawable\":\"%s\",\"mesh\":\"%s\",\"letter\":\"%s\",\"texture\":\"%s\",\"materialSlotsOverridden\":%d,\"part\":\"%s\"}"),
 		*RudeJsonEscape(PedName), *RudeJsonEscape(Comp->Slot), *RudeJsonEscape(Dr->Name), *RudeJsonEscape(M->GetPathName()), *RudeJsonEscape(Letter), *RudeJsonEscape(TexName), SlotsOverridden, *RudeJsonEscape(Part->GetName()));
+}
+
+// ---- ExportPedReplace (agent + Matt) --------------------------------------------------------
+// GDD "custom clothing", the path that needs NO variation-table writer: a REPLACE resource for one ped.
+// Every drawable the outfit knows (all slots, all indices, the High mesh) goes into stream/<ped>.ydd under
+// the game's own entry names (joaat(<comp>_<ddd>_<class>) = the game's hash), every texture imported from
+// the ped's dictionary goes into stream/<ped>.ytd under its own name, plus fxmanifest.lua. Streamed, the
+// pair shadows the game's files by name - edit one part in UE, export, the ped wears it. Rough: High only.
+FString URudeToolset::ExportPedReplace(const FString& OutfitAssetPath, const FString& OutDir, const FString& Options)
+{
+	using namespace RudePeds;
+	auto Bad = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	FString Path = OutfitAssetPath.TrimStartAndEnd();
+	if (Path.IsEmpty()) { return Bad(TEXT("give the outfit asset (/Game/RUDE/Peds/<ped>/<ped>_outfit) or the ped name")); }
+	if (!Path.StartsWith(TEXT("/"))) { Path = FString::Printf(TEXT("/Game/RUDE/Peds/%s/%s_outfit"), *Path, *Path); }
+	if (!Path.Contains(TEXT("."))) { Path += TEXT(".") + FPackageName::GetShortName(Path); }
+	URudePedOutfit* Outfit = LoadObject<URudePedOutfit>(nullptr, *Path);
+	if (!Outfit) { return Bad(FString::Printf(TEXT("outfit asset not found: %s (ImportPed builds it)"), *Path)); }
+	const FString Ped = Outfit->PedName.IsEmpty() ? FPackageName::GetShortName(Path).Replace(TEXT("_outfit"), TEXT("")) : Outfit->PedName;
+	if (OutDir.TrimStartAndEnd().IsEmpty()) { return Bad(TEXT("OutDir is empty")); }
+	const FString StreamDir = OutDir / TEXT("stream");
+	IFileManager::Get().MakeDirectory(*StreamDir, true);
+
+	// 1) the dictionary: every drawable with a mesh, under the game's own entry name
+	TArray<FString> Problems;
+	FString Paths, Names;
+	int32 Drawables = 0, DrawablesWithoutMesh = 0;
+	for (const FRudePedComponent& C : Outfit->Components)
+	{
+		for (const FRudePedDrawable& D : C.Drawables)
+		{
+			const FString MeshPath = D.Mesh.ToSoftObjectPath().ToString();
+			if (MeshPath.IsEmpty() || D.Name.IsEmpty() || D.Name.EndsWith(TEXT("_?"))) { ++DrawablesWithoutMesh; continue; }
+			Paths += (Paths.IsEmpty() ? TEXT("") : TEXT(",")) + MeshPath;
+			Names += (Names.IsEmpty() ? TEXT("") : TEXT(",")) + D.Name;
+			++Drawables;
+		}
+	}
+	if (Drawables == 0) { return Bad(TEXT("the outfit names no drawable with a mesh")); }
+	const FString YddPath = StreamDir / (Ped + TEXT(".ydd"));
+	const FString YddVerdict = ExportYddBinary(Paths, Names, YddPath, Options);
+	const bool bYddOk = YddVerdict.Contains(TEXT("\"ok\":true"));
+	if (!bYddOk) { Problems.Add(TEXT("ydd: ") + YddVerdict.Left(300)); }
+
+	// 2) the texture dictionary: everything ImportPed brought in from <ped>.ytd, usage read off the asset
+	TArray<FAssetData> TexAssets;
+	{
+		FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		ARM.Get().WaitForCompletion();
+		ARM.Get().GetAssetsByPath(FName(*(TEXT("/Game/RUDE/Textures/") + Ped)), TexAssets, false);
+	}
+	FString Specs;
+	int32 Textures = 0;
+	for (const FAssetData& AD : TexAssets)
+	{
+		UTexture2D* T = Cast<UTexture2D>(AD.GetAsset());
+		if (!T) { continue; }
+		const TCHAR* Usage = (T->CompressionSettings == TC_Normalmap) ? TEXT("NORMAL") : (!T->SRGB ? TEXT("SPECULAR") : TEXT("DIFFUSE"));
+		Specs += FString::Printf(TEXT("%s%s;%s;%s"), Specs.IsEmpty() ? TEXT("") : TEXT(","), *T->GetPathName(), *T->GetName(), Usage);
+		++Textures;
+	}
+	FString YtdVerdict; bool bYtdOk = false;
+	const FString YtdPath = StreamDir / (Ped + TEXT(".ytd"));
+	if (Textures > 0)
+	{
+		YtdVerdict = ExportYtdBinary(Specs, YtdPath, TEXT("0"));
+		bYtdOk = YtdVerdict.Contains(TEXT("\"ok\":true"));
+		if (!bYtdOk) { Problems.Add(TEXT("ytd: ") + YtdVerdict.Left(300)); }
+	}
+	else { Problems.Add(FString::Printf(TEXT("no textures under /Game/RUDE/Textures/%s - the ped streams untextured (ImportPed imports them when the corpus has pixels)"), *Ped)); }
+
+	// 3) the manifest, written once and kept
+	const FString ManifestPath = OutDir / TEXT("fxmanifest.lua");
+	FString ManifestState = TEXT("kept");
+	if (!FPaths::FileExists(ManifestPath))
+	{
+		const FString Manifest = FString::Printf(TEXT(
+			"fx_version 'cerulean'\ngame 'gta5'\n\n"
+			"-- Ped REPLACE resource for '%s': stream/%s.ydd and stream/%s.ytd carry the game's own file names,\n"
+			"-- so they shadow the vanilla files - no variation table (ymt) is needed. Every drawable the ped's\n"
+			"-- table lists is inside the dictionary under its vanilla entry name (joaat of <comp>_<ddd>_<class>).\n"
+			"-- High detail only (the game's own dictionaries carry three LOD groups); if a part vanishes at\n"
+			"-- distance, that is why. Textures are every name the vanilla dictionary held, re-encoded.\n"),
+			*Ped, *Ped, *Ped);
+		ManifestState = FFileHelper::SaveStringToFile(Manifest, *ManifestPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ? TEXT("written") : TEXT("writeFailed");
+	}
+	FString ProblemsJson;
+	for (const FString& P : Problems) { ProblemsJson += (ProblemsJson.IsEmpty() ? TEXT("") : TEXT(",")) + FString::Printf(TEXT("\"%s\""), *RudeJsonEscape(P)); }
+	return FString::Printf(TEXT("{\"ok\":%s,\"ped\":\"%s\",\"outDir\":\"%s\",\"yddPath\":\"%s\",\"drawables\":%d,\"drawablesWithoutMesh\":%d,\"yddEntries\":%d,\"yddBytes\":%d,")
+		TEXT("\"ytdPath\":\"%s\",\"textures\":%d,\"ytdBytes\":%d,\"manifest\":\"%s\",\"problems\":[%s]}"),
+		(bYddOk && (Textures == 0 || bYtdOk)) ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Ped), *RudeJsonEscape(OutDir), *RudeJsonEscape(YddPath),
+		Drawables, DrawablesWithoutMesh, JsonInt(YddVerdict, TEXT("entries"), -1), JsonInt(YddVerdict, TEXT("bytes"), -1),
+		*RudeJsonEscape(YtdPath), Textures, JsonInt(YtdVerdict, TEXT("bytes"), -1), *ManifestState, *ProblemsJson);
 }
