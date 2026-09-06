@@ -500,6 +500,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show the FiveM script lines that do in game what a sandbox command does in Play: load a map, run a cutscene, switch an interior set, enable a scenario group, set the clock."))
 	static FString EmitNativeSnippet(const FString& Kind, const FString& Name);
 
+	// The ped variation matrix as a surface: drawable D of slot S on the ped, wearing texture letter L.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Dress a character: pick which clothing piece a body slot wears and which colour variant.", RudeAudience="agent"))
+	static FString SetPedOutfit(const FString& ActorLabel, const FString& Slot, const FString& DrawableIndex, const FString& TextureLetter);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

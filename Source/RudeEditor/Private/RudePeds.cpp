@@ -35,6 +35,7 @@
 
 #include "Animation/Skeleton.h"
 #include "Animation/SkeletalMeshActor.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "AssetCompilingManager.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "BoneWeights.h"
@@ -897,4 +898,103 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 		TexturesInMatrix, TexturesResolved, TotalVerts, TotalUnweighted, TotalOutOfRange,
 		TotalTrisOut, TotalTris, BuiltSections, *RudeJsonEscape(PedFolder / SkelName), *RudeJsonEscape(PedFolder / OutfitName), *RudeJsonEscape(ActorLabel), PartsWorn,
 		*MeshesJson, *ProblemsJson);
+}
+
+// ---- SetPedOutfit (agent + Matt) ------------------------------------------------------------
+// The variation matrix as a surface: put drawable D of component slot S on the ped, wearing texture
+// letter L (a..). Drawables are the outfit asset's; the part is the actor's leader component (the first
+// worn slot) or its Part_<slot> component; the letter lands on the part's materials as a Diffuse
+// override (a dynamic instance, editor preview). Rough by design: the game's own rule is the ymt's
+// per-drawable texture list, which the asset carries.
+FString URudeToolset::SetPedOutfit(const FString& ActorLabel, const FString& Slot, const FString& DrawableIndex, const FString& TextureLetter)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	AActor* A = nullptr;
+	FString PedName;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (It->GetActorLabel() != ActorLabel.TrimStartAndEnd()) { continue; }
+		for (const FName& T : It->Tags) { const FString S = T.ToString(); if (S.StartsWith(TEXT("RUDE_PED:"))) { PedName = S.Mid(9); } }
+		if (!PedName.IsEmpty()) { A = *It; break; }
+	}
+	if (!A) { return Fail(FString::Printf(TEXT("no RUDE ped actor labelled '%s' (ImportPed labels them PED_<name>)"), *ActorLabel)); }
+	// the outfit asset: the one whose PedName matches, wherever it was imported
+	URudePedOutfit* Outfit = nullptr;
+	{
+		FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+		TArray<FAssetData> Assets;
+		ARM.Get().GetAssetsByClass(URudePedOutfit::StaticClass()->GetClassPathName(), Assets, true);
+		for (const FAssetData& AD : Assets)
+		{
+			URudePedOutfit* O = Cast<URudePedOutfit>(AD.GetAsset());
+			if (O && O->PedName.Equals(PedName, ESearchCase::IgnoreCase)) { Outfit = O; break; }
+		}
+	}
+	if (!Outfit) { return Fail(FString::Printf(TEXT("no URudePedOutfit asset for '%s'"), *PedName)); }
+	const FString S = Slot.TrimStartAndEnd().ToLower();
+	const FRudePedComponent* Comp = Outfit->Components.FindByPredicate([&](const FRudePedComponent& C) { return C.Slot.ToLower() == S; });
+	if (!Comp) { return Fail(FString::Printf(TEXT("the outfit has no component slot '%s'"), *S)); }
+	const int32 DI = FCString::Atoi(*DrawableIndex);
+	const FRudePedDrawable* Dr = Comp->Drawables.FindByPredicate([&](const FRudePedDrawable& D) { return D.DrawableIndex == DI; });
+	if (!Dr) { Dr = Comp->Drawables.IsValidIndex(DI) ? &Comp->Drawables[DI] : nullptr; }
+	if (!Dr) { return Fail(FString::Printf(TEXT("slot %s has no drawable %d (%d drawables)"), *S, DI, Comp->Drawables.Num())); }
+	USkeletalMesh* M = Dr->Mesh.LoadSynchronous();
+	if (!M) { return Fail(FString::Printf(TEXT("drawable %s has no imported mesh"), *Dr->Name)); }
+	// the part: the leader wears the FIRST worn slot; the others are Part_<slot>
+	ASkeletalMeshActor* SA = Cast<ASkeletalMeshActor>(A);
+	USkeletalMeshComponent* Lead = SA ? SA->GetSkeletalMeshComponent() : A->FindComponentByClass<USkeletalMeshComponent>();
+	USkeletalMeshComponent* Part = nullptr;
+	{
+		TArray<USkeletalMeshComponent*> Comps;
+		A->GetComponents<USkeletalMeshComponent>(Comps);
+		const FString Want = TEXT("Part_") + Comp->Slot;
+		for (USkeletalMeshComponent* C : Comps) { if (C->GetName().Equals(Want, ESearchCase::IgnoreCase)) { Part = C; break; } }
+		if (!Part)
+		{
+			// the first worn slot lives on the leader
+			for (const FRudePedComponent& C : Outfit->Components)
+			{
+				if (C.Drawables.Num() == 0 || !C.Drawables[0].Mesh.LoadSynchronous()) { continue; }
+				if (C.Slot.ToLower() == S) { Part = Lead; }
+				break;
+			}
+		}
+		if (!Part)
+		{
+			Part = NewObject<USkeletalMeshComponent>(A, FName(*Want));
+			Part->SetupAttachment(Lead ? static_cast<USceneComponent*>(Lead) : A->GetRootComponent());
+			if (Lead) { Part->SetLeaderPoseComponent(Lead); }
+			Part->RegisterComponent();
+			A->AddInstanceComponent(Part);
+		}
+	}
+	A->Modify();
+	Part->SetSkeletalMeshAsset(M);
+	// the texture letter as a Diffuse override on every material slot that has one
+	FString Letter = TextureLetter.TrimStartAndEnd().ToLower();
+	int32 SlotsOverridden = 0;
+	FString TexName;
+	if (!Letter.IsEmpty())
+	{
+		const FRudePedTexture* Tx = Dr->Textures.FindByPredicate([&](const FRudePedTexture& T) { return T.Letter.ToLower() == Letter; });
+		if (!Tx) { return Fail(FString::Printf(TEXT("drawable %s has no texture letter '%s' (%d letters)"), *Dr->Name, *Letter, Dr->Textures.Num())); }
+		UTexture2D* T = Tx->Texture.LoadSynchronous();
+		if (!T) { return Fail(FString::Printf(TEXT("texture %s is not imported (run ImportPed after the corpus has pixels)"), *Tx->TextureName)); }
+		TexName = Tx->TextureName;
+		for (int32 i = 0; i < Part->GetNumMaterials(); ++i)
+		{
+			UMaterialInterface* Base = Part->GetMaterial(i);
+			if (!Base) { continue; }
+			UMaterialInstanceDynamic* MID = Cast<UMaterialInstanceDynamic>(Base);
+			if (!MID) { MID = UMaterialInstanceDynamic::Create(Base, A); Part->SetMaterial(i, MID); }
+			MID->SetTextureParameterValue(FName(TEXT("Diffuse")), T);
+			++SlotsOverridden;
+		}
+	}
+	Part->MarkRenderStateDirty();
+	A->MarkPackageDirty();
+	return FString::Printf(TEXT("{\"ok\":true,\"ped\":\"%s\",\"slot\":\"%s\",\"drawable\":\"%s\",\"mesh\":\"%s\",\"letter\":\"%s\",\"texture\":\"%s\",\"materialSlotsOverridden\":%d,\"part\":\"%s\"}"),
+		*RudeJsonEscape(PedName), *RudeJsonEscape(Comp->Slot), *RudeJsonEscape(Dr->Name), *RudeJsonEscape(M->GetPathName()), *RudeJsonEscape(Letter), *RudeJsonEscape(TexName), SlotsOverridden, *RudeJsonEscape(Part->GetName()));
 }
