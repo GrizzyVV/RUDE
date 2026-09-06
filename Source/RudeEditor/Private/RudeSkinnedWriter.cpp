@@ -99,7 +99,7 @@ namespace RudeYdd
 	struct FYddVert { FVector3f P; FVector3f N; FVector2f UV; uint8 C[4]; FSkin S; };
 	struct FGeo
 	{
-		FString Slot, Diffuse, Normal, Spec;
+		FString Slot, Diffuse, Normal, Spec, Mat;   // Mat = the material the slot resolved to (measurement)
 		TArray<FYddVert> V; TArray<int32> Idx;
 		FVector3f Mn = FVector3f(FLT_MAX), Mx = FVector3f(-FLT_MAX);
 	};
@@ -245,6 +245,7 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 			if (SlotIdx == INDEX_NONE && Mats.IsValidIndex(GroupID.GetValue())) { SlotIdx = GroupID.GetValue(); }
 			if (Mats.IsValidIndex(SlotIdx))
 			{
+				G.Mat = Mats[SlotIdx].MaterialInterface ? Mats[SlotIdx].MaterialInterface->GetPathName() : FString(TEXT("null"));
 				if (const UMaterialInstanceConstant* MIC = Cast<UMaterialInstanceConstant>(Mats[SlotIdx].MaterialInterface))
 				{
 					auto TexName = [&](const TCHAR* Param) -> FString
@@ -563,8 +564,8 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 		for (const FGeo& G : D.Geos)
 		{
 			DV += G.V.Num(); DT += G.Idx.Num() / 3;
-			Tex += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"diffuse\":\"%s\",\"normal\":\"%s\",\"spec\":\"%s\"}"), Tex.IsEmpty() ? TEXT("") : TEXT(","),
-				*RudeJsonEscape(G.Slot), *RudeJsonEscape(G.Diffuse), *RudeJsonEscape(G.Normal), *RudeJsonEscape(G.Spec));
+			Tex += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"diffuse\":\"%s\",\"normal\":\"%s\",\"spec\":\"%s\"}"), Tex.IsEmpty() ? TEXT("") : TEXT(","),
+				*RudeJsonEscape(G.Slot), *RudeJsonEscape(G.Mat), *RudeJsonEscape(G.Diffuse), *RudeJsonEscape(G.Normal), *RudeJsonEscape(G.Spec));
 		}
 		DJson += FString::Printf(
 			TEXT("%s{\"name\":\"%s\",\"hash\":\"0x%08x\",\"asset\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"sourceVertices\":%d,\"triangles\":%d,")

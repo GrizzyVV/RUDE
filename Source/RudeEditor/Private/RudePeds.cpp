@@ -404,6 +404,7 @@ namespace RudePeds
 		USkeletalMesh* Mesh = nullptr;
 		FString AssetPath;
 		int32 Verts = 0, Tris = 0, Unweighted = 0, OutOfRange = 0, TrisOutOfRange = 0, Geos = 0, GeosDropped = 0;
+		int32 TexBound = -1, TexMissing = -1;   // the twin's material binding, surfaced per mesh (2026-09-06)
 		bool bOwnSkeleton = false;
 	};
 }
@@ -571,12 +572,18 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 		E.bOwnSkeleton = Item->FindChildNode(TEXT("Skeleton")) != nullptr;
 		if (E.bOwnSkeleton) { ++OwnSkeletons; }
 		const FString MeshName = E.ResolvedName;
+		// The twin is PED-QUALIFIED (2026-09-06): the shared lane keys its material instances by mesh name
+		// (/Game/RUDE/Materials/Instances/<mesh>/MI_<mesh>_<geo>), and every ped spells lowr_000_m - so two
+		// peds overwrote one MI, and a stale on-disk MI_lowr_000_m_0 (dangling textures) loaded over the fresh
+		// one: lowr exported with no diffuse while the import had bound 3/3. Unique per ped now.
+		const FString TwinName = Name + TEXT("__") + E.ResolvedName;
 
 		// a) materials through the shared drawable lane: a static twin under _static/ carries the instances
 		const FString StaticFolder = PedFolder / TEXT("_static");
-		const FString TwinVerdict = ImportDrawableNode(Item, MeshName, StaticFolder, &Scope);
+		const FString TwinVerdict = ImportDrawableNode(Item, TwinName, StaticFolder, &Scope);
+		E.TexBound = JsonInt(TwinVerdict, TEXT("boundTextures"), -1); E.TexMissing = JsonInt(TwinVerdict, TEXT("missingTextures"), -1);
 		UStaticMesh* Twin = TwinVerdict.Contains(TEXT("\"ok\":true"))
-			? LoadObject<UStaticMesh>(nullptr, *(StaticFolder / MeshName + TEXT(".") + MeshName)) : nullptr;
+			? LoadObject<UStaticMesh>(nullptr, *(StaticFolder / TwinName + TEXT(".") + TwinName)) : nullptr;
 		if (!Twin) { Problems.Add(FString::Printf(TEXT("%s: static twin (materials) failed: %s"), *MeshName, *TwinVerdict.Left(160))); }
 
 		// b) the skinned geometry (High group only, like every RUDE lane)
@@ -882,9 +889,9 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 	FString MeshesJson, ProblemsJson;
 	for (const FImported& E : Entries)
 	{
-		MeshesJson += FString::Printf(TEXT("%s{\"entry\":\"%s\",\"name\":\"%s\",\"comp\":\"%s\",\"index\":%d,\"class\":\"%s\",\"asset\":\"%s\",\"geometries\":%d,\"geometriesDropped\":%d,\"vertices\":%d,\"triangles\":%d,\"unweighted\":%d,\"influencesOutOfRange\":%d,\"ownSkeleton\":%s}"),
+		MeshesJson += FString::Printf(TEXT("%s{\"entry\":\"%s\",\"name\":\"%s\",\"comp\":\"%s\",\"index\":%d,\"class\":\"%s\",\"asset\":\"%s\",\"geometries\":%d,\"geometriesDropped\":%d,\"vertices\":%d,\"triangles\":%d,\"unweighted\":%d,\"influencesOutOfRange\":%d,\"texturesBound\":%d,\"texturesMissing\":%d,\"ownSkeleton\":%s}"),
 			MeshesJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(E.EntryName), *RudeJsonEscape(E.ResolvedName), *E.Comp, E.Index, *E.Class,
-			*RudeJsonEscape(E.AssetPath), E.Geos, E.GeosDropped, E.Verts, E.Tris, E.Unweighted, E.OutOfRange, E.bOwnSkeleton ? TEXT("true") : TEXT("false"));
+			*RudeJsonEscape(E.AssetPath), E.Geos, E.GeosDropped, E.Verts, E.Tris, E.Unweighted, E.OutOfRange, E.TexBound, E.TexMissing, E.bOwnSkeleton ? TEXT("true") : TEXT("false"));
 	}
 	for (const FString& P : Problems) { ProblemsJson += FString::Printf(TEXT("%s\"%s\""), ProblemsJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(P)); }
 	return FString::Printf(
