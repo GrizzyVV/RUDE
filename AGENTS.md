@@ -320,8 +320,11 @@ Content/Masters/                 M_RUDE_Opaque / Cutout / DecalGeo / Foliage / T
                                   RenderBucket first, preset name as fallback)
 Source/RudeEditor/Private/
   RudeToolset.h                  THE tool surface (every UFUNCTION tool). Start here.
-  RudeToolset.cpp                the implementations (bulk: intake, textures, ydr/yft/ybn import,
-                                 masters, scene import)
+  RudeToolset.cpp                the core (4k lines): master generation, the ydr/yft XML reader
+                                 (RudeYdr), bounds (RudeBound), textures, the single-file import tools
+  RudeMapLanes.cpp               the map/area lane (split 2026-09-06): corpus filebase + archetype
+                                 index, ImportMapArea / ImportArea / ImportMlo, ExportYtyp / ExportYmap,
+                                 batch importers, SaveAssets, FixLevelRefs, SetWorldHour, ImportScene
   RudeBinaryLanes.cpp            the binary lane (split 2026-09-06): the RSC7 ydr reader, the ytd and
                                  ybn writers, ExportYdrBinary[Batch] / ExportYtdBinary / ExportYbnBinary /
                                  ProbeYdrBinary
