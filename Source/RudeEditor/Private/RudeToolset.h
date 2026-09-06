@@ -307,6 +307,11 @@ public:
 	static FString RebuildLodChunk(const FString& ParentLabel, const FString& NewArchetypeName,
 	                               const FString& TrianglePercent, const FString& AtlasSize, const FString& PaletteFolder);
 
+	// Rebake the LOD lights: every entity light extension in the level (or the YmapFilter's ymaps)
+	// becomes one distant light in a <Name>_distlodlights / <Name>_lodlights ymap pair under OutDir/stream.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Rebuild the far-away lights (the dots you see at night from a distance) from every light on the placed objects.", RudeAudience="agent"))
+	static FString RebakeLodLights(const FString& OutDir, const FString& Name, const FString& YmapFilter);
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);

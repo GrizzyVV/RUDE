@@ -2199,6 +2199,191 @@ FString URudeToolset::RebuildLodChunk(const FString& ParentLabel, const FString&
 		*RudeJsonEscape(NA->SourceYtyp), Atlas);
 }
 
+// ---- RebakeLodLights (Wave 2 / WP9) --------------------------------------------------------
+// The game's LOD lights are BAKED from entity light extensions, one per light instance, into a file
+// pair: distlodlights_* (flags 2: DistantLODLightsSOA position + RGBI) parent of lodlights_* (flags 0,
+// contentFlags 128: LODLightsSOA direction / falloff / falloffExponent / timeAndStateFlags / hash /
+// coneInnerAngle / coneOuterAngleOrCapExt / coronaIntensity), index-aligned. Measured on downtown
+// 2026-09-06 (829/832 entity lights have a LOD light at their exact world position; laws 32-33):
+//   position = entity transform applied to posn (+ offsetPosition)      direction = the rotation applied
+//   RGBI = round(intensity*255/50)<<24 | r<<16 | g<<8 | b                (byte 478/829, rgb 808/829)
+//   timeAndStateFlags = timeFlags | (point ? 4 : 8)<<24                   (low 24 bits 768/829)
+//   falloff / falloffExponent verbatim (710 / 751)   cone bytes = trunc(angle*127.5/90) capped 127
+//   coronaIntensity 0 (the game's 0 or 7 is not derivable)   hash: UNKNOWN formula (34 candidates
+//   refuted) -> unique atDataHash(guid, light index); the in-game test judges (law 33).
+// Written as XML (FiveM loads XML ymaps - witnessed July) in the game's own spelling, ten values per
+// line, without ROUT's carried MetaSchema (a fresh file has none).
+static uint32 RudeDataHash(const uint8* B, int32 N, uint32 Seed = 0)
+{
+	uint32 H = Seed;
+	for (int32 i = 0; i < N; ++i) { H += B[i]; H += (H << 10); H ^= (H >> 6); }
+	H += (H << 3); H ^= (H >> 11); H += (H << 15);
+	return H;
+}
+FString URudeToolset::RebakeLodLights(const FString& OutDir, const FString& Name, const FString& YmapFilter)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	if (OutDir.TrimStartAndEnd().IsEmpty()) { return Fail(TEXT("give an OutDir")); }
+	const FString Base = Name.TrimStartAndEnd().IsEmpty() ? FString(TEXT("rude")) : Name.TrimStartAndEnd().ToLower();
+	TSet<FString> Wanted;
+	{
+		TArray<FString> Parts; YmapFilter.ParseIntoArray(Parts, TEXT(","), true);
+		for (FString P : Parts) { P.TrimStartAndEndInline(); if (!P.IsEmpty()) { Wanted.Add(P.ToLower()); } }
+	}
+	struct FLod { FVector Pos; FVector Dir; uint32 Rgbi; uint32 Ts; uint32 Hash; float Falloff, FalloffExp, ConeIn, ConeOut; };
+	TArray<FLod> Lights;
+	int32 Entities = 0, EntitiesWithLights = 0, Malformed = 0;
+	TSet<FString> Ymaps;
+	auto Num = [](const FXmlNode* N, const TCHAR* Tag, double Def) -> double
+	{
+		const FXmlNode* C = N ? N->FindChildNode(Tag) : nullptr;
+		return C ? FCString::Atod(*C->GetAttribute(TEXT("value"))) : Def;
+	};
+	auto Vec = [](const FXmlNode* N, const TCHAR* Tag, FVector& Out) -> bool
+	{
+		const FXmlNode* C = N ? N->FindChildNode(Tag) : nullptr;
+		if (!C) { return false; }
+		TArray<FString> T; C->GetContent().ParseIntoArrayWS(T);
+		if (T.Num() < 3) { return false; }
+		Out = FVector(FCString::Atod(*T[0]), FCString::Atod(*T[1]), FCString::Atod(*T[2]));
+		return true;
+	};
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		const URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>();
+		if (!R) { continue; }
+		++Entities;
+		if (Wanted.Num() > 0 && !Wanted.Contains(R->SourceYmap.ToLower())) { continue; }
+		if (!R->ExtensionsXml.Contains(TEXT("CExtensionDefLightEffect"))) { continue; }
+		const FString Buffer = TEXT("<root>") + R->ExtensionsXml + TEXT("</root>");
+		FXmlFile Doc(Buffer, EConstructMethod::ConstructFromBuffer);
+		const FXmlNode* Root = Doc.IsValid() ? Doc.GetRootNode() : nullptr;
+		if (!Root) { ++Malformed; continue; }
+		const FXmlNode* Ext = Root->FindChildNode(TEXT("extensions"));
+		if (!Ext) { Ext = Root; }
+		const FTransform Xf = It->GetActorTransform();
+		int32 Li = 0;
+		bool bAny = false;
+		for (const FXmlNode* Item : Ext->GetChildrenNodes())
+		{
+			if (Item->GetAttribute(TEXT("type")) != TEXT("CExtensionDefLightEffect")) { continue; }
+			FVector Off = FVector::ZeroVector;
+			if (const FXmlNode* O = Item->FindChildNode(TEXT("offsetPosition")))
+			{
+				Off = FVector(FCString::Atod(*O->GetAttribute(TEXT("x"))), FCString::Atod(*O->GetAttribute(TEXT("y"))), FCString::Atod(*O->GetAttribute(TEXT("z"))));
+			}
+			const FXmlNode* Inst = Item->FindChildNode(TEXT("instances"));
+			if (!Inst) { continue; }
+			for (const FXmlNode* L : Inst->GetChildrenNodes())
+			{
+				FVector Posn, Col, Dir(0, 0, -1);
+				if (!Vec(L, TEXT("posn"), Posn) || !Vec(L, TEXT("colour"), Col)) { ++Malformed; continue; }
+				Vec(L, TEXT("direction"), Dir);
+				const FVector LocalRage = Posn + Off;
+				const FVector LocalUe(LocalRage.X * 100.0, -LocalRage.Y * 100.0, LocalRage.Z * 100.0);
+				const FVector WorldUe = Xf.TransformPosition(LocalUe);
+				const FVector DirUe = Xf.TransformVectorNoScale(FVector(Dir.X, -Dir.Y, Dir.Z)).GetSafeNormal();
+				FLod E;
+				E.Pos = FVector(WorldUe.X / 100.0, -WorldUe.Y / 100.0, WorldUe.Z / 100.0);
+				E.Dir = FVector(DirUe.X, -DirUe.Y, DirUe.Z);
+				const double I = Num(L, TEXT("intensity"), 0.0);
+				const uint32 IB = (uint32)FMath::Clamp(FMath::RoundToInt(I * 255.0 / 50.0), 0, 255);
+				const uint32 r = (uint32)FMath::Clamp((int32)Col.X, 0, 255), g = (uint32)FMath::Clamp((int32)Col.Y, 0, 255), b = (uint32)FMath::Clamp((int32)Col.Z, 0, 255);
+				E.Rgbi = (IB << 24) | (r << 16) | (g << 8) | b;
+				const int32 Type = (int32)Num(L, TEXT("lightType"), 2.0);
+				const uint32 Tf = (uint32)Num(L, TEXT("timeFlags"), 0xFFFFFF) & 0xFFFFFFu;
+				E.Ts = Tf | ((Type == 1 ? 4u : 8u) << 24);
+				E.Falloff = (float)Num(L, TEXT("falloff"), 0.0);
+				E.FalloffExp = (float)Num(L, TEXT("falloffExponent"), 0.0);
+				auto ConeByte = [](double Deg) { return (float)FMath::Min(127, (int32)(Deg * 127.5 / 90.0)); };
+				E.ConeIn = Type == 4 ? 127.f : ConeByte(Num(L, TEXT("coneInnerAngle"), 0.0));
+				E.ConeOut = Type == 4 ? 127.f : ConeByte(Num(L, TEXT("coneOuterAngle"), 0.0));
+				struct { uint32 Guid; uint32 Li; } Key = { R->Guid, (uint32)Li };
+				E.Hash = RudeDataHash((const uint8*)&Key, sizeof(Key));
+				Lights.Add(E);
+				++Li;
+				bAny = true;
+			}
+		}
+		if (bAny) { ++EntitiesWithLights; Ymaps.Add(R->SourceYmap.ToLower()); }
+	}
+	if (Lights.Num() == 0) { return Fail(FString::Printf(TEXT("no entity light extensions found (%d entities seen)"), Entities)); }
+	FVector Mn(DBL_MAX), Mx(-DBL_MAX);
+	for (const FLod& E : Lights) { Mn = Mn.ComponentMin(E.Pos); Mx = Mx.ComponentMax(E.Pos); }
+	auto V3 = [](const TCHAR* Tag, const FVector& V) { return FString::Printf(TEXT(" <%s x=\"%s\" y=\"%s\" z=\"%s\" />\n"), Tag, *RudeNum(V.X), *RudeNum(V.Y), *RudeNum(V.Z)); };
+	auto Header = [&](const FString& FileName, const FString& Parent, int32 Flags, int32 Content) -> FString
+	{
+		FString O = TEXT("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CMapData>\n");
+		O += TEXT(" <name>") + FileName + TEXT("</name>\n");
+		O += Parent.IsEmpty() ? TEXT(" <parent />\n") : (TEXT(" <parent>") + Parent + TEXT("</parent>\n"));
+		O += FString::Printf(TEXT(" <flags value=\"%d\" />\n <contentFlags value=\"%d\" />\n"), Flags, Content);
+		O += V3(TEXT("streamingExtentsMin"), Mn - FVector(500.0)); O += V3(TEXT("streamingExtentsMax"), Mx + FVector(500.0));
+		O += V3(TEXT("entitiesExtentsMin"), Mn); O += V3(TEXT("entitiesExtentsMax"), Mx);
+		O += TEXT(" <entities />\n <containerLods itemType=\"rage__fwContainerLodDef\" />\n <boxOccluders itemType=\"BoxOccluder\" />\n <occludeModels itemType=\"OccludeModel\" />\n <physicsDictionaries />\n");
+		O += TEXT(" <instancedData>\n  <ImapLink />\n  <PropInstanceList itemType=\"rage__fwPropInstanceListDef\" />\n  <GrassInstanceList itemType=\"rage__fwGrassInstanceListDef\" />\n </instancedData>\n");
+		O += TEXT(" <timeCycleModifiers itemType=\"CTimeCycleModifier\" />\n <carGenerators itemType=\"CCarGen\" />\n");
+		return O;
+	};
+	auto Rows = [&](const TCHAR* Tag, TFunctionRef<FString(const FLod&)> Cell) -> FString
+	{
+		FString O = FString::Printf(TEXT("  <%s>\n"), Tag);
+		for (int32 i = 0; i < Lights.Num(); ++i)
+		{
+			if (i % 10 == 0) { O += TEXT("   "); } else { O += TEXT(" "); }
+			O += Cell(Lights[i]);
+			if (i % 10 == 9 || i == Lights.Num() - 1) { O += TEXT("\n"); }
+		}
+		O += FString::Printf(TEXT("  </%s>\n"), Tag);
+		return O;
+	};
+	auto XyzItems = [&](const TCHAR* Tag, TFunctionRef<FVector(const FLod&)> Get) -> FString
+	{
+		FString O = FString::Printf(TEXT("  <%s itemType=\"FloatXYZ\">\n"), Tag);
+		for (const FLod& E : Lights)
+		{
+			const FVector V = Get(E);
+			O += FString::Printf(TEXT("   <Item>\n    <x value=\"%s\" />\n    <y value=\"%s\" />\n    <z value=\"%s\" />\n   </Item>\n"), *RudeNum(V.X), *RudeNum(V.Y), *RudeNum(V.Z));
+		}
+		O += FString::Printf(TEXT("  </%s>\n"), Tag);
+		return O;
+	};
+	const FString Footer = TEXT(" <block>\n  <version value=\"0\" />\n  <flags value=\"0\" />\n  <name></name>\n  <exportedBy>RUDE</exportedBy>\n  <owner></owner>\n  <time></time>\n </block>\n</CMapData>\n");
+	const FString DistName = Base + TEXT("_distlodlights"), LodName = Base + TEXT("_lodlights");
+	// the parent: positions + RGBI
+	FString Dist = Header(DistName, TEXT(""), 2, 256);
+	Dist += TEXT(" <LODLightsSOA>\n  <direction itemType=\"FloatXYZ\" />\n  <falloff />\n  <falloffExponent />\n  <timeAndStateFlags />\n  <hash />\n  <coneInnerAngle />\n  <coneOuterAngleOrCapExt />\n  <coronaIntensity />\n </LODLightsSOA>\n");
+	Dist += TEXT(" <DistantLODLightsSOA>\n");
+	Dist += XyzItems(TEXT("position"), [](const FLod& E) { return E.Pos; });
+	Dist += Rows(TEXT("RGBI"), [](const FLod& E) { return FString::Printf(TEXT("%u"), E.Rgbi); });
+	Dist += TEXT("  <numStreetLights value=\"0\" />\n  <category value=\"0\" />\n </DistantLODLightsSOA>\n");
+	Dist += Footer;
+	// the child: the detail
+	FString Lod = Header(LodName, DistName, 0, 128);
+	Lod += TEXT(" <LODLightsSOA>\n");
+	Lod += XyzItems(TEXT("direction"), [](const FLod& E) { return E.Dir; });
+	Lod += Rows(TEXT("falloff"), [](const FLod& E) { return RudeNum(E.Falloff); });
+	Lod += Rows(TEXT("falloffExponent"), [](const FLod& E) { return RudeNum(E.FalloffExp); });
+	Lod += Rows(TEXT("timeAndStateFlags"), [](const FLod& E) { return FString::Printf(TEXT("%u"), E.Ts); });
+	Lod += Rows(TEXT("hash"), [](const FLod& E) { return FString::Printf(TEXT("%u"), E.Hash); });
+	Lod += Rows(TEXT("coneInnerAngle"), [](const FLod& E) { return RudeNum(E.ConeIn); });
+	Lod += Rows(TEXT("coneOuterAngleOrCapExt"), [](const FLod& E) { return RudeNum(E.ConeOut); });
+	Lod += Rows(TEXT("coronaIntensity"), [](const FLod& E) { return FString(TEXT("0")); });
+	Lod += TEXT(" </LODLightsSOA>\n <DistantLODLightsSOA>\n  <position itemType=\"FloatXYZ\" />\n  <RGBI />\n  <numStreetLights value=\"0\" />\n  <category value=\"0\" />\n </DistantLODLightsSOA>\n");
+	Lod += Footer;
+	IFileManager::Get().MakeDirectory(*(OutDir / TEXT("stream")), true);
+	const FString DistPath = OutDir / TEXT("stream") / (DistName + TEXT(".ymap"));
+	const FString LodPath = OutDir / TEXT("stream") / (LodName + TEXT(".ymap"));
+	if (!FFileHelper::SaveStringToFile(Dist, *DistPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)) { return Fail(TEXT("cannot write ") + DistPath); }
+	if (!FFileHelper::SaveStringToFile(Lod, *LodPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)) { return Fail(TEXT("cannot write ") + LodPath); }
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"lights\":%d,\"entitiesWithLights\":%d,\"entitiesSeen\":%d,\"ymaps\":%d,\"malformed\":%d,\"files\":[\"%s\",\"%s\"],")
+		TEXT("\"extentsM\":[%s,%s],\"note\":\"packings per ENGINEERING_LOG law 32; hash = unique atDataHash(guid, index), formula unknown (law 33); corona 0\"}"),
+		Lights.Num(), EntitiesWithLights, Entities, Ymaps.Num(), Malformed, *RudeJsonEscape(DistPath), *RudeJsonEscape(LodPath),
+		*RudeJsonEscape(FString::Printf(TEXT("%.1f,%.1f,%.1f"), Mn.X, Mn.Y, Mn.Z)), *RudeJsonEscape(FString::Printf(TEXT("%.1f,%.1f,%.1f"), Mx.X, Mx.Y, Mx.Z)));
+}
+
 // ---- PickAt (agent) -----------------------------------------------------------------------
 // What is under a pixel of a CaptureView frame? CamSpec = "x,y,z,pitch,yaw" (';' accepted) as
 // CaptureView; U,V = 0..1 across the frame (aspect = the capture's, default 2103x1230, HFOV 90).
