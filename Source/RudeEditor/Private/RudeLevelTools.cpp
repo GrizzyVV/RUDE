@@ -1861,7 +1861,7 @@ FString URudeToolset::MakeLodArchetype(const FString& ActorLabel, const FString&
 	NA->Name = NewName;
 	NA->AssetName = NewName;
 	NA->AssetType = TEXT("ASSET_TYPE_DRAWABLE");
-	NA->TextureDictionary = HdArch->TextureDictionary;   // the LOD reuses the HD's textures (a lower-res txd is a later refinement)
+	NA->TextureDictionary = NewName;   // its own txd: ExportMeshTextures(mesh, <NewName>.ytd, MaxDim) writes it
 	NA->PhysicsDictionary.Reset();
 	NA->DrawableDictionary.Reset();
 	NA->ClipDictionary.Reset();
@@ -1948,7 +1948,7 @@ FString URudeToolset::MakeLodArchetype(const FString& ActorLabel, const FString&
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"mode\":\"%s\",\"hd\":\"%s\",\"newArchetype\":\"%s\",\"mesh\":\"%s\",\"trianglesBefore\":%d,\"trianglesAfter\":%d,")
 		TEXT("\"lodDist\":%g,\"childLodDist\":%g,\"bsRadius\":%g,\"targetYtyp\":\"%s\",\"lodEntity\":\"%s\",")
-		TEXT("\"note\":\"the drawable still needs ExportYdrBinary(mesh) and the ytyp ExportPaletteYtyps; textures reuse the HD's dictionary; existing lodDist/childLodDist untouched (law 26)\"}"),
+		TEXT("\"note\":\"then: ExportYdrBinary(mesh, <name>.ydr, NOBOUND) + ExportMeshTextures(mesh, <name>.ytd, 256) + ExportPaletteYtyps + ExportLevelYmaps; existing lodDist/childLodDist untouched (law 26)\"}"),
 		*Mode, *RudeJsonEscape(R->ArchetypeName), *RudeJsonEscape(NewName), *RudeJsonEscape(MeshPkgName), TrisBefore, TrisAfter,
 		NewLodDist, PR ? PR->ChildLodDist : R->LodDist, NA->BsRadius, *RudeJsonEscape(NA->SourceYtyp), *RudeJsonEscape(Touched));
 }

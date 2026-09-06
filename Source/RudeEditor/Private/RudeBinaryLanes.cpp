@@ -675,6 +675,43 @@ namespace RudeYtd
 	}
 }
 
+// ---- ExportMeshTextures ----------------------------------------------------------------
+// The textures a static mesh's material instances reference (the Diffuse / Normal parameters
+// the ydr writer names as samplers), packed into ONE .ytd through ExportYtdBinary, downscaled to
+// MaxDim. The LOD texture dictionary: MakeLodArchetype names the LOD's txd after the archetype and
+// this writes it (e.g. MaxDim 256 for a distant shell). Returns ExportYtdBinary's verdict plus the
+// texture list.
+FString URudeToolset::ExportMeshTextures(const FString& AssetPath, const FString& OutYtdPath, const FString& MaxDim)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *AssetPath);
+	if (!Mesh) { return Fail(TEXT("StaticMesh not found")); }
+	TSet<FString> Seen;
+	FString Specs, Names;
+	int32 N = 0;
+	for (const FStaticMaterial& SM : Mesh->GetStaticMaterials())
+	{
+		const UMaterialInstanceConstant* MIC = Cast<UMaterialInstanceConstant>(SM.MaterialInterface);
+		if (!MIC) { continue; }
+		for (const TCHAR* Param : { TEXT("Diffuse"), TEXT("Normal"), TEXT("Specular") })
+		{
+			UTexture* T = nullptr;
+			if (!MIC->GetTextureParameterValue(FMaterialParameterInfo(Param), T) || !T) { continue; }
+			const FString Path = T->GetPathName();
+			if (Seen.Contains(Path)) { continue; }
+			Seen.Add(Path);
+			const FString Usage = FString(Param).ToUpper();
+			Specs += FString::Printf(TEXT("%s%s;%s;%s"), Specs.IsEmpty() ? TEXT("") : TEXT(","), *Path, *T->GetName(), *Usage);
+			Names += FString::Printf(TEXT("%s\"%s\""), Names.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(T->GetName()));
+			++N;
+		}
+	}
+	if (N == 0) { return Fail(TEXT("the mesh's materials reference no Diffuse/Normal/Specular textures")); }
+	FString R = ExportYtdBinary(Specs, OutYtdPath, MaxDim);
+	if (R.EndsWith(TEXT("}"))) { R = R.LeftChop(1) + FString::Printf(TEXT(",\"meshTextures\":%d,\"names\":[%s]}"), N, *Names); }
+	return R;
+}
+
 FString URudeToolset::ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath,
                                       const FString& MaxDim)
 {
@@ -1170,7 +1207,7 @@ FString URudeToolset::ExportYdrBinaryBatch(const FString& AssetFolder, const FSt
 		const FString& A = AssetPaths[i];
 		const FString Name = FPaths::GetBaseFilename(A);
 		const FString Out = OutDir / (Name + TEXT(".ydr"));
-		const FString R = ExportYdrBinary(A, Out);
+		const FString R = ExportYdrBinary(A, Out, TEXT(""));
 		CollisionFromRenderMesh += RudeSumField(R, TEXT("collisionFromRenderMesh"));
 		BoundsIgnored           += RudeSumField(R, TEXT("boundsIgnored"));
 		if (R.Contains(TEXT("\"ok\":true")))
@@ -1214,12 +1251,16 @@ FString URudeToolset::ExportYdrBinaryBatch(const FString& AssetFolder, const FSt
 		*OutDir, *FailedList);
 }
 
-FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath)
+FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath, const FString& Options)
 {
 	auto Fail = [](const FString& Why)
 	{
 		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
 	};
+	// Options: "NOBOUND" = no embedded collision. A LOD drawable carries none in the game's own data
+	// (its archetype has no physics; collision belongs to the HD), so MakeLodArchetype's output is
+	// exported this way. Default keeps the proven whole-mesh bound.
+	const bool bBound = !Options.ToUpper().Contains(TEXT("NOBOUND"));
 #if WITH_EDITORONLY_DATA
 	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *AssetPath);
 	if (!Mesh) { return Fail(TEXT("StaticMesh not found")); }
@@ -1664,6 +1705,7 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	// ---------- embedded phBoundComposite (whole-mesh GeometryBVH), duplicated from the
 	// in-game-proven ExportYbnBinary with the composite emitted in place (not @0) ----------
 	int32 OComposite = 0;
+	if (bBound)
 	{
 		const int32 NV = CV.Num(), NP = CI.Num() / 3;
 		FVector3f WMin(FLT_MAX), WMax(-FLT_MAX);
@@ -1873,7 +1915,9 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	RudeYbn::PU16(Seg, 0x9a, 0x0012);
 	RudeYbn::PPTR(Seg, 0xa0, OModelsHdr);
 	RudeYbn::PPTR(Seg, 0xa8, OName);
-	RudeYbn::PPTR(Seg, 0xc8, OComposite);
+	// no bound = a NULL pointer (PPTR would encode 0x50000000|0: a live pointer INTO THE HEADER)
+	if (bBound) { RudeYbn::PPTR(Seg, 0xc8, OComposite); }
+	else { RudeYbn::PU32(Seg, 0xc8, 0u); RudeYbn::PU32(Seg, 0xcc, 0u); }
 
 	// --- container: RSC7 v165, sys hi-nibble 0xa, gfx 0x5 (gfx=0), uniform pages of PAGE ---
 	uint32 Padded = 0, NPages = 0;
@@ -1930,10 +1974,10 @@ FString URudeToolset::ExportYdrBinary(const FString& AssetPath, const FString& O
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"ydrPath\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,\"bytes\":%d,")
 		TEXT("\"segSize\":%d,\"sysFlags\":\"0x%08x\",\"selfCheck\":\"passed (single-ownership + ")
-		TEXT("geoBounds/count + declarations)\",\"collisionFromRenderMesh\":1,\"boundsIgnored\":%d,")
+		TEXT("geoBounds/count + declarations)\",\"collisionFromRenderMesh\":%d,\"embeddedBound\":%s,\"boundsIgnored\":%d,")
 		TEXT("\"presetsSubstitutedToNormalSpec\":[%s]}"),
 		*OutYdrPath, Geos.Num(), TotalVerts, TotalTris, Out.Num(), Seg.Num(), SysFlag,
-		BoundsIgnored, *SubList);
+		bBound ? 1 : 0, bBound ? TEXT("true") : TEXT("false"), BoundsIgnored, *SubList);
 #else
 	return Fail(TEXT("editor-only"));
 #endif

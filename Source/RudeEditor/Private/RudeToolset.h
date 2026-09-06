@@ -588,6 +588,11 @@ public:
 	static FString ExportYtdBinary(const FString& TextureSpecs, const FString& OutYtdPath,
 	                               const FString& MaxDim);
 
+	// Every texture a mesh's materials reference (Diffuse / Normal / Specular parameters) into one
+	// .ytd, downscaled to MaxDim - the LOD texture dictionary for a MakeLodArchetype output.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save all the textures a model uses as one GTA V texture file, optionally shrunk for a distant version.", RudeAudience="agent"))
+	static FString ExportMeshTextures(const FString& AssetPath, const FString& OutYtdPath, const FString& MaxDim);
+
 	// Export a UStaticMesh directly to a binary FiveM .ydr (RSC7 v165) - CLEAN-ROOM,
 	// no CodeWalker. P5 step 3, the LAST CodeWalker dependency. Emits a gtaDrawable:
 	// GTAV1 vertex buffers (Pos/Normal/Colour0/UV, 36B stride) + u16 index buffers per
@@ -604,7 +609,7 @@ public:
 	// Returns JSON: {ok, ydrPath, geometries, vertices, triangles, bytes, sysFlags,
 	// collisionFromRenderMesh, boundsIgnored}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save a Static Mesh as a finished GTA V model the game loads directly, with its collision included."))
-	static FString ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath);
+	static FString ExportYdrBinary(const FString& AssetPath, const FString& OutYdrPath, const FString& Options);
 
 	// Batch ExportYdrBinary. AssetFolder = a content folder walked recursively, OR a text file of
 	// content paths one per line. Filter = optional case-insensitive substring the asset NAME must
