@@ -320,7 +320,12 @@ Content/Masters/                 M_RUDE_Opaque / Cutout / DecalGeo / Foliage / T
                                   RenderBucket first, preset name as fallback)
 Source/RudeEditor/Private/
   RudeToolset.h                  THE tool surface (every UFUNCTION tool). Start here.
-  RudeToolset.cpp                the implementations (bulk)
+  RudeToolset.cpp                the implementations (bulk: intake, textures, ydr/yft/ybn import,
+                                 masters, scene import, binary export lanes)
+  RudeLevelTools.cpp             the level lane (split 2026-09-06): BuildDistrictLevel / OpenLevel /
+                                 palette / interiors / ExportLevelYmaps / SetLodView / PickAt / InspectMesh
+  RudeToolsetInternal.h          private plumbing shared by the .cpp lanes (RudeJsonEscape, the XML
+                                 re-speller, RudeSpawnEntityActor, RudeSaveDirty + its counters)
   RudeScenario/BuildArea/Vehicle.cpp   lane implementations split out for size — still URudeToolset
                                  statics, reached only through FRudeInvoke
   RudeInvoke.{h,cpp}             the ONE reflective call path (§1)

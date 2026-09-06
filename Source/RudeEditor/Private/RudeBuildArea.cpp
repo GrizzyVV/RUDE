@@ -75,7 +75,7 @@
 // not Matt's - BUILD_AREA_DESIGN is the spec, the calls below are the reading of it.
 
 #include "RudeToolset.h"
-bool RudeSaveDirty(bool bMaps, bool bContent);   // RudeToolset.cpp
+#include "RudeToolsetInternal.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Editor.h"
