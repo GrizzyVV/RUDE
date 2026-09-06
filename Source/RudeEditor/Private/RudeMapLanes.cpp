@@ -31,6 +31,7 @@
 #include "RudeCorpus.h"
 #include "RudeDds.h"
 #include "RudeEntityComponent.h"
+#include "RudeMloEntityComponent.h"
 #include "RudeArchetype.h"
 #include "DataLayer/DataLayerEditorSubsystem.h"
 #include "WorldPartition/WorldPartition.h"
@@ -1668,6 +1669,30 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 		if (E.bValid && E.Room < 0 && E.Portal < 0) { ++Unroomed; }
 	}
 
+	// ---- 2b) the file's OWN BYTES, cut into per-entity slices - the export (ExportMloYtyp) splices these
+	// back verbatim. A slicing that disagrees with the parse is refused HERE, never carried into the level
+	// (measured 2026-09-06: 539/539 non-empty MLO entity blocks and 2,272/2,272 set blocks cut with zero
+	// leftover bytes - scratchpad/wp11/mlo_export/LAWS.md law 3). RUDE_MLO_RAW_SLICES
+	FRudeMloRaw Raw;
+	{
+		FString RawText, RawErr;
+		if (!FFileHelper::LoadFileToString(RawText, *Search.FoundFile))
+		{
+			return Fail(FString::Printf(TEXT("cannot read the ytyp's bytes: %s"), *RudeJsonEscape(Search.FoundFile)));
+		}
+		if (!RudeMloSliceRaw(RawText, Search.FoundName, Raw, RawErr))
+		{
+			return Fail(FString::Printf(TEXT("ytyp slices refused (%s): %s"), *FPaths::GetCleanFilename(Search.FoundFile), *RudeJsonEscape(RawErr)));
+		}
+		if (Raw.Items.Num() != Ents.Num())
+		{
+			return Fail(FString::Printf(TEXT("ytyp slices %d != parsed entities %d in %s - not the measured shape"),
+				Raw.Items.Num(), Ents.Num(), *FPaths::GetCleanFilename(Search.FoundFile)));
+		}
+	}
+	// the ytyp ASSET name (ledger identity): the export resolves the same row through the corpus
+	const FString YtypAsset = FRudeCorpus::AssetNameOf(TEXT("ytyp"), FPaths::GetCleanFilename(Search.FoundFile));
+
 	// ---- 3) import every referenced drawable present in the corpus (skip-if-exists;
 	// the exact ydr/yft/ydd lane ImportMapArea proved, via the shared helper) ----
 	TSet<FString> Needed;
@@ -1739,6 +1764,10 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 		RootActor->SetFolderPath(FName(TEXT("RUDE_MLO")));
 		RootActor->Tags.Add(IdTag);
 		RootActor->Tags.Add(FName(TEXT("RUDE_MLO_ROOT")));
+		// the ytyp the interior was read from: ExportMloYtyp splices THAT file (86/391 MLO names live in more
+		// than one ledger row, LAWS.md law 2) and refuses a different copy
+		RootActor->Tags.Add(FName(*(TEXT("RUDE_MLO_Ytyp:") + YtypAsset)));
+		RootActor->Tags.Add(FName(*(TEXT("RUDE_MLO_YtypFile:") + Search.FoundFile)));
 	}
 
 	// One actor per room (plus a portal-doors bucket and an unroomed bucket when needed),
@@ -1769,9 +1798,11 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 		A->Tags.Add(IdTag);
 		A->Tags.Add((Key >= 0) ? FName(*(TEXT("RUDE_MLO_Room:") + Rooms[Key].Name))
 			: FName(Key == -2 ? TEXT("RUDE_MLO_Portal") : TEXT("RUDE_MLO_Room:(none)")));
+		if (Key >= 0) { A->Tags.Add(FName(*FString::Printf(TEXT("RUDE_MLO_RoomIndex:%d"), Key))); }   // the export appends an added entity to the room it sits under
 		A->AttachToActor(RootActor, FAttachmentTransformRules::KeepWorldTransform);
 		return &Buckets.Add(Key, FBucket{ A, R });
 	};
+#if 0   // RUDE 2026-09-06 (mlo_export): ISM path retired - entities are actors now (see SpawnMloEntity); kept for the record
 	auto GetBucketIsm = [&](int32 Key, const FString& MeshKey, UStaticMesh* Mesh)
 		-> UInstancedStaticMeshComponent*
 	{
@@ -1788,10 +1819,55 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 		B->IsmByMesh.Add(MeshKey, Ism);
 		return Ism;
 	};
+#endif
 
 	UStaticMesh* ProxyCube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
 	TMap<FString, UStaticMesh*> MeshCache;   // lowercase drawable -> mesh (nullptr = known-missing)
 	int32 Spawned = 0, Proxies = 0, NumLights = 0, Unresolved = 0;
+	// ---- one ACTOR per entity (GDD Tier 1: import-author-EXPORT) - RUDE_MLO_ENTITY_ACTORS ----
+	// Identity rides on a URudeMloEntityComponent (interior, set, ordinal, the raw <Item> slice, the source
+	// transform). The ISM path is retired: an instance had no identity, so nothing could be moved and written
+	// back. Cost, counted in the verdict: one actor per entity (v_franklinshouse: 157 room + 133 set entities).
+	int32 EntityActors = 0, SetEntityActors = 0, RawSetMismatch = 0;
+	auto SpawnMloEntity = [&](AActor* Parent, const FString& SetName, int32 Ordinal, int32 RoomIdx, int32 PortalIdx,
+	                          const FString& ArchLower, const FTransform& Xf, UStaticMesh* Mesh, const FString& Slice,
+	                          bool bHidden) -> AActor*
+	{
+		AActor* EA = World->SpawnActor<AActor>();
+		if (!EA) { return nullptr; }
+		UStaticMeshComponent* SMC = NewObject<UStaticMeshComponent>(EA, TEXT("Mesh"));
+		SMC->SetStaticMesh(Mesh ? Mesh : ProxyCube);
+		SMC->SetMobility(EComponentMobility::Static);
+		EA->SetRootComponent(SMC);
+		SMC->RegisterComponent();
+		EA->AddInstanceComponent(SMC);
+		EA->SetActorTransform(Xf);
+		EA->SetActorLabel(ArchLower);
+		EA->SetFolderPath(FName(*(TEXT("RUDE_MLO/") + Label)));
+		EA->Tags.Add(IdTag);
+		EA->Tags.Add(FName(TEXT("RUDE_MLO_Entity")));
+		if (!Mesh) { EA->Tags.Add(FName(TEXT("RUDE_PROXY"))); }
+		if (Parent) { EA->AttachToActor(Parent, FAttachmentTransformRules::KeepWorldTransform); }
+		URudeMloEntityComponent* M = NewObject<URudeMloEntityComponent>(EA, TEXT("RudeMloEntity"));
+		M->Interior = Search.FoundName;
+		M->SetName = SetName;
+		M->SourceIndex = Ordinal;
+		M->RoomIndex = RoomIdx;
+		M->PortalIndex = PortalIdx;
+		M->ArchetypeName = ArchLower;
+		M->SourceYtyp = YtypAsset;
+		M->SourceFile = Search.FoundFile;
+		M->SourceXml = Slice;
+		M->SourceTransform = Xf;
+		M->RegisterComponent();
+		EA->AddInstanceComponent(M);
+		if (bHidden)
+		{
+			EA->SetActorHiddenInGame(true);
+			SMC->SetVisibility(false, true);
+		}
+		return EA;
+	};
 	// ---- entity SETS (GDD: "entity sets -> variants; activation is per instance"): every set's entities
 	// spawn under their own actor, HIDDEN, tagged RUDE_MLO_EntitySet:<set> - SetEntitySet (editor) and the
 	// sandbox shim's ActivateInteriorEntitySet (PIE) toggle them. Rough: lights of set entities are skipped.
@@ -1816,12 +1892,24 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 			SA->Tags.Add(IdTag);
 			SA->Tags.Add(FName(*(TEXT("RUDE_MLO_EntitySet:") + SetName)));
 			SA->AttachToActor(RootActor, FAttachmentTransformRules::KeepWorldTransform);
-			TMap<FString, UInstancedStaticMeshComponent*> SetIsm;
+			// slices for this set (the export re-emits them verbatim); a set whose slices disagree with the parse is
+			// counted and skipped, never spawned half-right. RUDE_MLO_SET_ACTORS
+			const FRudeMloRawSet* RawSet = Raw.Sets.FindByPredicate([&SetName](const FRudeMloRawSet& X) { return X.Name.Equals(SetName, ESearchCase::IgnoreCase); });
+			if (!RawSet || RawSet->Items.Num() != SE->GetChildrenNodes().Num())
+			{
+				++RawSetMismatch;
+				UE_LOG(LogTemp, Warning, TEXT("[RUDE] ImportMlo %s: entity set '%s' raw slices %d != parsed %d - set skipped"),
+					*Search.FoundName, *SetName, RawSet ? RawSet->Items.Num() : -1, SE->GetChildrenNodes().Num());
+				World->DestroyActor(SA);
+				continue;
+			}
+			int32 SetOrdinal = -1;
 			for (const FXmlNode* E : SE->GetChildrenNodes())
 			{
+				++SetOrdinal;
 				const FXmlNode* AN = E->FindChildNode(TEXT("archetypeName"));
 				const FXmlNode* Pos = E->FindChildNode(TEXT("position"));
-				if (!AN || !Pos) { continue; }
+				if (!AN || !Pos) { continue; }   // a dead slot keeps its ordinal; its slice re-emits verbatim at export
 				const FString ArchLower = AN->GetContent().TrimStartAndEnd().ToLower();
 				const double Px = FCString::Atod(*Pos->GetAttribute(TEXT("x"))), Py = FCString::Atod(*Pos->GetAttribute(TEXT("y"))), Pz = FCString::Atod(*Pos->GetAttribute(TEXT("z")));
 				double Qx = 0, Qy = 0, Qz = 0, Qw = 1;
@@ -1830,7 +1918,9 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 					Qx = FCString::Atod(*Rot->GetAttribute(TEXT("x"))); Qy = FCString::Atod(*Rot->GetAttribute(TEXT("y")));
 					Qz = FCString::Atod(*Rot->GetAttribute(TEXT("z"))); Qw = FCString::Atod(*Rot->GetAttribute(TEXT("w")));
 				}
-				const FTransform Xf(FQuat(Qx, -Qy, Qz, Qw), FVector(Px * 100.0, -Py * 100.0, Pz * 100.0), FVector::OneVector);
+				// scale read like the room entities' (the ISM path dropped it); never compared at export
+				const FTransform Xf(FQuat(Qx, -Qy, Qz, Qw), FVector(Px * 100.0, -Py * 100.0, Pz * 100.0),
+					FVector(Val(E, TEXT("scaleXY"), 1.0), Val(E, TEXT("scaleXY"), 1.0), Val(E, TEXT("scaleZ"), 1.0)));
 				const FString* Asset = Index.ArchToAsset.Find(ArchLower);
 				UStaticMesh* Mesh = nullptr;
 				if (Asset)
@@ -1838,27 +1928,18 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 					if (UStaticMesh** Cached = MeshCache.Find(*Asset)) { Mesh = *Cached; }
 					else { Mesh = LoadObject<UStaticMesh>(nullptr, *(DestMeshFolder / *Asset)); MeshCache.Add(*Asset, Mesh); }
 				}
-				const FString MeshKey = Mesh ? *Asset : FString(TEXT("proxy"));
-				UStaticMesh* Use = Mesh ? Mesh : ProxyCube;
-				if (!Use) { continue; }
-				UInstancedStaticMeshComponent* Ism = SetIsm.FindRef(MeshKey);
-				if (!Ism)
+				if (!Mesh && !ProxyCube) { continue; }
+				// the set's <locations> slot = this entity's room (one per entity: 2,272/2,272 sets measured)
+				const int32 Loc = RawSet->Locations.IsValidIndex(SetOrdinal) ? RawSet->Locations[SetOrdinal] : -1;
+				if (SpawnMloEntity(SA, SetName, SetOrdinal, Loc, -1, ArchLower, Xf, Mesh, RawSet->Items[SetOrdinal], /*bHidden*/ true))
 				{
-					Ism = NewObject<UInstancedStaticMeshComponent>(SA, FName(*FString::Printf(TEXT("ISM_%d"), SetIsm.Num())));
-					Ism->SetStaticMesh(Use);
-					Ism->SetMobility(EComponentMobility::Static);
-					Ism->SetupAttachment(SR);
-					Ism->RegisterComponent();
-					SA->AddInstanceComponent(Ism);
-					Ism->ComponentTags.Add(FName(TEXT("RUDE_MLO_SET_ISM")));
-					SetIsm.Add(MeshKey, Ism);
+					++SetEntityActors;
+					if (Mesh) { ++SetEntitiesSpawned; } else { ++SetEntitiesProxied; }
 				}
-				Ism->AddInstance(Xf, /*bWorldSpace*/ true);
-				if (Mesh) { ++SetEntitiesSpawned; } else { ++SetEntitiesProxied; }
 			}
-			// hidden until activated (the game's own default: a set is off unless the instance lists it)
+			// hidden until activated (the game's own default: a set is off unless the instance lists it);
+			// the entity actors were spawned hidden above
 			SA->SetActorHiddenInGame(true);
-			for (auto& KV : SetIsm) { KV.Value->SetVisibility(false, true); }
 			++SetActors;
 		}
 	}
@@ -1867,6 +1948,8 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 		const FMloEntity& E = Ents[i];
 		if (!Passes(E)) { continue; }
 		const int32 Key = (E.Room >= 0) ? E.Room : (E.Portal >= 0 ? -2 : -3);
+		FBucket* B = GetBucket(Key);
+		if (!B) { continue; }
 
 		const FString* Asset = Index.ArchToAsset.Find(E.ArchLower);
 		UStaticMesh* Mesh = nullptr;
@@ -1880,32 +1963,22 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 			}
 		}
 		else { ++Unresolved; }
-		if (Mesh)
-		{
-			if (UInstancedStaticMeshComponent* Ism = GetBucketIsm(Key, *Asset, Mesh))
-			{
-				Ism->AddInstance(E.Xf, /*bWorldSpace*/ true);
-				++Spawned;
-			}
-		}
-		else if (ProxyCube)
-		{
-			if (UInstancedStaticMeshComponent* Ism = GetBucketIsm(Key, TEXT("proxy"), ProxyCube))
-			{
-				Ism->AddInstance(E.Xf, /*bWorldSpace*/ true);
-				++Proxies;
-			}
-		}
+		if (!Mesh && !ProxyCube) { continue; }
+		// one ACTOR per entity under its room actor, carrying its ordinal + raw slice (the export's identity).
+		// RUDE_MLO_MAIN_ACTORS
+		AActor* EA = SpawnMloEntity(B->Actor, FString(), i, E.Room, E.Portal, E.ArchLower, E.Xf, Mesh, Raw.Items[i], /*bHidden*/ false);
+		if (!EA) { continue; }
+		++EntityActors;
+		if (Mesh) { ++Spawned; } else { ++Proxies; }
 
-		// lights: one component per CLightAttrDef instance, on the entity's room actor
+		// lights: one component per CLightAttrDef instance, ON THE ENTITY ACTOR (a moved entity carries them;
+		// the placement math is the v1 math, unchanged - world position from the entity transform)
 		for (const FMloLight& L : E.Lights)
 		{
-			FBucket* B = GetBucket(Key);
-			if (!B) { continue; }
 			ULocalLightComponent* LC = nullptr;
 			if (L.Type == 2)
 			{
-				USpotLightComponent* Spot = NewObject<USpotLightComponent>(B->Actor,
+				USpotLightComponent* Spot = NewObject<USpotLightComponent>(EA,
 					FName(*FString::Printf(TEXT("Light_%d_%d"), i, B->NumLights)));
 				// RAGE cone angles are half-angle degrees like UE's; UE's outer cone tops out
 				// at 80, so RAGE's 90-degree hemisphere washes clamp (documented narrowing).
@@ -1915,7 +1988,7 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 			}
 			else if (L.Type == 1 || L.Type == 4)
 			{
-				UPointLightComponent* Pt = NewObject<UPointLightComponent>(B->Actor,
+				UPointLightComponent* Pt = NewObject<UPointLightComponent>(EA,
 					FName(*FString::Printf(TEXT("Light_%d_%d"), i, B->NumLights)));
 				if (L.Type == 4)
 				{
@@ -1943,9 +2016,9 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 			// RUDE lighting model is dynamic-only (BUILD_AREA_DESIGN section 4) - a Static light
 			// here would render as unbuilt preview forever.
 			LC->SetMobility(EComponentMobility::Movable);
-			LC->SetupAttachment(B->Root);
+			LC->SetupAttachment(EA->GetRootComponent());
 			LC->RegisterComponent();
-			B->Actor->AddInstanceComponent(LC);
+			EA->AddInstanceComponent(LC);
 			LC->SetLightColor(L.Color);
 			LC->SetIntensityUnits(ELightUnits::Candelas);
 			LC->SetIntensity(L.Intensity * RudeMloLightCandelaScale);
@@ -1990,12 +2063,12 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 	// that fires on a normal run is a gate that gets ignored; tightening this one needs an
 	// in-editor run across several interiors, which is on the handoff list.
 	const bool bMloOk = (Rooms.Num() > 0 || Portals.Num() > 0)
-		&& (Spawned + Proxies > 0 || Ents.Num() == 0);
+		&& (Spawned + Proxies > 0 || Ents.Num() == 0) && RawSetMismatch == 0;
 	return FString::Printf(TEXT(
 		"{\"ok\":%s,\"archetype\":\"%s\",\"requested\":\"%s\",\"ytyp\":\"%s\","
 		"\"rooms\":%d,\"roomNames\":[%s],\"portals\":%d,\"portalRooms\":[%s],"
 		"\"entitySets\":[%s],\"entitySetActors\":%d,\"entitySetEntitiesSpawned\":%d,\"entitySetEntitiesProxied\":%d,\"entities\":%d,\"entitiesMissingTransform\":%d,"
-		"\"spawned\":%d,\"proxies\":%d,"
+		"\"spawned\":%d,\"proxies\":%d,\"entityActors\":%d,\"setEntityActors\":%d,\"rawSetMismatch\":%d,"
 		"\"unresolvedArchetypes\":%d,\"lights\":%d,\"lightsSkipped\":%d,%s"
 		"\"otherExtensions\":%d,\"badAttachedRefs\":%d,\"unroomedEntities\":%d,"
 		"\"meshesImported\":%d,\"meshesSkipped\":%d,\"meshesFailed\":%d,"
@@ -2003,7 +2076,7 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 		bMloOk ? TEXT("true") : TEXT("false"),
 		*Search.FoundName, *Wanted, *FPaths::GetCleanFilename(Search.FoundFile),
 		Rooms.Num(), *RoomNamesJson, Portals.Num(), *PortalsJson,
-		*SetsJson, SetActors, SetEntitiesSpawned, SetEntitiesProxied, Ents.Num(), EntitiesMissingTransform, Spawned, Proxies,
+		*SetsJson, SetActors, SetEntitiesSpawned, SetEntitiesProxied, Ents.Num(), EntitiesMissingTransform, Spawned, Proxies, EntityActors, SetEntityActors, RawSetMismatch,
 		Unresolved, NumLights, LightsSkipped, *LightProblemJson,
 		OtherExtensions, BadRefs, Unroomed,
 		MeshOk, MeshSkip, MeshFail, MeshMissing, *Tally.ToJson());

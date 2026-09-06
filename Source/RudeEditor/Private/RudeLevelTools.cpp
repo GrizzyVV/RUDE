@@ -508,6 +508,9 @@ static FString RudeNum(double V)
 	return S;
 }
 
+// RudeNum for other translation units (RudeMloExport.cpp); declared in RudeToolsetInternal.h.
+FString RudeNumText(double V) { return RudeNum(V); }
+
 // A CEntityDef from the component + the actor's transform, in the game's field order (verified
 // against dt1_02.ymap.xml 2026-09-05). UE -> RAGE: position /100 with Y mirrored; the ymap stores
 // the INVERSE orientation, so the actor quaternion goes out as (x, -y, z, w); scale XY from X.
@@ -2788,6 +2791,18 @@ FString URudeToolset::SetEntitySet(const FString& InteriorName, const FString& S
 		TArray<UInstancedStaticMeshComponent*> Isms;
 		It->GetComponents<UInstancedStaticMeshComponent>(Isms);
 		for (UInstancedStaticMeshComponent* C : Isms) { C->SetVisibility(bShow, true); Instances += C->GetInstanceCount(); }
+		// since the MLO export lane (2026-09-06) a set's entities are child ACTORS under the set actor, not ISM instances
+		TArray<AActor*> Kids;
+		It->GetAttachedActors(Kids, true, true);
+		for (AActor* K : Kids)
+		{
+			K->Modify();
+			K->SetActorHiddenInGame(!bShow);
+			TArray<UPrimitiveComponent*> Prims;
+			K->GetComponents<UPrimitiveComponent>(Prims);
+			for (UPrimitiveComponent* Pc : Prims) { Pc->SetVisibility(bShow, true); }
+			if (K->FindComponentByClass<UStaticMeshComponent>()) { ++Instances; }
+		}
 		It->MarkPackageDirty();
 		++Touched;
 	}

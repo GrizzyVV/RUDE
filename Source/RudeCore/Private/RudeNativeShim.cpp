@@ -51,6 +51,10 @@ namespace RudeShim
 		TArray<UPrimitiveComponent*> Prims;
 		A->GetComponents<UPrimitiveComponent>(Prims);
 		for (UPrimitiveComponent* P : Prims) { P->SetHiddenInGame(!bShow, true); P->SetVisibility(bShow, true); }
+		// attached child actors too: since 2026-09-06 an interior's entity-set entities are actors under the set actor
+		TArray<AActor*> Kids;
+		A->GetAttachedActors(Kids);
+		for (AActor* K : Kids) { SetActorShown(K, bShow); }
 	}
 }
 

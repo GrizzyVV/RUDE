@@ -600,6 +600,34 @@ public:
 	static FString SetPedProp(const FString& ActorLabel, const FString& Anchor, const FString& PropIndex, const FString& TextureIndex);
 	// RUDE_PEDPROPS_END header
 
+	// THE INTERIOR EXPORTER (GDD Tier 1 interiors: import-author-EXPORT; scratchpad/wp11/mlo_export). The
+	// interior's entity actors (ImportMlo since 2026-09-06 spawns one actor per entity carrying a
+	// URudeMloEntityComponent: interior, set, ordinal, raw slice, source transform) go back into the ytyp
+	// that declared the CMloArchetypeDef, as a FiveM resource: <OutDir>/stream/<ytyp>.ytyp (XML form,
+	// Legacy loads it) + fxmanifest.lua. The source file's bytes are SPLICED: inside the ONE archetype
+	// (37/424 MLO ytyps declare several - the splice targets one by name), only its top-level <entities>
+	// block, the <entities>/<locations> of an entity set that changed, and the <attachedObjects> of a room
+	// that gained entities are replaced. Every untouched entity re-emits its own slice VERBATIM; a moved
+	// one (position + rotation compared, NOT scale) has only its <position>/<rotation> lines re-spelled
+	// (RudeNum); an added one (a duplicated entity actor: SourceIndex -1 or a repeated ordinal) is appended
+	// after the source items with a fresh guid and its ordinal appended to the room actor it sits under
+	// (a set entity: to the set, with its room in <locations>). DELETIONS ARE REFUSED and nothing is
+	// written: rooms and portals index entities by ORDINAL, a shift would re-attach every later prop
+	// (LAWS.md law 4). Hide instead - and export from a FULL import: a room Filter leaves rooms unspawned,
+	// which reads as deletions. Everything else in the file stays byte-identical (gate: the clean export
+	// equals the source bytes). MloArchetypeName is hash-tolerant like ImportMlo's. Returns JSON:
+	// {ok, interior, ytyp, file, source, byteIdentical, entities, seen, kept, moved, added, deleted,
+	// deadSlots, sets, setEntities, setKept, setMoved, setAdded, setDeleted, setsRewritten, roomsRewritten,
+	// locationsRewritten, refused[]}; ok is COMPUTED (any refusal = false).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Write an interior you built or edited back to its game definition file as a FiveM resource. Untouched props come out exactly as they went in, moved props are rewritten, duplicated props are added; deleting a prop is refused (hide it instead)."))
+	static FString ExportMloYtyp(const FString& OutDir, const FString& MloArchetypeName, const FString& CorpusRoot);
+
+	// Nudge one interior entity by x,y,z centimetres. Index = the ordinal in the archetype's <entities>, or
+	// "<setName>:<ordinal>" for an entity-set entity. Identity = interior + set + ordinal. The scriptable edit
+	// the MLO export gate uses (scratchpad/wp11/mlo_export/gate.jsonl).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one prop of an interior by x,y,z centimetres.", RudeAudience="agent"))
+	static FString MoveMloEntity(const FString& InteriorName, const FString& Index, const FString& DeltaCm);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);
@@ -869,6 +897,15 @@ public:
 	// wrong props to the wrong rooms with badAttachedRefs still reading 0. The per-mesh counters
 	// are new: this lane and ImportMapArea are the only consumers of the yft/ydd import paths and
 	// both used to discard the whole unit verdict.
+	// 2026-09-06 (scratchpad/wp11/mlo_export): EVERY entity - room entities and entity-set entities - is now
+	// its OWN ACTOR under its room / set actor, carrying a URudeMloEntityComponent (interior, set, ordinal,
+	// the entity's raw <Item> slice, the source transform). The ISM path is retired: an instance had no
+	// identity, so nothing could be moved and written back. Cost = one actor per entity (v_franklinshouse:
+	// 157 room + 133 set entities). The root carries RUDE_MLO_Ytyp:<asset> + RUDE_MLO_YtypFile:<path>; room
+	// actors add RUDE_MLO_RoomIndex:<i>; entity actors add RUDE_MLO_Entity. The verdict adds entityActors /
+	// setEntityActors / rawSetMismatch (a set whose raw slices disagree with the parse is skipped and
+	// counted; ok goes false), and the import now REFUSES a ytyp whose bytes do not cut into one slice per
+	// parsed entity (never measured on the corpus: 539/539 blocks cut clean). Export: ExportMloYtyp.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build a GTA V interior (MLO) in your open level - rooms, furniture and lights, standing at the world origin. Give the interior's archetype name; optionally list room names to spawn only those rooms."))
 	static FString ImportMlo(const FString& CorpusRoot, const FString& MloArchetypeName,
 	                         const FString& DestMeshFolder, const FString& Filter);

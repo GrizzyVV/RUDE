@@ -71,3 +71,43 @@ int32 RudeAttachEntityLights(AActor* Actor, class URudeEntityComponent* R);
 // R->ExtensionsXml (position, colour, intensity, falloff, exponent, cone angles, direction) so the
 // entity keys as edited and only those fields move. Returns the number of instances rewritten.
 int32 RudeSyncEntityLights(AActor* Actor, class URudeEntityComponent* R);
+
+// ---- MLO interiors: raw slices of one CMloArchetypeDef (RudeMloExport.cpp; scratchpad/wp11/mlo_export/LAWS.md) ----
+// The ytyp's OWN BYTES cut along the lines the game's writer emits (measured 2026-09-06 over 541 MLO archetypes:
+// one shape). Offsets are into `Arch` (the archetype's "  <Item type=\"CMloArchetypeDef\">" slice) except
+// ArchStart/ArchEnd, which are into the document. Every item slice starts at its own indentation and ends with the
+// newline after its </Item>, so concatenating a block's slices reproduces the block's inner bytes exactly.
+struct FRudeMloRawRoom
+{
+	FString Item;                     // "    <Item>...    </Item>\n"
+	int32 AoStart = -1, AoEnd = -1;   // inside Item: the "     <attachedObjects...>" element incl. its trailing newline
+	TArray<int32> Attached;           // the ordinals it lists (empty for "<attachedObjects />")
+};
+struct FRudeMloRawSet
+{
+	FString Name;                     // the set's <name> as spelled
+	FString Item;                     // "    <Item>...    </Item>\n"
+	int32 LocStart = -1, LocEnd = -1; // inside Item: the "     <locations...>" element incl. its trailing newline
+	int32 EntStart = -1, EntEnd = -1; // inside Item: "     <entities>\n" .. "     </entities>\n" (or "     <entities />\n")
+	bool bEntitiesEmpty = false;
+	TArray<int32> Locations;          // one room index per entity (2,272/2,272 sets measured)
+	TArray<FString> Items;            // "      <Item type=\"CEntityDef\">...      </Item>\n" slices, by ordinal
+};
+struct FRudeMloRaw
+{
+	int32 ArchStart = -1, ArchEnd = -1;   // in the document
+	FString Arch;
+	int32 EntStart = -1, EntEnd = -1;     // in Arch: "   <entities>\n" .. "   </entities>\n" (or "   <entities />\n")
+	bool bEntitiesEmpty = false;
+	TArray<FString> Items;                // "    <Item type=\"CEntityDef\">...    </Item>\n" slices, by ordinal
+	int32 RoomsStart = -1, RoomsEnd = -1; // in Arch: the whole "   <rooms itemType=\"CMloRoomDef\">" block (-1 = none)
+	TArray<FRudeMloRawRoom> Rooms;
+	int32 SetsStart = -1, SetsEnd = -1;   // in Arch: the whole "   <entitySets itemType=\"CMloEntitySet\">" block (-1 = none)
+	TArray<FRudeMloRawSet> Sets;
+};
+// Cut Doc along the measured lines for the CMloArchetypeDef named MloName (case-insensitive). False with a reason
+// when the file does not have the measured shape (CRLF, a leftover byte between items, a set without <locations>):
+// the caller refuses, never guesses.
+bool RudeMloSliceRaw(const FString& Doc, const FString& MloName, FRudeMloRaw& Out, FString& OutError);
+// RudeNum (RudeLevelTools.cpp, file-local) for other translation units: a float32 as the game's files spell it.
+FString RudeNumText(double V);
