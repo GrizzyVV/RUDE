@@ -1678,6 +1678,21 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 	}
 	int32 MeshOk = 0, MeshSkip = 0, MeshFail = 0, MeshMissing = 0, Done = 0;
 	FRudeImportTally Tally;
+	// the entity SETS join the mesh pass (2026-09-06): without this every set entity was a proxy cube
+	if (const FXmlNode* SetsN = Mlo->FindChildNode(TEXT("entitySets")))
+	{
+		for (const FXmlNode* S : SetsN->GetChildrenNodes())
+		{
+			const FXmlNode* SE = S->FindChildNode(TEXT("entities"));
+			if (!SE) { continue; }
+			for (const FXmlNode* E : SE->GetChildrenNodes())
+			{
+				const FXmlNode* AN = E->FindChildNode(TEXT("archetypeName"));
+				if (!AN) { continue; }
+				if (const FString* Asset = Index.ArchToAsset.Find(AN->GetContent().TrimStartAndEnd().ToLower())) { Needed.Add(*Asset); }
+			}
+		}
+	}
 	for (const FString& D : Needed)
 	{
 		++Done;
