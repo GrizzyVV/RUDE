@@ -618,7 +618,8 @@ FString URudeToolset::BuildBlipCatalog(const FString& CorpusRoot, const FString&
 	for (const FString& S : BlipSheets)
 	{
 		const FString SheetPkg = DestFolder / TEXT("minimap") / S;
-		if (FPackageName::DoesPackageExist(SheetPkg)) { ++SheetsWithPixels; }
+		// on disk OR still in memory (a -nosave gate run imports without saving)
+		if (FPackageName::DoesPackageExist(SheetPkg) || FindPackage(nullptr, *SheetPkg) != nullptr) { ++SheetsWithPixels; }
 		C->Sheets.Add(TSoftObjectPtr<UTexture2D>(FSoftObjectPath(SheetPkg + TEXT(".") + S)));
 		C->SheetSizes.Add(S, Sizes[S]);
 	}
