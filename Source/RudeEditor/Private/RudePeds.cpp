@@ -577,11 +577,11 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 		if (!Corpus.IsValid()) { return Fail(CorpusErr); }
 		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("yft"), Name)) { YftPath = Corpus->PathOf(*R); }
 		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ydd"), Name)) { YddPath = Corpus->PathOf(*R); }
-		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ytd"), Name)) { YtdPath = Corpus->PathOf(*R); }
+		if (const FRudeCorpusEntry* R = Corpus->EffectiveWithSidecar(TEXT("ytd"), Name)) { YtdPath = Corpus->PathOf(*R); }   // the copy WITH pixels
 		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ymt"), Name)) { YmtPath = Corpus->PathOf(*R); }
 		// RUDE_PEDPROPS_BEGIN corpus
 		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ydd"), Name + TEXT("_p"))) { PropYddPath = Corpus->PathOf(*R); }
-		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ytd"), Name + TEXT("_p"))) { PropYtdPath = Corpus->PathOf(*R); }
+		if (const FRudeCorpusEntry* R = Corpus->EffectiveWithSidecar(TEXT("ytd"), Name + TEXT("_p"))) { PropYtdPath = Corpus->PathOf(*R); }
 		// RUDE_PEDPROPS_END corpus
 	}
 	if (!FPaths::FileExists(YftPath)) { return Fail(FString::Printf(TEXT("no fragment XML at %s - is the name right, and is this a component ped?"), *YftPath)); }

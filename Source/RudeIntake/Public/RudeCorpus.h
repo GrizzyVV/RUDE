@@ -55,6 +55,12 @@ public:
 	// Every copy of (type, name), lowest slot first.
 	TArray<const FRudeCorpusEntry*> History(const FString& Type, const FString& Name) const;
 
+	// The highest-ranked copy that HAS its pixel/payload sidecar folder on disk, else Effective().
+	// A DLC patch copy exported without --textures shadows a base copy that has them (s_m_y_cop_01:
+	// patchday9ng vs componentpeds_s_m_y, 2026-09-06) - the game's own precedence is kept, the
+	// corpus's coverage gap is not.
+	const FRudeCorpusEntry* EffectiveWithSidecar(const FString& Type, const FString& Name) const;
+
 	// Effective entry of every name of Type that starts with Prefix (empty = all names).
 	// Sorted by name.
 	void ByPrefix(const FString& Type, const FString& Prefix, TArray<const FRudeCorpusEntry*>& Out) const;

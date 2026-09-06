@@ -269,6 +269,19 @@ TArray<const FRudeCorpusEntry*> FRudeCorpus::History(const FString& Type, const 
 	return Out;
 }
 
+const FRudeCorpusEntry* FRudeCorpus::EffectiveWithSidecar(const FString& Type, const FString& Name) const
+{
+	const FRudeCorpusEntry* Best = nullptr;
+	for (const FRudeCorpusEntry* E : History(Type, Name))   // lowest slot first: the last with a sidecar wins
+	{
+		const FString P = PathOf(*E);
+		FString Stem = FPaths::GetBaseFilename(P);
+		Stem.RemoveFromEnd(TEXT(".") + Type.ToLower());
+		if (FPaths::DirectoryExists(FPaths::GetPath(P) / Stem)) { Best = E; }
+	}
+	return Best ? Best : Effective(Type, Name);
+}
+
 void FRudeCorpus::ByPrefix(const FString& Type, const FString& Prefix, TArray<const FRudeCorpusEntry*>& Out) const
 {
 	const FString T = Type.ToLower();
