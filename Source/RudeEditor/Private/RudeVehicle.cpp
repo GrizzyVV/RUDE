@@ -976,6 +976,18 @@ FString URudeToolset::ImportVehicleComposite(const FString& CorpusRoot, const FS
 		}
 	}
 
+	// ---- 0b) the textures first, the way ImportPed does: the vehicle's own dictionaries and the shared
+	// vehshare, into /Game/RUDE/Textures (an empty PixelFolder = the corpus sidecar). Since the 2026-09-06
+	// re-export the corpus carries every vehicle's DDS; before it these imported 0 and the body came in grey.
+	{
+		FString VehShareSlot;
+		const FString VehSharePath = Effective(TEXT("ytd"), TEXT("vehshare"), VehShareSlot);
+		for (const FString& TxdPath : { YtdPath, HiYtdPath, VehSharePath })
+		{
+			if (TxdPath.IsEmpty()) { continue; }
+			URudeToolset::ImportYtd(TxdPath, TEXT(""), TEXT("/Game/RUDE/Textures"));
+		}
+	}
 	// ---- 1) the skeleton (the base file's; the _hi's is the same one: 68/68 and 74/74 measured) --
 	TArray<FBone> Bones;
 	TArray<FTransform> WorldGta;
