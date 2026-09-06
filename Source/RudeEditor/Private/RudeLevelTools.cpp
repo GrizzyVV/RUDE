@@ -81,6 +81,13 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "RudeToolsetInternal.h"
+#include "MeshReductionSettings.h"
+#include "IMeshReductionManagerModule.h"
+#include "IMeshReductionInterfaces.h"
+#include "OverlappingCorners.h"
+#include "StaticMeshAttributes.h"
+#include "StaticMeshOperations.h"
+#include "UObject/SavePackage.h"
 
 // =========================== LOD lineage (ENGINEERING_LOG laws 24-28) ===========================
 // Measured on downtown 2026-09-06 (158 ymaps, 14,248 entities; scratchpad/wp7/lod_rules*.py):
@@ -1237,7 +1244,7 @@ FString URudeToolset::ExportPaletteYtyps(const FString& OutDir, const FString& P
 	}
 	if (Groups.Num() == 0) { return Fail(FString::Printf(TEXT("no palette assets with a source ytyp under %s (%d loaded)"), *PaletteFolder, Loaded)); }
 	IFileManager::Get().MakeDirectory(*(OutDir / TEXT("stream")), true);
-	int32 Written = 0, Refused = 0, Kept = 0, Edited = 0, NotRebuilt = 0, Removed = 0;
+	int32 Written = 0, Refused = 0, Kept = 0, Edited = 0, NotRebuilt = 0, Removed = 0, Added = 0;
 	FString Files, RefusedJson;
 	for (auto& KV : Groups)
 	{
@@ -1291,6 +1298,12 @@ FString URudeToolset::ExportPaletteYtyps(const FString& OutDir, const FString& P
 				else { Block += RudeArchetypeXml(A); ++Edited; }
 			}
 		}
+		// NEW archetypes (no source ordinal: made in RUDE, e.g. MakeLodArchetype) go out APPENDED to
+		// their target ytyp, after every source item, so no existing ordinal moves.
+		for (const URudeArchetype* A : As)
+		{
+			if (A->SourceIndex < 0) { Block += RudeArchetypeXml(A); ++Added; }
+		}
 		FString Doc = SrcText;
 		const int32 Open = Doc.Find(TEXT("\n <archetypes>\n"), ESearchCase::CaseSensitive);
 		const int32 Close = Open == INDEX_NONE ? INDEX_NONE : Doc.Find(TEXT(" </archetypes>\n"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Open);
@@ -1304,8 +1317,8 @@ FString URudeToolset::ExportPaletteYtyps(const FString& OutDir, const FString& P
 	FFileHelper::SaveStringToFile(TEXT("fx_version 'cerulean'\ngame 'gta5'\nthis_is_a_map 'yes'\n"), *(OutDir / TEXT("fxmanifest.lua")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 	const bool bOk = Written > 0 && Refused == 0;
 	return FString::Printf(
-		TEXT("{\"ok\":%s,\"paletteAssets\":%d,\"ytypsWritten\":%d,\"ytypsRefused\":%d,\"kept\":%d,\"edited\":%d,\"notRebuilt\":%d,\"removed\":%d,\"files\":[%s],\"refused\":[%s]}"),
-		bOk ? TEXT("true") : TEXT("false"), Loaded, Written, Refused, Kept, Edited, NotRebuilt, Removed, *Files, *RefusedJson);
+		TEXT("{\"ok\":%s,\"paletteAssets\":%d,\"ytypsWritten\":%d,\"ytypsRefused\":%d,\"kept\":%d,\"edited\":%d,\"added\":%d,\"notRebuilt\":%d,\"removed\":%d,\"files\":[%s],\"refused\":[%s]}"),
+		bOk ? TEXT("true") : TEXT("false"), Loaded, Written, Refused, Kept, Edited, Added, NotRebuilt, Removed, *Files, *RefusedJson);
 }
 
 // ---- SetArchetypeField (agent; the scriptable palette edit) ------------------------------
@@ -1736,6 +1749,208 @@ FString URudeToolset::LodAudit()
 	}
 	return FString::Printf(TEXT("{\"ok\":%s,\"entities\":%d,\"links\":%d,\"unresolved\":%d,\"partial\":%d,\"diffs\":%d,\"diffParentIndex\":%d,\"diffNumChildren\":%d,\"diffLodLevel\":%d,\"refusals\":%d,\"first\":[%s]}"),
 		(Diffs == 0 && Refusals == 0) ? TEXT("true") : TEXT("false"), All.Num(), Links, Unresolved, Partial, Diffs, DiffParent, DiffCount, DiffLevel, Refusals, *Rows);
+}
+
+// ---- MakeLodArchetype (Wave 2 / WP8 step 1) ------------------------------------------------
+// "Swap a building, press rebuild, distances behave" (GDD Wave 2). Regenerates an HD entity's LOD
+// parent from the HD mesh itself: a reduced copy of the HD static mesh becomes a NEW drawable
+// asset, a NEW palette archetype wraps it (bounds from the mesh, the LOD distance given, textures
+// the HD's), and then EITHER the existing LOD parent entity is re-pointed at the new archetype
+// (its ordinal, parentIndex and numChildren stay: no lineage edit at all) OR, for an orphan, a
+// LOD entity is placed where the format allows one (the HD ymap's parent ymap when it has one,
+// else the HD's own ymap) and linked. Nothing existing loses its lodDist / childLodDist (law 26);
+// a NEW parent gets childLodDist = the HD child's lodDist (the game's own rule 958/1,084 times).
+// NewArchetypeName defaults to <hd>_rlod - a RUDE default, not the game's convention: rename freely.
+FString URudeToolset::MakeLodArchetype(const FString& ActorLabel, const FString& NewArchetypeName,
+                                       const FString& TrianglePercent, const FString& LodDist, const FString& PaletteFolder)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	AActor* A = RudeFindActorByLabel(World, ActorLabel);
+	if (!A) { return Fail(FString::Printf(TEXT("no actor labelled '%s'"), *ActorLabel)); }
+	URudeEntityComponent* R = A->FindComponentByClass<URudeEntityComponent>();
+	if (!R) { return Fail(TEXT("that actor carries no RUDE entity")); }
+	if (!RudeIsHdLevel(R->LodLevel)) { return Fail(FString::Printf(TEXT("'%s' is %s; give the HD entity whose LOD parent you want rebuilt"), *ActorLabel, *R->LodLevel)); }
+	if (A->Tags.Contains(FName(TEXT("RUDE_PROXY")))) { return Fail(TEXT("that entity is a proxy cube (its drawable never imported) - nothing to reduce")); }
+	UStaticMeshComponent* SMC = A->FindComponentByClass<UStaticMeshComponent>();
+	UStaticMesh* Src = SMC ? SMC->GetStaticMesh() : nullptr;
+	if (!Src) { return Fail(TEXT("the HD entity has no static mesh")); }
+	const FString Palette = PaletteFolder.TrimStartAndEnd().IsEmpty() ? FString(TEXT("/Game/RUDE/Palette/Downtown")) : PaletteFolder.TrimStartAndEnd();
+	const FString HdName = R->ArchetypeName.ToLower();
+	URudeArchetype* HdArch = LoadObject<URudeArchetype>(nullptr, *(Palette / HdName + TEXT(".") + HdName));
+	if (!HdArch) { return Fail(FString::Printf(TEXT("no palette asset for '%s' under %s - build the palette first"), *HdName, *Palette)); }
+	FString NewName = NewArchetypeName.TrimStartAndEnd().ToLower();
+	if (NewName.IsEmpty()) { NewName = HdName + TEXT("_rlod"); }
+	const double Pct = FMath::Clamp(TrianglePercent.TrimStartAndEnd().IsEmpty() ? 30.0 : FCString::Atod(*TrianglePercent), 1.0, 100.0);
+
+	// the existing LOD parent, if any (re-pointed, never re-linked)
+	AActor* PA = R->LodParent.Get();
+	URudeEntityComponent* PR = PA ? PA->FindComponentByClass<URudeEntityComponent>() : nullptr;
+	URudeArchetype* OldLodArch = nullptr;
+	if (PR) { OldLodArch = LoadObject<URudeArchetype>(nullptr, *(Palette / PR->ArchetypeName.ToLower() + TEXT(".") + PR->ArchetypeName.ToLower())); }
+	double NewLodDist = LodDist.TrimStartAndEnd().IsEmpty() ? 0.0 : FCString::Atod(*LodDist);
+	if (NewLodDist <= 0.0) { NewLodDist = PR ? PR->LodDist : (OldLodArch ? OldLodArch->LodDist : FMath::Max(R->LodDist * 4.0, 300.0)); }
+
+	// a palette asset of that name: only one RUDE made before may be regenerated in place
+	{
+		if (URudeArchetype* Existing = LoadObject<URudeArchetype>(nullptr, *(Palette / NewName + TEXT(".") + NewName)))
+		{
+			if (Existing->SourceIndex >= 0 || !Existing->SourceXml.IsEmpty())
+			{
+				return Fail(FString::Printf(TEXT("'%s' is a game archetype in the palette; choose a NewArchetypeName the game does not use"), *NewName));
+			}
+		}
+	}
+
+	// 1) the reduced drawable: a copy of the HD mesh, LOD0 reduced to TrianglePercent, other LODs dropped
+	const FString MeshFolder = FPackageName::GetLongPackagePath(Src->GetOutermost()->GetName());
+	const FString MeshPkgName = MeshFolder / NewName;
+	UPackage* MeshPkg = CreatePackage(*MeshPkgName);
+	MeshPkg->FullyLoad();
+	if (UObject* Stale = StaticFindObject(UStaticMesh::StaticClass(), MeshPkg, *NewName)) { Stale->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors | REN_NonTransactional); }
+	UStaticMesh* NewMesh = DuplicateObject<UStaticMesh>(Src, MeshPkg, FName(*NewName));
+	if (!NewMesh) { return Fail(TEXT("could not duplicate the HD mesh")); }
+	NewMesh->SetFlags(RF_Public | RF_Standalone);
+	NewMesh->ClearFlags(RF_Transient);
+	// Reduce the SOURCE geometry (the mesh description), not just the render data: the ydr writer
+	// reads the description, so a render-only reduction would export the full HD mesh (measured
+	// 2026-09-06: 2,520 triangles out of a "754-triangle" LOD).
+	const FMeshDescription* SrcDesc = NewMesh->GetMeshDescription(0);
+	if (!SrcDesc) { return Fail(TEXT("the HD mesh has no source geometry to reduce")); }
+	const int32 TrisBefore = SrcDesc->Triangles().Num();
+	IMeshReductionManagerModule& ReducerModule = FModuleManager::LoadModuleChecked<IMeshReductionManagerModule>("MeshReductionInterface");
+	IMeshReduction* Reducer = ReducerModule.GetStaticMeshReductionInterface();
+	if (!Reducer) { return Fail(TEXT("no static mesh reduction module is available in this editor")); }
+	FMeshDescription Reduced;
+	FStaticMeshAttributes(Reduced).Register();
+	{
+		FOverlappingCorners Corners;
+		FStaticMeshOperations::FindOverlappingCorners(Corners, *SrcDesc, THRESH_POINTS_ARE_SAME);
+		FMeshReductionSettings RS;
+		RS.TerminationCriterion = EStaticMeshReductionTerimationCriterion::Triangles;
+		RS.PercentTriangles = (float)(Pct / 100.0);
+		RS.PercentVertices = 1.0f;
+		float MaxDeviation = 0.f;
+		Reducer->ReduceMeshDescription(Reduced, MaxDeviation, *SrcDesc, Corners, RS);
+	}
+	const int32 TrisAfter = Reduced.Triangles().Num();
+	NewMesh->SetNumSourceModels(1);
+	{
+		FMeshDescription* Dst = NewMesh->CreateMeshDescription(0, MoveTemp(Reduced));
+		if (!Dst) { return Fail(TEXT("could not store the reduced geometry")); }
+		NewMesh->CommitMeshDescription(0);
+		FStaticMeshSourceModel& SM = NewMesh->GetSourceModel(0);
+		SM.ReductionSettings.PercentTriangles = 1.0f;   // already reduced at the source
+		SM.ReductionSettings.PercentVertices = 1.0f;
+		SM.BuildSettings.bRecomputeNormals = false;
+		SM.BuildSettings.bRecomputeTangents = false;
+	}
+	NewMesh->Build(/*bSilent*/ true);
+	NewMesh->PostEditChange();
+	NewMesh->MarkPackageDirty();
+	if (TrisAfter <= 0) { return Fail(TEXT("the reduced mesh has no triangles - the reduction did not run (is the mesh reduction module available?)")); }
+
+	// 2) the palette archetype, appended to the HD archetype's ytyp by ExportPaletteYtyps
+	const FString ArchPkgName = Palette / NewName;
+	UPackage* ArchPkg = CreatePackage(*ArchPkgName);
+	ArchPkg->FullyLoad();
+	URudeArchetype* NA = FindObject<URudeArchetype>(ArchPkg, *NewName);
+	if (!NA) { NA = NewObject<URudeArchetype>(ArchPkg, FName(*NewName), RF_Public | RF_Standalone); }
+	NA->ArchetypeKind = TEXT("CBaseArchetypeDef");
+	NA->Name = NewName;
+	NA->AssetName = NewName;
+	NA->AssetType = TEXT("ASSET_TYPE_DRAWABLE");
+	NA->TextureDictionary = HdArch->TextureDictionary;   // the LOD reuses the HD's textures (a lower-res txd is a later refinement)
+	NA->PhysicsDictionary.Reset();
+	NA->DrawableDictionary.Reset();
+	NA->ClipDictionary.Reset();
+	NA->LodDist = (float)NewLodDist;
+	NA->HdTextureDist = OldLodArch ? OldLodArch->HdTextureDist : 0.f;
+	NA->Flags = OldLodArch ? OldLodArch->Flags : HdArch->Flags;
+	NA->SpecialAttribute = 0;
+	NA->TimeFlags = 0;
+	NA->ExtensionsXml.Reset();
+	NA->MloXml.Reset();
+	{
+		// bounds from the mesh, spelled in RAGE metres/axes (x, -y, z; y flips min/max)
+		const FBox B = NewMesh->GetBoundingBox();
+		const FVector Mn(B.Min.X / 100.0, -B.Max.Y / 100.0, B.Min.Z / 100.0);
+		const FVector Mx(B.Max.X / 100.0, -B.Min.Y / 100.0, B.Max.Z / 100.0);
+		NA->BbMin = Mn; NA->BbMax = Mx;
+		NA->BsCentre = (Mn + Mx) * 0.5;
+		NA->BsRadius = (float)((Mx - Mn).Size() * 0.5);
+	}
+	NA->Mesh = NewMesh;
+	NA->SourceYtyp = HdArch->SourceYtyp;   // the target file: appended after every source item
+	NA->SourceSlot = HdArch->SourceSlot;
+	NA->SourceIndex = -1;
+	NA->SourceXml.Reset();
+	NA->SourceFieldsKey.Reset();
+	NA->MarkPackageDirty();
+	{
+		FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+		ARM.Get().AssetCreated(NewMesh);
+		ARM.Get().AssetCreated(NA);
+	}
+
+	// 3) the entity: re-point the existing LOD parent, or place + link one for an orphan
+	FString Mode, Touched;
+	if (PR && PA)
+	{
+		PA->Modify();
+		PR->ArchetypeName = NewName;
+		if (UStaticMeshComponent* PS = PA->FindComponentByClass<UStaticMeshComponent>()) { PS->SetStaticMesh(NewMesh); }
+		PA->Tags.Remove(FName(TEXT("RUDE_PROXY")));
+		PA->MarkPackageDirty();
+		Mode = TEXT("replaced");
+		Touched = FString::Printf(TEXT("%s:%d"), *PR->SourceYmap, PR->SourceIndex);
+	}
+	else
+	{
+		const FString Ymap = R->SourceYmapParent.IsEmpty() ? R->SourceYmap.ToLower() : R->SourceYmapParent.ToLower();
+		TSharedPtr<FJsonObject> Ent = MakeShared<FJsonObject>();
+		Ent->SetStringField(TEXT("archetype"), NewName);
+		Ent->SetStringField(TEXT("srcYmap"), Ymap);
+		Ent->SetStringField(TEXT("srcSlot"), TEXT(""));
+		Ent->SetNumberField(TEXT("srcIndex"), -1);
+		Ent->SetStringField(TEXT("lodLevel"), TEXT("LODTYPES_DEPTH_LOD"));
+		Ent->SetStringField(TEXT("priorityLevel"), R->PriorityLevel);
+		Ent->SetNumberField(TEXT("lodDist"), NewLodDist);
+		Ent->SetNumberField(TEXT("childLodDist"), R->LodDist);
+		Ent->SetNumberField(TEXT("parentIndex"), -1);
+		Ent->SetNumberField(TEXT("flags"), (double)R->Flags);
+		Ent->SetNumberField(TEXT("numChildren"), 1.0);
+		Ent->SetNumberField(TEXT("aoMultiplier"), 255.0);
+		Ent->SetNumberField(TEXT("artificialAo"), 255.0);
+		Ent->SetNumberField(TEXT("tintValue"), 0.0);
+		Ent->SetStringField(TEXT("itemType"), TEXT("CEntityDef"));
+		const FTransform Xf = A->GetActorTransform();
+		{
+			const FVector L = Xf.GetLocation();
+			const uint32 Guid = FCrc::StrCrc32(*FString::Printf(TEXT("%s:%s:%f:%f:%f"), *Ymap, *NewName, L.X / 100.0, -L.Y / 100.0, L.Z / 100.0));
+			Ent->SetNumberField(TEXT("guid"), (double)Guid);
+		}
+		AActor* NewA = RudeSpawnEntityActor(World, Ymap, Ent, Xf, NewMesh, false, 0);
+		if (!NewA) { return Fail(TEXT("could not place the LOD entity")); }
+		URudeEntityComponent* NR = NewA->FindComponentByClass<URudeEntityComponent>();
+		NR->SourceXml.Reset();
+		NR->SourceFieldsKey.Reset();
+		NR->SourceYmapParent = R->SourceYmapParent.IsEmpty() ? FString() : FString();   // a LOD in the HD's parent ymap: that file's own parent is unknown here
+		NR->LodChildren.Add(A);
+		A->Modify();
+		R->LodParent = NewA;
+		NewA->MarkPackageDirty();
+		A->MarkPackageDirty();
+		Mode = TEXT("placed");
+		Touched = FString::Printf(TEXT("%s:new (%s)"), *Ymap, *NewA->GetActorLabel());
+	}
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"mode\":\"%s\",\"hd\":\"%s\",\"newArchetype\":\"%s\",\"mesh\":\"%s\",\"trianglesBefore\":%d,\"trianglesAfter\":%d,")
+		TEXT("\"lodDist\":%g,\"childLodDist\":%g,\"bsRadius\":%g,\"targetYtyp\":\"%s\",\"lodEntity\":\"%s\",")
+		TEXT("\"note\":\"the drawable still needs ExportYdrBinary(mesh) and the ytyp ExportPaletteYtyps; textures reuse the HD's dictionary; existing lodDist/childLodDist untouched (law 26)\"}"),
+		*Mode, *RudeJsonEscape(R->ArchetypeName), *RudeJsonEscape(NewName), *RudeJsonEscape(MeshPkgName), TrisBefore, TrisAfter,
+		NewLodDist, PR ? PR->ChildLodDist : R->LodDist, NA->BsRadius, *RudeJsonEscape(NA->SourceYtyp), *RudeJsonEscape(Touched));
 }
 
 // ---- PickAt (agent) -----------------------------------------------------------------------

@@ -294,6 +294,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Check every object's LOD links against its stored numbers and report any that disagree.", RudeAudience="agent"))
 	static FString LodAudit();
 
+	// Regenerate an HD entity's LOD parent from the HD mesh itself (GDD Wave 2 "swap a building,
+	// press rebuild"): reduced mesh -> new drawable asset + new palette archetype; the existing LOD
+	// parent is re-pointed at it, or one is placed and linked for an orphan.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Rebuild the distant version of a building from the building itself: a simplified copy becomes its new LOD.", RudeAudience="agent"))
+	static FString MakeLodArchetype(const FString& ActorLabel, const FString& NewArchetypeName,
+	                                const FString& TrianglePercent, const FString& LodDist, const FString& PaletteFolder);
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);

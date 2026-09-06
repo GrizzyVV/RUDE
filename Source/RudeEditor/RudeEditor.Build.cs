@@ -27,6 +27,8 @@ public class RudeEditor : ModuleRules
 			"XmlParser",
 			"MeshDescription",
 			"StaticMeshDescription",
+			"MeshReductionInterface",
+			"MeshUtilitiesCommon",
 			"AssetRegistry",
 			"ToolsetRegistry",
 			"ImageWrapper",
