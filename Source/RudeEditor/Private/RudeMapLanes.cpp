@@ -2617,11 +2617,29 @@ FString URudeToolset::SetWorldHour(const FString& Hour)
 
 	const uint32 Bit = 1u << Hr;
 	int32 Gated = 0, Shown = 0, Hidden = 0;
+	// The sun follows the hour too (2026-09-06): elevation = 90 sin(pi (h-6)/12) - up at 06:00, noon at
+	// 12:00, down at 18:00, below the horizon at night - on the RUDE_SKY directional light. A rough
+	// time-of-day for captures and editing; the sandbox shim runs its own clock in PIE.
+	int32 SunMoved = 0; (void)SunMoved;
+	{
+		const double Elev = 90.0 * FMath::Sin(PI * (Hr - 6.0) / 12.0);
+		for (TActorIterator<ADirectionalLight> SIt(World); SIt; ++SIt)
+		{
+			if (!SIt->ActorHasTag(FName(TEXT("RUDE_SKY")))) { continue; }
+			FRotator R = SIt->GetActorRotation();
+			R.Pitch = (float)-Elev;
+			SIt->SetActorRotation(R);
+			SIt->MarkPackageDirty();
+			++SunMoved;
+		}
+	}
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
-		TArray<UInstancedStaticMeshComponent*> Comps;
-		It->GetComponents<UInstancedStaticMeshComponent>(Comps);
-		for (UInstancedStaticMeshComponent* C : Comps)
+		// the district's entity actors carry the mask on their UStaticMeshComponent (RudeSpawnEntityActor);
+		// ImportScene's ISM path carries it on the instanced component - both are swept
+		TArray<UStaticMeshComponent*> Comps;
+		It->GetComponents<UStaticMeshComponent>(Comps);
+		for (UStaticMeshComponent* C : Comps)
 		{
 			for (const FName& Tag : C->ComponentTags)
 			{
