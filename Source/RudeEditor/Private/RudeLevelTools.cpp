@@ -42,6 +42,7 @@
 #include "WorldPartition/DataLayer/WorldDataLayers.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "RudeCarGenComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/SpotLightComponent.h"
 #include "Dom/JsonObject.h"
@@ -176,6 +177,52 @@ void RudeResolveLodLineage(UWorld* World, const TMap<FString, FString>& YmapPare
 
 // =========================== entity lights (Tier 1: lights on the owning actor) ===========================
 static FString RudeNum(double V);   // defined with the entity writer below
+static bool RudeRawItems(const FString& Text, const TCHAR* BlockTag, TArray<FString>& Out);
+
+// =========================== car generators (ymap <carGenerators>) ===========================
+namespace RudeCarGen
+{
+	// the item as the file spells it (2-space Item, 3-space fields; measured shape 723/723 downtown)
+	static FString Spell(const URudeCarGenComponent* C, const FTransform& Xf)
+	{
+		const FVector P = Xf.GetLocation();
+		const FVector Fwd = Xf.GetRotation().GetForwardVector();
+		const double Ox = Fwd.X * C->Length, Oy = -Fwd.Y * C->Length;   // UE forward -> RAGE (x, -y)
+		// an unchanged heading keeps the file's own digits (a recomputed vector re-spells 5.603781 as 5.60378075)
+		const bool bSameHeading = !C->SourceOrientXText.IsEmpty() && Xf.GetRotation().Equals(C->SourceTransform.GetRotation(), 1e-4f);
+		FString O;
+		O += TEXT("  <Item>\n");
+		O += FString::Printf(TEXT("   <position x=\"%s\" y=\"%s\" z=\"%s\" />\n"), *RudeNum(P.X / 100.0), *RudeNum(-P.Y / 100.0), *RudeNum(P.Z / 100.0));
+		O += FString::Printf(TEXT("   <orientX value=\"%s\" />\n   <orientY value=\"%s\" />\n"), bSameHeading ? *C->SourceOrientXText : *RudeNum(Ox), bSameHeading ? *C->SourceOrientYText : *RudeNum(Oy));
+		O += FString::Printf(TEXT("   <perpendicularLength value=\"%s\" />\n"), *RudeNum(C->PerpendicularLength));
+		if (C->CarModel.IsEmpty()) { O += TEXT("   <carModel />\n"); } else { O += TEXT("   <carModel>"); RudeXmlEscapeInto(O, C->CarModel); O += TEXT("</carModel>\n"); }
+		O += FString::Printf(TEXT("   <flags value=\"%u\" />\n"), C->Flags);
+		O += FString::Printf(TEXT("   <bodyColorRemap1 value=\"%d\" />\n   <bodyColorRemap2 value=\"%d\" />\n   <bodyColorRemap3 value=\"%d\" />\n   <bodyColorRemap4 value=\"%d\" />\n"), C->BodyColorRemap1, C->BodyColorRemap2, C->BodyColorRemap3, C->BodyColorRemap4);
+		if (C->PopGroup.IsEmpty()) { O += TEXT("   <popGroup />\n"); } else { O += TEXT("   <popGroup>"); RudeXmlEscapeInto(O, C->PopGroup); O += TEXT("</popGroup>\n"); }
+		O += FString::Printf(TEXT("   <livery value=\"%d\" />\n"), C->Livery);
+		O += TEXT("  </Item>\n");
+		return O;
+	}
+	static bool Untouched(const URudeCarGenComponent* C, const FTransform& Xf)
+	{
+		// position + heading only: the marker's scale is its slab size, not a field
+		return !C->SourceXml.IsEmpty() && C->SourceIndex >= 0 && Xf.GetLocation().Equals(C->SourceTransform.GetLocation(), 1e-3f)
+			&& Xf.GetRotation().Equals(C->SourceTransform.GetRotation(), 1e-4f) && C->FieldsKey() == C->SourceFieldsKey;
+	}
+	// every marker of a ymap: ordinal -> (component, transform); added ones (no ordinal) after
+	struct FMark { URudeCarGenComponent* C; FTransform Xf; };
+	static void Collect(UWorld* World, const FString& YmapLower, TMap<int32, FMark>& ByOrdinal, TArray<FMark>& Added)
+	{
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			URudeCarGenComponent* C = It->FindComponentByClass<URudeCarGenComponent>();
+			if (!C || C->SourceYmap.ToLower() != YmapLower) { continue; }
+			FMark M{ C, It->GetActorTransform() };
+			if (C->SourceIndex >= 0) { ByOrdinal.Add(C->SourceIndex, M); } else { Added.Add(M); }
+		}
+	}
+}
+
 namespace RudeLights
 {
 	struct FInst
@@ -581,7 +628,7 @@ FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& Yma
 	{
 		for (FRudeExportEntity& E : KV.Value) { LightsRewritten += RudeSyncEntityLights(E.R->GetOwner(), E.R); }
 	}
-	int32 LineageDerived = 0;
+	int32 LineageDerived = 0, CarGensRebuilt = 0, CarGensAdded = 0, CarGensRemoved = 0;
 	TMap<FString, FString> LineageBad;   // ymap -> why the whole file is refused
 	{
 		TMap<const AActor*, URudeEntityComponent*> Comp;
@@ -794,6 +841,47 @@ FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& Yma
 				Refused += FString::Printf(TEXT("%s\"%s: no top-level <entities> block found to splice\""), Refused.IsEmpty() ? TEXT("") : TEXT(","), *YmapName);
 				continue;
 			}
+			// ---- car generators: the block is rebuilt only when a marker moved / changed / was added / removed
+			{
+				TMap<int32, RudeCarGen::FMark> ByOrdinal; TArray<RudeCarGen::FMark> AddedMarks;
+				RudeCarGen::Collect(World, YmapName, ByOrdinal, AddedMarks);
+				if (ByOrdinal.Num() > 0 || AddedMarks.Num() > 0)
+				{
+					TArray<FString> RawCg;
+					RudeRawItems(SrcText, TEXT("carGenerators"), RawCg);
+					// never rewrite from a slicing that disagrees with the source: count the file's own items
+					int32 SourceItems = 0;
+					{
+						const int32 O = SrcText.Find(TEXT("\n <carGenerators"), ESearchCase::CaseSensitive);
+						const int32 Cl = O == INDEX_NONE ? INDEX_NONE : SrcText.Find(TEXT("</carGenerators>"), ESearchCase::CaseSensitive, ESearchDir::FromStart, O);
+						if (O != INDEX_NONE && Cl != INDEX_NONE) { FString Blk = SrcText.Mid(O, Cl - O); int32 At = 0; while ((At = Blk.Find(TEXT("\n  <Item"), ESearchCase::CaseSensitive, ESearchDir::FromStart, At)) != INDEX_NONE) { ++SourceItems; ++At; } }
+					}
+					if (RawCg.Num() != SourceItems)
+					{
+						Refused += FString::Printf(TEXT("%s\"%s: car generators: raw slices %d != source items %d - block left verbatim\""), Refused.IsEmpty() ? TEXT("") : TEXT(","), *YmapName, RawCg.Num(), SourceItems);
+						AddedMarks.Reset(); ByOrdinal.Reset();
+					}
+					bool bChanged = AddedMarks.Num() > 0 || (ByOrdinal.Num() > 0 && ByOrdinal.Num() != RawCg.Num());
+					for (const auto& MK : ByOrdinal) { if (!RudeCarGen::Untouched(MK.Value.C, MK.Value.Xf)) { bChanged = true; break; } }
+					if (bChanged)
+					{
+						FString Block;
+						for (int32 o = 0; o < RawCg.Num(); ++o)
+						{
+							const RudeCarGen::FMark* M = ByOrdinal.Find(o);
+							if (!M) { ++CarGensRemoved; continue; }   // marker deleted: the item goes (nothing references it by ordinal)
+							if (RudeCarGen::Untouched(M->C, M->Xf)) { Block += RawCg[o]; if (!RawCg[o].EndsWith(TEXT("\n"))) { Block += TEXT("\n"); } }
+							else { Block += RudeCarGen::Spell(M->C, M->Xf); ++CarGensRebuilt; }
+						}
+						for (const RudeCarGen::FMark& M : AddedMarks) { Block += RudeCarGen::Spell(M.C, M.Xf); ++CarGensAdded; }
+						if (!ReplaceTopLevel(TEXT("\n <carGenerators itemType=\"CCarGen\">\n"), TEXT(" </carGenerators>\n"), TEXT("\n <carGenerators itemType=\"CCarGen\" />\n"),
+							Block.IsEmpty() ? TEXT("\n <carGenerators itemType=\"CCarGen\" />\n") : (TEXT("\n <carGenerators itemType=\"CCarGen\">\n") + Block + TEXT(" </carGenerators>\n"))))
+						{
+							Refused += FString::Printf(TEXT("%s\"%s: car generators changed but no top-level <carGenerators> block to splice\""), Refused.IsEmpty() ? TEXT("") : TEXT(","), *YmapName);
+						}
+					}
+				}
+			}
 			if (Movers > 0)
 			{
 				auto ReplaceExtents = [&](const TCHAR* Tag, bool bMin)
@@ -847,9 +935,9 @@ FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& Yma
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"componentsSeen\":%d,\"unsourced\":%d,\"unsourcedDropped\":%d,")
 		TEXT("\"ymapsWritten\":%d,\"ymapsRefused\":%d,\"kept\":%d,\"edited\":%d,\"added\":%d,\"removed\":%d,")
-		TEXT("\"editsNotRebuilt\":%d,\"extentsGrown\":%d,\"lineageDerived\":%d,\"lightsRewritten\":%d,\"files\":[%s],\"refused\":[%s]}"),
+		TEXT("\"editsNotRebuilt\":%d,\"extentsGrown\":%d,\"lineageDerived\":%d,\"lightsRewritten\":%d,\"carGensRebuilt\":%d,\"carGensAdded\":%d,\"carGensRemoved\":%d,\"files\":[%s],\"refused\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"), Seen, Unsourced, UnsourcedDropped,
-		YmapsWritten, YmapsRefused, Kept, Edited, Added, Removed, EditsNotRebuilt, ExtentsGrown, LineageDerived, LightsRewritten, *Files, *Refused);
+		YmapsWritten, YmapsRefused, Kept, Edited, Added, Removed, EditsNotRebuilt, ExtentsGrown, LineageDerived, LightsRewritten, CarGensRebuilt, CarGensAdded, CarGensRemoved, *Files, *Refused);
 }
 
 // ---- MoveRudeEntity (agent; the scriptable edit for the export gate) ----------------------
@@ -1232,13 +1320,26 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 // construction - the answer to FXmlFile flattening multi-line text (MLO <attachedObjects>).
 static bool RudeRawItems(const FString& Text, const TCHAR* BlockTag, TArray<FString>& Out)
 {
-	const FString Open = FString::Printf(TEXT("\n <%s>\n"), BlockTag);
+	// the opening tag may carry attributes ("<carGenerators itemType=\"CCarGen\">"): match "\n <tag" and
+	// step past that line (measured 2026-09-06: the bare-tag match sliced 0 car generators and the hook
+	// replaced the block with an empty one)
+	const FString OpenBare = FString::Printf(TEXT("\n <%s"), BlockTag);
 	const FString Close = FString::Printf(TEXT("\n </%s>"), BlockTag);
-	const int32 B = Text.Find(Open, ESearchCase::CaseSensitive);
-	if (B == INDEX_NONE) { return false; }
-	const int32 E = Text.Find(Close, ESearchCase::CaseSensitive, ESearchDir::FromStart, B + Open.Len());
+	int32 B = INDEX_NONE, Search = 0;
+	while (true)
+	{
+		const int32 Hit = Text.Find(OpenBare, ESearchCase::CaseSensitive, ESearchDir::FromStart, Search);
+		if (Hit == INDEX_NONE) { return false; }
+		const TCHAR After = Text.IsValidIndex(Hit + OpenBare.Len()) ? Text[Hit + OpenBare.Len()] : 0;
+		if (After == '>' || After == ' ') { B = Hit; break; }
+		Search = Hit + 1;
+	}
+	const int32 OpenLineEnd = Text.Find(TEXT("\n"), ESearchCase::CaseSensitive, ESearchDir::FromStart, B + 1);
+	if (OpenLineEnd == INDEX_NONE) { return false; }
+	if (Text.Mid(B, OpenLineEnd - B).EndsWith(TEXT("/>"))) { return true; }   // the empty form: no items
+	const int32 E = Text.Find(Close, ESearchCase::CaseSensitive, ESearchDir::FromStart, OpenLineEnd);
 	if (E == INDEX_NONE) { return false; }
-	int32 Pos = B + Open.Len();
+	int32 Pos = OpenLineEnd + 1;
 	const FString ItemOpen = TEXT("  <Item");
 	const FString ItemClose = TEXT("\n  </Item>\n");
 	const FString ItemEmptyEnd = TEXT(" />\n");
@@ -2660,6 +2761,7 @@ FString URudeToolset::SetLightField(const FString& ActorLabel, const FString& Li
 		*RudeJsonEscape(A->GetActorLabel()), Idx, *RudeJsonEscape(F), *RudeJsonEscape(Value), LC->Intensity, LC->AttenuationRadius);
 }
 
+
 // ---- SetEntitySet (agent + Matt) ----------------------------------------------------------
 // Activate / deactivate one of an interior's entity sets in the editor (the game's per-instance
 // defaultEntitySets, ActivateInteriorEntitySet): shows or hides the actor ImportMlo spawned for it.
@@ -2692,6 +2794,130 @@ FString URudeToolset::SetEntitySet(const FString& InteriorName, const FString& S
 	if (Touched == 0) { return Fail(FString::Printf(TEXT("no entity set '%s' on interior '%s' (sets present: %s)"), *SetName, *InteriorName, *FString::Join(Known, TEXT(", ")))); }
 	return FString::Printf(TEXT("{\"ok\":true,\"interior\":\"%s\",\"set\":\"%s\",\"visible\":%s,\"actors\":%d,\"instances\":%d,\"setsPresent\":%d}"),
 		*RudeJsonEscape(InteriorName), *RudeJsonEscape(SetName), bShow ? TEXT("true") : TEXT("false"), Touched, Instances, Known.Num());
+}
+
+// ---- ImportCarGenerators (agent + Matt) ---------------------------------------------------
+// The ymap's <carGenerators> as slab markers: length = |orient| (the vehicle's length, 3.4-13 m
+// measured), width = perpendicularLength, facing the orient vector; a URudeCarGenComponent carries the
+// fields and the source slice. YmapFilter = comma list of ymap names ("ALL" = every ymap with entity
+// actors in the level).
+FString URudeToolset::ImportCarGenerators(const FString& CorpusRoot, const FString& YmapFilter)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	FString CorpusErr;
+	const TSharedPtr<FRudeCorpus> Corpus = FRudeCorpus::Open(CorpusRoot, CorpusErr);
+	if (!Corpus.IsValid()) { return Fail(CorpusErr); }
+	TSet<FString> Ymaps;
+	if (YmapFilter.TrimStartAndEnd().Equals(TEXT("ALL"), ESearchCase::IgnoreCase))
+	{
+		for (TActorIterator<AActor> It(World); It; ++It) { if (const URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>()) { if (!R->SourceYmap.IsEmpty()) { Ymaps.Add(R->SourceYmap.ToLower()); } } }
+	}
+	else
+	{
+		TArray<FString> Parts; YmapFilter.ParseIntoArray(Parts, TEXT(","), true);
+		for (FString P : Parts) { P.TrimStartAndEndInline(); if (!P.IsEmpty()) { Ymaps.Add(P.ToLower()); } }
+	}
+	if (Ymaps.Num() == 0) { return Fail(TEXT("give ymap names, or ALL with a level that has RUDE entities")); }
+	UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	int32 Spawned = 0, Cleared = 0, YmapsRead = 0, Malformed = 0;
+	FString Files;
+	for (const FString& Y : Ymaps)
+	{
+		const FRudeCorpusEntry* Row = Corpus->Effective(TEXT("ymap"), Y);
+		if (!Row) { continue; }
+		const FString Path = Corpus->PathOf(*Row);
+		FString Text;
+		if (!FFileHelper::LoadFileToString(Text, *Path)) { continue; }
+		FXmlFile Doc(Path);
+		const FXmlNode* Root = (Doc.IsValid() && Doc.GetRootNode()) ? Doc.GetRootNode() : nullptr;
+		const FXmlNode* CG = Root ? Root->FindChildNode(TEXT("carGenerators")) : nullptr;
+		++YmapsRead;
+		if (!CG || CG->GetChildrenNodes().Num() == 0) { continue; }
+		TArray<FString> Raw;
+		RudeRawItems(Text, TEXT("carGenerators"), Raw);
+		// a rebuild replaces this ymap's markers
+		const FName YmapTag(*(TEXT("RUDE_CARGEN:") + Y));
+		{
+			TArray<AActor*> Old;
+			for (TActorIterator<AActor> It(World); It; ++It) { if (It->Tags.Contains(YmapTag)) { Old.Add(*It); } }
+			for (AActor* O : Old) { World->DestroyActor(O); ++Cleared; }
+		}
+		int32 Ordinal = -1;
+		for (const FXmlNode* Item : CG->GetChildrenNodes())
+		{
+			++Ordinal;
+			const FXmlNode* Pos = Item->FindChildNode(TEXT("position"));
+			auto Num = [&](const TCHAR* Tag, double Def) { const FXmlNode* N = Item->FindChildNode(Tag); return N ? FCString::Atod(*N->GetAttribute(TEXT("value"))) : Def; };
+			auto Txt = [&](const TCHAR* Tag) { const FXmlNode* N = Item->FindChildNode(Tag); return N ? N->GetContent().TrimStartAndEnd() : FString(); };
+			if (!Pos) { ++Malformed; continue; }
+			const double Px = FCString::Atod(*Pos->GetAttribute(TEXT("x"))), Py = FCString::Atod(*Pos->GetAttribute(TEXT("y"))), Pz = FCString::Atod(*Pos->GetAttribute(TEXT("z")));
+			const double Ox = Num(TEXT("orientX"), 1.0), Oy = Num(TEXT("orientY"), 0.0);
+			const double Len = FMath::Max(0.1, FMath::Sqrt(Ox * Ox + Oy * Oy));
+			const double Yaw = FMath::RadiansToDegrees(FMath::Atan2(-Oy, Ox));   // RAGE (x,y) -> UE (x,-y)
+			const FTransform Xf(FRotator(0.0, Yaw, 0.0), FVector(Px * 100.0, -Py * 100.0, Pz * 100.0), FVector::OneVector);
+			AActor* A = World->SpawnActor<AActor>();
+			if (!A) { continue; }
+			UStaticMeshComponent* SMC = NewObject<UStaticMeshComponent>(A, TEXT("Marker"));
+			SMC->SetStaticMesh(Cube);
+			SMC->SetMobility(EComponentMobility::Movable);
+			SMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			A->SetRootComponent(SMC);
+			SMC->RegisterComponent();
+			A->AddInstanceComponent(SMC);
+			A->SetActorTransform(Xf);
+			const double Perp = FMath::Max(0.1, Num(TEXT("perpendicularLength"), 3.0));
+			SMC->SetRelativeScale3D(FVector(Len, Perp, 0.3));   // the cube is 1 m: scale = metres
+			URudeCarGenComponent* C = NewObject<URudeCarGenComponent>(A, TEXT("RudeCarGen"));
+			C->Length = (float)Len; C->PerpendicularLength = (float)Perp;
+			C->CarModel = Txt(TEXT("carModel")); C->Flags = (uint32)Num(TEXT("flags"), 0.0);
+			C->BodyColorRemap1 = (int32)Num(TEXT("bodyColorRemap1"), -1.0); C->BodyColorRemap2 = (int32)Num(TEXT("bodyColorRemap2"), -1.0);
+			C->BodyColorRemap3 = (int32)Num(TEXT("bodyColorRemap3"), -1.0); C->BodyColorRemap4 = (int32)Num(TEXT("bodyColorRemap4"), -1.0);
+			C->PopGroup = Txt(TEXT("popGroup")); C->Livery = (int32)Num(TEXT("livery"), -1.0);
+			C->SourceYmap = Y; C->SourceIndex = Ordinal;
+			C->SourceXml = Raw.IsValidIndex(Ordinal) ? Raw[Ordinal] : FString();
+			C->SourceTransform = Xf;
+			{
+				const FXmlNode* OX = Item->FindChildNode(TEXT("orientX")); const FXmlNode* OY = Item->FindChildNode(TEXT("orientY"));
+				C->SourceOrientXText = OX ? OX->GetAttribute(TEXT("value")) : FString(); C->SourceOrientYText = OY ? OY->GetAttribute(TEXT("value")) : FString();
+			}
+			C->SourceFieldsKey = C->FieldsKey();
+			C->RegisterComponent();
+			A->AddInstanceComponent(C);
+			A->Tags.Add(FName(TEXT("RUDE_CARGEN")));
+			A->Tags.Add(YmapTag);
+			A->SetActorLabel(FString::Printf(TEXT("cargen_%s_%d"), *Y, Ordinal));
+			A->SetFolderPath(FName(*(TEXT("RUDE_CARGENS/") + Y)));
+			++Spawned;
+		}
+		Files += FString::Printf(TEXT("%s\"%s:%d\""), Files.IsEmpty() ? TEXT("") : TEXT(","), *Y, Ordinal + 1);
+	}
+	return FString::Printf(TEXT("{\"ok\":%s,\"ymapsRead\":%d,\"spawned\":%d,\"cleared\":%d,\"malformed\":%d,\"perYmap\":[%s]}"),
+		Spawned > 0 ? TEXT("true") : TEXT("false"), YmapsRead, Spawned, Cleared, Malformed, *Files);
+}
+
+// ---- MoveCarGenerator (agent) ------------------------------------------------------------
+FString URudeToolset::MoveCarGenerator(const FString& YmapName, const FString& Index, const FString& DeltaCm)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	const int32 I = FCString::Atoi(*Index);
+	TArray<FString> P; DeltaCm.Replace(TEXT(";"), TEXT(",")).ParseIntoArray(P, TEXT(","), true);
+	if (P.Num() != 3) { return Fail(TEXT("DeltaCm must be x,y,z")); }
+	const FVector D(FCString::Atod(*P[0]), FCString::Atod(*P[1]), FCString::Atod(*P[2]));
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		URudeCarGenComponent* C = It->FindComponentByClass<URudeCarGenComponent>();
+		if (!C || C->SourceIndex != I || !C->SourceYmap.Equals(YmapName.TrimStartAndEnd(), ESearchCase::IgnoreCase)) { continue; }
+		It->Modify();
+		const FVector Before = It->GetActorLocation();
+		It->SetActorLocation(Before + D);
+		It->MarkPackageDirty();
+		return FString::Printf(TEXT("{\"ok\":true,\"ymap\":\"%s\",\"index\":%d,\"before\":[%.2f,%.2f,%.2f],\"after\":[%.2f,%.2f,%.2f]}"), *RudeJsonEscape(C->SourceYmap), I, Before.X, Before.Y, Before.Z, Before.X + D.X, Before.Y + D.Y, Before.Z + D.Z);
+	}
+	return Fail(FString::Printf(TEXT("no car generator %s:%d in the level (ImportCarGenerators first)"), *YmapName, I));
 }
 
 // ---- PickAt (agent) -----------------------------------------------------------------------

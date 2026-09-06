@@ -508,6 +508,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Switch one of an interior's optional prop sets on or off.", RudeAudience="agent"))
 	static FString SetEntitySet(const FString& InteriorName, const FString& SetName, const FString& Visible);
 
+	// A ymap's car generators as slab markers (length, width, heading) with their fields; export rebuilds the block when one moves.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a map's parked-car spawn spots in as markers you can move; the export writes them back.", RudeAudience="agent"))
+	static FString ImportCarGenerators(const FString& CorpusRoot, const FString& YmapFilter);
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one parked-car spawn spot by x,y,z centimetres.", RudeAudience="agent"))
+	static FString MoveCarGenerator(const FString& YmapName, const FString& Index, const FString& DeltaCm);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);
