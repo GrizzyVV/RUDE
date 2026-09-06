@@ -1826,6 +1826,14 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 		// corrupts its bulkdata registration ("invalid payload" save failures,
 		// 2026-07-24) - the texture becomes unsaveable.
 		UTexture2D* Tex = FindObject<UTexture2D>(Package, *TexName);
+		// A texture that exists ON DISK but is not loaded is LOADED first (2026-09-06): creating a new object
+		// over an unloaded package left two claimants - ours, and the disk copy pulled in later by a kept
+		// mesh's material instance - and the save then failed with "invalid payload" (14 of 225 in the
+		// vehicle re-body gate, every one referenced by an on-disk MI). Loading makes the edit in place real.
+		if (!Tex && FPackageName::DoesPackageExist(PackageName))
+		{
+			Tex = LoadObject<UTexture2D>(nullptr, *(PackageName + TEXT(".") + TexName));
+		}
 		if (!Tex)
 		{
 			Tex = NewObject<UTexture2D>(Package, FName(*TexName), RF_Public | RF_Standalone);
