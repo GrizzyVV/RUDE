@@ -12,6 +12,7 @@
 #include "Engine/Texture2D.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceConstant.h"
+#include "Materials/MaterialInstance.h"
 #include "MeshDescription.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
@@ -3041,14 +3042,33 @@ FString URudeToolset::InspectMesh(const FString& AssetPath)
 		for (const FKSphylElem& E : BS->AggGeom.SphylElems) { FarthestPrimM = FMath::Max(FarthestPrimM, E.Center.Size() / 100.0); }
 		for (const FKConvexElem& E : BS->AggGeom.ConvexElems) { FarthestPrimM = FMath::Max(FarthestPrimM, E.GetTransform().GetLocation().Size() / 100.0); }
 	}
+	// materials per slot: the instance and what its Diffuse resolved to (2026-09-06: the instrument that
+	// names WHICH geometry of a checkered mesh lost its texture - a master shows the checker for an unbound
+	// diffuse, and the district's bind report only counts misses)
+	FString MatsJson;
+	for (const FStaticMaterial& SM : Mesh->GetStaticMaterials())
+	{
+		FString Diffuse = TEXT("unbound"), MatPath = TEXT("null");
+		if (SM.MaterialInterface)
+		{
+			MatPath = SM.MaterialInterface->GetPathName();
+			if (const UMaterialInstance* MI = Cast<UMaterialInstance>(SM.MaterialInterface))
+			{
+				UTexture* T = nullptr;
+				if (MI->GetTextureParameterValue(FMaterialParameterInfo(TEXT("Diffuse")), T) && T && !T->GetPathName().StartsWith(TEXT("/Engine/"))) { Diffuse = T->GetName(); }
+			}
+		}
+		MatsJson += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"diffuse\":\"%s\"}"), MatsJson.IsEmpty() ? TEXT("") : TEXT(","),
+			*RudeJsonEscape(SM.MaterialSlotName.ToString()), *RudeJsonEscape(MatPath), *RudeJsonEscape(Diffuse));
+	}
 	return FString::Printf(TEXT("{\"ok\":true,\"mesh\":\"%s\",\"renderBoundsM\":\"%.1fx%.1fx%.1f\",\"boundsCenterM\":\"%.1f,%.1f,%.1f\",")
 		TEXT("\"lod0Verts\":%d,\"lod0Tris\":%d,\"vertexMinM\":\"%.1f,%.1f,%.1f\",\"vertexMaxM\":\"%.1f,%.1f,%.1f\",")
-		TEXT("\"collision\":{\"spheres\":%d,\"boxes\":%d,\"capsules\":%d,\"convex\":%d,\"farthestPrimM\":%.1f},\"positiveBoundsExtM\":\"%.1f,%.1f,%.1f\"}"),
+		TEXT("\"collision\":{\"spheres\":%d,\"boxes\":%d,\"capsules\":%d,\"convex\":%d,\"farthestPrimM\":%.1f},\"positiveBoundsExtM\":\"%.1f,%.1f,%.1f\",\"materials\":[%s]}"),
 		*RudeJsonEscape(Mesh->GetName()), B.GetSize().X / 100.0, B.GetSize().Y / 100.0, B.GetSize().Z / 100.0,
 		B.GetCenter().X / 100.0, B.GetCenter().Y / 100.0, B.GetCenter().Z / 100.0,
 		Verts, Tris, VMin.X / 100.0, VMin.Y / 100.0, VMin.Z / 100.0, VMax.X / 100.0, VMax.Y / 100.0, VMax.Z / 100.0,
 		Spheres, Boxes, Capsules, Convex, FarthestPrimM,
-		Mesh->GetPositiveBoundsExtension().X / 100.0, Mesh->GetPositiveBoundsExtension().Y / 100.0, Mesh->GetPositiveBoundsExtension().Z / 100.0);
+		Mesh->GetPositiveBoundsExtension().X / 100.0, Mesh->GetPositiveBoundsExtension().Y / 100.0, Mesh->GetPositiveBoundsExtension().Z / 100.0, *MatsJson);
 }
 
 // ---- XmlShapeRoundTrip -------------------------------------------------------------------
