@@ -30,6 +30,9 @@ public class RudeEditor : ModuleRules
 			"MeshReductionInterface",
 			"MeshMergeUtilities",
 			"MeshUtilitiesCommon",
+			// WP10 peds: FSkeletalMeshAttributes / skin-weight attributes, and UE::AnimationCore::FBoneWeights.
+			"SkeletalMeshDescription",
+			"AnimationCore",
 			"AssetRegistry",
 			"ToolsetRegistry",
 			"ImageWrapper",
@@ -38,7 +41,15 @@ public class RudeEditor : ModuleRules
 			"RudeIntake",
 			// WP4: Data Layers from code (the ymap-as-layer projection).
 			"DataLayerEditor",
+			// WP10 audio lane: USoundFactory is the engine's own WAV importer (ImportAwc).
+			"AudioEditor",
 			"RudeCore",
+			// WP10 ANIMS: ycd -> UAnimSequence (IAnimationDataController lives in Engine; the controller
+			// implementation module is named so the headless CLI has it loaded), cut -> Level Sequence.
+			"AnimationDataController",
+			"LevelSequence",
+			"MovieScene",
+			"MovieSceneTracks",
 		});
 	}
 }

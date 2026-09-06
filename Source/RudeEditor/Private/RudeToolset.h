@@ -297,6 +297,167 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one ambient-life point by x,y,z centimetres. Name it by its region and its number in that region's file.", RudeAudience="agent"))
 	static FString MoveScenarioPoint(const FString& RegionName, const FString& PointIndex, const FString& DeltaCm);
 
+	// ---- wp10 configs: timecycle modifiers (scratchpad/wp10/configs/LAWS.md) ----
+	// One URudeTimecycle DataAsset per <modifier> across EVERY timecycle_mods_*.xml the corpus carries (base,
+	// update and each DLC copy are separate documents - the ledger keys them all as one name, the game loads
+	// them additively; a later copy of the same modifier name refills the asset). Fields: mod name ->
+	// (value, weight) in the file's order, userFlags, numMods as spelled, provenance (slot, file, ordinal)
+	// and the modifier's own bytes. Verdict: files, modifiersSeen, assets, created, overwrittenByLaterCopy,
+	// selfClosing (numMods=0 form), irregular (kept verbatim), gaps, mods, modVocabulary, refused.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring the game's timecycle modifiers (the lighting, fog and colour tweaks a map switches on by area) in as assets you can edit."))
+	static FString ImportTimecycles(const FString& CorpusRoot, const FString& DestFolder);
+
+	// The modifiers back to their source files: <OutDir>/<slot>/<filename> (game filename kept, identity in
+	// folders) plus an fxmanifest.lua of data_file 'TIMECYCLEMOD_FILE' lines. The source document is SPLICED:
+	// an untouched modifier re-emits its own bytes, an edited one is rebuilt in the file's spelling (CRLF,
+	// "%.3f %.3f" pairs, self-closing when it has no mods), a RUDE-authored one (SourceIndex -1) is appended
+	// to its source file, or to rude/timecycle_mods_rude.xml when it has none. Gate: every untouched file
+	// byte-identical to the corpus copy.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save the timecycle modifiers back out as game files, ready to stream. Modifiers you did not touch go back exactly as they came in."))
+	static FString ExportTimecycles(const FString& OutDir, const FString& DestFolder, const FString& CorpusRoot);
+
+	// ---- wp10 configs: text (gxt2) ----
+	// One gxt2 table -> a UStringTable at <DestFolder>/<language>/<name>, keyed by the entry hash spelled as
+	// 8 upper-case hex digits. TableName = "<name>[@<language>]" (default american): the corpus keys gxt2 by
+	// name only and 20+ language archives spell the same names, so the language is part of the ask. The
+	// binary layout is checked on read (magic x2, size field, ascending hashes/offsets, NUL-terminated
+	// contiguous UTF-8 strings) and any violation is refused with its reason.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring one of the game's text tables in as a String Table you can edit. Give the table name, optionally @language (american is the default)."))
+	static FString ImportText(const FString& CorpusRoot, const FString& TableName, const FString& DestFolder);
+
+	// A UStringTable back to a gxt2 in the measured layout: '2TXG', count, (hash, offset) pairs sorted by
+	// hash, '2TXG', total size, then each string UTF-8 + NUL in that order. An 8-hex key is the hash
+	// itself; any other key is joaat'd (a label authored in RUDE) and counted keysHashedFromLabels. Two keys
+	// with one hash are refused. Gate: an unedited import re-exports byte-identical.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Write a String Table out as a game text file (.gxt2)."))
+	static FString ExportText(const FString& StringTableAsset, const FString& OutGxt2Path);
+
+	// ---- wp10 configs: blips ----
+	// The blip catalog as one URudeBlipCatalog at <DestFolder>/BlipCatalog: every radar_* name minimap.gfx
+	// exports (the SWF's ExportAssets tag, walked from the uncompressed 'GFX' container; a 'CFX' one is
+	// refused) with its SWF character id, the blip sheets minimap.ytd declares (blips_texturesheet, _ng,
+	// _ng_2, _ng_3) as soft refs to the textures ImportYtd lands under <DestFolder>/minimap/, and the
+	// non-radar exports. The per-sprite sheet stays null (not derived in this lane). Verdict carries the
+	// ytd import's declared/imported/missingPixels: the corpus has no pixel sidecars for cdimages ytds today.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build the list of map blip icons the game knows, with the sprite sheets they are drawn from."))
+	static FString BuildBlipCatalog(const FString& CorpusRoot, const FString& DestFolder);
+
+	// ---- vehicle paths (ynd) - WP10 paths lane; laws in scratchpad/wp10/paths/LAWS.md ----------
+	// Import one path cell as editable actors: nodes<N> (N = row*32+col over 512 m cells from -8192 m;
+	// "at:x,y" in GTA metres names the cell that holds a point - downtown (120,-575) is nodes464). One
+	// actor per node with a URudePathNodeComponent (every node field + provenance), in-cell links as
+	// linear splines on one <cell>_Links actor, junction heightmap data carried on the junction's node.
+	// Filter: ALL (default) | VEH | PED | JUNCTION. Re-running replaces the cell's actors.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring one square of the game's road and footpath network into your level as movable points, with the connections drawn."))
+	static FString ImportPaths(const FString& CorpusRoot, const FString& CellName, const FString& Filter);
+
+	// Move one path node by x,y,z UE centimetres (identity = cell + ordinal). The scriptable edit the
+	// export gate uses. Reports the GTA position before and after, snapped to the file's grid.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one road/footpath point by x,y,z centimetres. Name it by its square and its number in that square.", RudeAudience="agent"))
+	static FString MovePathNode(const FString& CellName, const FString& NodeID, const FString& DeltaCm);
+
+	// The path readback: every node actor goes back to its cell as <OutDir>/stream/<cell>.ynd (XML in the
+	// corpus spelling) + fxmanifest.lua. The source bytes are SPLICED - only the <Nodes> block is re-emitted:
+	// an untouched node verbatim from its raw slice, an edited node rebuilt from its fields with the position
+	// snapped to the measured grid (x,y 1/4 m; z 1/32 m); Junctions/JunctionRefs/header verbatim. Wave 1 has
+	// no add and no delete (ordinals are link targets across files) - both are counted, as are stale
+	// LinkLengths (never rewritten: the rule is unproven) and Y-order breaks. CellName = comma list (empty =
+	// every cell in the level).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save the road/footpath points in your level back out as game path files, ready to stream in FiveM. Points you did not touch go back exactly as they came in."))
+	static FString ExportPaths(const FString& OutDir, const FString& CellName, const FString& CorpusRoot);
+
+	// Import a ped: the fragment's skeleton -> USkeleton, every component drawable of its dictionary ->
+	// a skinned USkeletalMesh (real BlendWeights / BlendIndices resolved through the geometry's <BoneIDs>
+	// table), materials through the shared drawable lane, the ymt variation matrix -> a URudePedOutfit
+	// DataAsset, and a preview actor wearing drawable 0 / texture a of every component. Laws + numbers:
+	// scratchpad/wp10/peds/LAWS.md (a_m_m_business_01: 106 bones, 8 drawables, 46 textures, 4 components).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V character (ped) into Unreal: its skeleton, every clothing piece as a skinned mesh, and its outfit variations."))
+	static FString ImportPed(const FString& CorpusRoot, const FString& PedName, const FString& DestFolder);
+
+	// ---- WP10 audio lane (RudeAudio.cpp) ----
+	// Write ONE USoundWave as a plaintext single-stream .awc (PCM16). Container ('ADAT', measured on the
+	// game's own files, LAWS.md): 16-B header | per-stream [u16 chunkStart][u32 word], word =
+	// (chunkCount<<29)|(joaat(name)&0x1FFFFFFF) | u64 chunk table (offset 28b | size 28b | type 8b) |
+	// bodies data(0x55) format(0xFA, 24 B) peak(0x36) back-to-back from dataStart 46, no padding; flags
+	// 0xFF01 (the game's 50 plaintext-PCM files). PCM from USoundWave::GetImportedSoundWaveData (16-bit
+	// only; stereo downmixed to mono and reported). Self-check re-parses the file with the tiling reader.
+	// StreamName empty = the output file's stem. Returns JSON {ok, frames, sampleRate, bytes, chunks, selfCheck}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save a sound as a GTA V audio container (.awc) holding one uncompressed track."))
+	static FString ExportAwc(const FString& SoundWaveAssetPath, const FString& OutAwcPath, const FString& StreamName);
+
+	// Import the PCM16 streams of one corpus .awc as USoundWave assets (AwcName = ledger name, e.g. "chicken").
+	// Converted XML: kind="pcm16" .wav sidecars / kind="raw" PCM16 are imported; kind="none" (ROUT --textures
+	// none - the 2026-09-04 corpus), kind="encrypted" and ADPCM streams are counted and skipped. Kept binary:
+	// parsed by the tiling reader; no 'ADAT' magic = whole-file encrypted = named refusal. DestFolder empty =
+	// /Game/RUDE/Audio/<name>. Returns JSON {ok, dataChunks, pcmImported, adpcmSkipped, encryptedSkipped, payloadAbsent, ...}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring the uncompressed tracks of a game audio container into the project as sounds; compressed or encrypted tracks are counted, not guessed."))
+	static FString ImportAwc(const FString& CorpusRoot, const FString& AwcName, const FString& DestFolder);
+
+	// ---- WP10 passthrough tier (RudeCarried.cpp) ----
+	// One URudeCarriedAsset per effective corpus file of Type (ledger lane word: yed, yld, yfd, ypdb, ynv,
+	// mrf, ypt, ...) whose name contains NameFilter (empty = all): raw XML inline up to 8 MB, root tag, a
+	// summary of the top-level arrays ("Polygons:2564 Portals:4 ..."), ledger provenance (slot, file, sha1).
+	// Kept-binary rows become stubs. DestFolder empty = /Game/RUDE/Carried/<type>. Nothing edit-native.
+	// Returns JSON {ok, rows, matched, assets, created, refilled, xmlInlined, xmlTooLarge, binaryStubs, sample}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Catalogue one kind of game file into the project as browsable carried assets, each with a one-line count summary."))
+	static FString CatalogLane(const FString& CorpusRoot, const FString& Type, const FString& NameFilter, const FString& DestFolder);
+
+	// Draw one corpus navmesh (.ynv) as persistent lines in the editor world: every polygon ring (cyan),
+	// portals (magenta), points (yellow ticks); RAGE metres -> UE cm with the house Y mirror. YnvName=CLEAR
+	// flushes the persistent batch. Returns JSON {ok, polygons, polygonVertices, portals, points, lines, camSpecHint}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Draw a game navigation mesh in the level as lines, to see where characters can walk.", RudeAudience="agent"))
+	static FString DebugDrawNavmesh(const FString& CorpusRoot, const FString& YnvName);
+
+	// ---- WP10 ANIMS ----------------------------------------------------------------------------
+	// Import a clip dictionary (.ycd, ROUT XML) as ONE UAnimSequence per <Animations><Item> on the given
+	// USkeleton. Laws measured over 5 dictionaries / 30 animations (scratchpad/wp10/anims/LAWS.md):
+	//   * frames = <FrameCount>; frame rate = round((FrameCount-1)/Duration) - 30 fps in 27/30, 10 fps in 3/30.
+	//   * <BoneIds><Item> = {BoneId = skeleton bone TAG, Track, Unk0 = kind 0 vec3 / 1 quat / 2 float}; the
+	//     <SequenceData><Item>s of every sequence are parallel to it (44/44 sequences). Track 0 = bone
+	//     translation (metres, parent-local), Track 1 = bone rotation (quaternion). Other tracks are counted
+	//     and skipped (camera 7/8/27..., facial 24/25/26, mover extras 5/6/134..140).
+	//   * consecutive sequences share one frame: sum(seq frames) - (nSeq-1) == FrameCount; a file that breaks
+	//     this refuses. Global frame f -> sequence f / SequenceFrameLimit, local f - s*limit.
+	//   * channels: QuantizeFloat <Values> (already dequantised, one per frame), StaticFloat, StaticVector3,
+	//     StaticQuaternion, IndirectQuantizeFloat (<Values> palette indexed by <Frames>), CachedQuaternion1/2
+	//     (<QuatIndex> = the OMITTED component; the 3 preceding channels fill the remaining indices in order;
+	//     omitted = +sqrt(1 - sum sq) - sign UNVERIFIED in-game, see NOTES.md).
+	//   * transform to UE: pos (x*100, -y*100, z*100) cm, quat (x, -y, z, w) - the plain mirror a skeleton bone
+	//     takes (RudeVehicle.cpp bone note). Scale = the skeleton's reference scale. Root motion OFF.
+	//   * tags: every <Tags><Item> of every clip referencing the animation becomes a plain notify named
+	//     <NameHash>, at StartTime + StartPhase * (EndTime - StartTime) of that clip's reference (EndPhase dropped).
+	// Bone mapping: BoneId (tag) -> NAME through the ped outfit's name->tag map (URudePedOutfit `BoneTags`,
+	// read by reflection so this lane compiles without the ped lane), then the skeleton bone by NAME; a bone
+	// whose skeleton name spells the tag's decimal maps by TAG as the fallback. Unmapped tags are counted and
+	// listed - never silently dropped.
+	// CorpusRoot: filebase root (ledger lookup, type "ycd"); any other folder = "<folder>/<name>.ycd.xml".
+	// YcdName: the dictionary name as the ledger spells it (e.g. amb@bagels@male@walking@).
+	// SkeletonAssetPath: "/Game/.../SK_ped" or "/Game/.../SK_ped;/Game/.../DA_outfit" (explicit outfit; else the
+	// single URudePedOutfit asset in the skeleton's folder is used and named in the verdict).
+	// DestFolder: assets land at <DestFolder>/<dictionary>/A_<animation>.
+	// Verdict: clips, animations, per-animation {frames, frameRate, bonesMapped, bonesUnmapped, unmappedTags,
+	// tracksSkipped, rotUnreadable, notifies, keys[first bones: t0/tLast cm, r0/rLast quat]}, totals, failures.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V animation dictionary into Unreal as animations on a ped skeleton. Give the skeleton (and its outfit asset) so bones line up."))
+	static FString ImportClipDictionary(const FString& CorpusRoot, const FString& YcdName,
+	                                    const FString& SkeletonAssetPath, const FString& DestFolder);
+
+	// Import a cutscene (.cut, ROUT XML of rage__cutfCutsceneFile2) as a Level Sequence: one spawnable camera
+	// keyed from the cutscene's own animation parts (<cut>-0.ycd, <cut>-1.ycd, ... - each carries a clip
+	// "<camera cName>-<k>", bone 0 track 7 = position (metres, RAGE Z-up), track 8 = rotation; measured against
+	// the .cut's own camera-cut positions: identical to 1e-5 on 2/2 cutscenes once the .cut's (x, y, z) is read
+	// as (x, z_up, -y)), a camera-cut track with one cut per rage__cutfCameraCutEventArgs event (iEventId 43),
+	// and a sidecar URudeCutsceneEvents DataAsset carrying EVERY event verbatim (list, time, id, object,
+	// args index/type/name, the args and event XML re-spelled), every object, the concat rows.
+	// Parts are laid back-to-back by their own frame counts; the verdict reports the sum against fTotalDuration
+	// (the exact boundary rule is UNMEASURED - see NOTES.md). Camera axis convention (which local axis the
+	// RAGE camera looks along) is UNVERIFIED: first-frame rotation is reported for Matt's eyes.
+	// CorpusRoot: filebase root (ledger types "cut" and "ycd"); CutName: e.g. ah_1_int; DestFolder: assets land
+	// at <DestFolder>/<cut>/LS_<cut> and DA_<cut>_events.
+	// Verdict: totalDuration, objects, events, eventArgs, cameraCutEvents, parts[{name, frames, fps, seqs}],
+	// cameraKeys, sumPartsSeconds, levelSequence, eventsAsset, firstCamPosUE, firstCamRotUE, fovFirst.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V cutscene into Unreal as a Level Sequence with its camera moves and cuts, plus a data asset listing every event."))
+	static FString ImportCutscene(const FString& CorpusRoot, const FString& CutName, const FString& DestFolder);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);
