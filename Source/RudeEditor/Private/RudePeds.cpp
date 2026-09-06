@@ -26,7 +26,8 @@
 // produces a static twin under <ped>/_static/ - its material instances go through the existing preset /
 // RenderBucket / texture-scope path - and the skeletal mesh borrows the twin's material per slot name.
 //
-// NOT in v1: Medium/Low LOD groups, cloth, the heads' own <Skeleton>, pedprops (<ped>_p.ydd), expressions,
+// NOT in v1: Medium/Low LOD groups, cloth, the heads' own <Skeleton>, expressions,
+// (pedprops <ped>_p.ydd ARE in since WP11 - RUDE_PEDPROPS regions below; laws in scratchpad/wp11/pedprops/LAWS.md)
 // the peds.ymt row (movement sets, audio). Every one of those is a counted absence, not a silent one.
 #include "RudeToolset.h"
 #include "RudeToolsetInternal.h"
@@ -42,6 +43,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "BoneWeights.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Components/StaticMeshComponent.h"   // RUDE_PEDPROPS: props ride the bones as static-mesh components
 #include "Dom/JsonObject.h"
 #include "Editor.h"
 #include "Engine/SkeletalMesh.h"
@@ -409,6 +411,146 @@ namespace RudePeds
 		int32 TexBound = -1, TexMissing = -1;   // the twin's material binding, surfaced per mesh (2026-09-06)
 		bool bOwnSkeleton = false;
 	};
+	// RUDE_PEDPROPS_BEGIN helpers
+	// ---- ped props (WP11 lane, scratchpad/wp11/pedprops/LAWS.md) ----
+	// The only anchor ids the game's data spells (1,169/1,169 aAnchors rows over 709 peds) and the yft bone each rides.
+	// id -> enumerant -> entry word are MEASURED (aAnchors in ascending anchorId order on every ped; propId sets equal
+	// the entry ddd sets 1,169/1,169); the BONE per anchor is RUDE's table (the game's own is code, not data) - a
+	// skeleton without it is counted (anchorsUnmapped), never guessed.
+	struct FPropAnchor { int32 Id; const TCHAR* Word; const TCHAR* Enum; const TCHAR* Bone; };
+	static const FPropAnchor kPropAnchors[5] =
+	{
+		{ 0, TEXT("head"),   TEXT("ANCHOR_HEAD"),        TEXT("SKEL_Head") },
+		{ 1, TEXT("eyes"),   TEXT("ANCHOR_EYES"),        TEXT("SKEL_Head") },
+		{ 2, TEXT("ears"),   TEXT("ANCHOR_EARS"),        TEXT("SKEL_Head") },
+		{ 6, TEXT("lwrist"), TEXT("ANCHOR_LEFT_WRIST"),  TEXT("SKEL_L_Hand") },
+		{ 7, TEXT("rwrist"), TEXT("ANCHOR_RIGHT_WRIST"), TEXT("SKEL_R_Hand") },
+	};
+	static const FPropAnchor* AnchorById(int32 Id)
+	{
+		for (const FPropAnchor& A : kPropAnchors) { if (A.Id == Id) { return &A; } }
+		return nullptr;
+	}
+	static const FPropAnchor* AnchorByWord(const FString& Word)
+	{
+		for (const FPropAnchor& A : kPropAnchors) { if (Word.Equals(A.Word, ESearchCase::IgnoreCase)) { return &A; } }
+		return nullptr;
+	}
+	// "head" / "p_head" / "ANCHOR_HEAD" / "0" -> the row (nullptr when none of the five)
+	static const FPropAnchor* AnchorByText(const FString& Text)
+	{
+		const FString T = Text.TrimStartAndEnd().ToLower();
+		if (T.IsEmpty()) { return nullptr; }
+		if (T.IsNumeric()) { return AnchorById(FCString::Atoi(*T)); }
+		for (const FPropAnchor& A : kPropAnchors)
+		{
+			if (T == FString(A.Word).ToLower() || T == FString(A.Enum).ToLower() || T == FString(TEXT("p_")) + A.Word) { return &A; }
+		}
+		return nullptr;
+	}
+	// p_<anchor>_<ddd> -> parts (1,763/1,763 entries measured spell this)
+	static bool SplitPropName(const FString& Name, FString& OutAnchorWord, int32& OutIndex)
+	{
+		TArray<FString> Parts;
+		Name.ToLower().ParseIntoArray(Parts, TEXT("_"), true);
+		if (Parts.Num() != 3 || Parts[0] != TEXT("p") || !Parts[2].IsNumeric()) { return false; }
+		OutAnchorWord = Parts[1]; OutIndex = FCString::Atoi(*Parts[2]);
+		return true;
+	}
+	struct FPropMetaTex { int32 TexId = 0; int32 Dist = 255; };
+	struct FPropMeta { int32 AnchorId = -1; int32 PropId = -1; int32 PropFlags = 0; int32 Flags = 0; FString AudioId; TArray<FPropMetaTex> Tex; };
+	struct FPropAnchorRow { FString Enum; TArray<int32> Props; };
+	// <propInfo>: numAvailProps, aPropMetaData rows (anchorId / propId / texData / propFlags / flags / audioId), aAnchors
+	// rows (enumerant + per-prop texture counts). Re-opens the ymt (small). False when it is not a CPedVariationInfo.
+	static bool ReadPropInfo(const FString& YmtPath, int32& OutNumAvail, TArray<FPropMeta>& OutRows, TArray<FPropAnchorRow>& OutAnchors)
+	{
+		FXmlFile Ymt(YmtPath);
+		const FXmlNode* Root = Ymt.IsValid() ? Ymt.GetRootNode() : nullptr;
+		if (!Root || Root->GetTag() != TEXT("CPedVariationInfo")) { return false; }
+		const FXmlNode* PropIx = Root->FindChildNode(TEXT("propInfo"));
+		if (!PropIx) { return true; }
+		OutNumAvail = ValueInt(PropIx, TEXT("numAvailProps"), 0);
+		if (const FXmlNode* MD = PropIx->FindChildNode(TEXT("aPropMetaData")))
+		{
+			for (const FXmlNode* It : MD->GetChildrenNodes())
+			{
+				if (It->GetTag() != TEXT("Item")) { continue; }
+				FPropMeta M;
+				M.AnchorId = ValueInt(It, TEXT("anchorId"), -1); M.PropId = ValueInt(It, TEXT("propId"), -1);
+				M.PropFlags = ValueInt(It, TEXT("propFlags"), 0); M.Flags = ValueInt(It, TEXT("flags"), 0);
+				M.AudioId = NodeText(It, TEXT("audioId"));
+				if (const FXmlNode* TD = It->FindChildNode(TEXT("texData")))
+				{
+					for (const FXmlNode* T : TD->GetChildrenNodes())
+					{
+						if (T->GetTag() != TEXT("Item")) { continue; }
+						FPropMetaTex X; X.TexId = ValueInt(T, TEXT("texId"), 0); X.Dist = ValueInt(T, TEXT("distribution"), 255);
+						M.Tex.Add(X);
+					}
+				}
+				OutRows.Add(MoveTemp(M));
+			}
+		}
+		if (const FXmlNode* AN = PropIx->FindChildNode(TEXT("aAnchors")))
+		{
+			for (const FXmlNode* It : AN->GetChildrenNodes())
+			{
+				if (It->GetTag() != TEXT("Item")) { continue; }
+				FPropAnchorRow R; R.Enum = NodeText(It, TEXT("anchor"));
+				TArray<FString> P; NodeText(It, TEXT("props")).ParseIntoArrayWS(P);
+				for (const FString& S : P) { R.Props.Add(FCString::Atoi(*S)); }
+				OutAnchors.Add(MoveTemp(R));
+			}
+		}
+		return true;
+	}
+	struct FPropImported
+	{
+		FString EntryName, AnchorWord; int32 Index = -1;
+		UStaticMesh* Mesh = nullptr; FString AssetPath;
+		int32 Verts = 0, Tris = 0, Geos = 0, SkinnedGeos = 0, TexBound = -1, TexMissing = -1;
+		TArray<FString> Presets;
+		bool bNamed = false, bOwnSkeleton = false;
+	};
+	// Geometry count of the High group and how many carry BlendWeights (= a skinned prop; none measured, 977/977 rigid).
+	static void CountPropGeometry(const FXmlNode* Item, FPropImported& P)
+	{
+		const FXmlNode* High = Item->FindChildNode(TEXT("DrawableModelsHigh"));
+		if (!High) { return; }
+		for (const FXmlNode* M : High->GetChildrenNodes())
+		{
+			const FXmlNode* Gs = M->FindChildNode(TEXT("Geometries"));
+			if (!Gs) { continue; }
+			for (const FXmlNode* G : Gs->GetChildrenNodes())
+			{
+				++P.Geos;
+				const FXmlNode* VB = G->FindChildNode(TEXT("VertexBuffer"));
+				const FXmlNode* L = VB ? VB->FindChildNode(TEXT("Layout")) : nullptr;
+				if (L && L->FindChildNode(TEXT("BlendWeights"))) { ++P.SkinnedGeos; }
+			}
+		}
+	}
+	// One HIDDEN static-mesh component on the prop's anchor bone. Props are modeled in ped axes with the origin at the
+	// bone (LAWS.md law 7: hats extend +Z while the head bone's local X is world-up), so the relative rotation is the
+	// bone's component-space bind rotation INVERTED and the translation zero. Null when the bone is not on the rig.
+	static UStaticMeshComponent* AttachPropComponent(AActor* Actor, USkeletalMeshComponent* Lead, const FReferenceSkeleton& RS, const FRudePedProp& P, UStaticMesh* PM)
+	{
+		if (!Actor || !Lead || !PM || P.AnchorBone.IsNone()) { return nullptr; }
+		const int32 BI = RS.FindBoneIndex(P.AnchorBone);
+		if (BI < 0) { return nullptr; }
+		FTransform CS = FTransform::Identity;
+		for (int32 b = BI; b >= 0; b = RS.GetParentIndex(b)) { CS = CS * RS.GetRefBonePose()[b]; }   // child local first, then each parent
+		UStaticMeshComponent* PC = NewObject<UStaticMeshComponent>(Actor, FName(*FString::Printf(TEXT("Prop_%s_%03d"), *P.Anchor, P.PropIndex)));
+		PC->SetStaticMesh(PM);
+		PC->SetupAttachment(Lead, P.AnchorBone);
+		PC->SetRelativeTransform(FTransform(CS.GetRotation().Inverse()));
+		PC->SetVisibility(false);
+		PC->ComponentTags.Add(FName(*FString::Printf(TEXT("RUDE_PEDPROP:%d:%d"), P.AnchorId, P.PropIndex)));
+		PC->RegisterComponent();
+		Actor->AddInstanceComponent(PC);
+		return PC;
+	}
+	// RUDE_PEDPROPS_END helpers
 }
 
 // ---- ImportPed --------------------------------------------------------------------------------
@@ -424,6 +566,10 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 	FString YddPath = CorpusRoot / (Name + TEXT(".ydd.xml"));
 	FString YtdPath = CorpusRoot / (Name + TEXT(".ytd.xml"));
 	FString YmtPath = CorpusRoot / (Name + TEXT(".ymt.xml"));
+	// RUDE_PEDPROPS_BEGIN paths
+	FString PropYddPath = CorpusRoot / (Name + TEXT("_p.ydd.xml"));   // the prop dictionary (pedprops.rpf), when the ped has one
+	FString PropYtdPath = CorpusRoot / (Name + TEXT("_p.ytd.xml"));
+	// RUDE_PEDPROPS_END paths
 	if (FRudeCorpus::LooksLikeCorpus(CorpusRoot))
 	{
 		FString CorpusErr;
@@ -433,6 +579,10 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ydd"), Name)) { YddPath = Corpus->PathOf(*R); }
 		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ytd"), Name)) { YtdPath = Corpus->PathOf(*R); }
 		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ymt"), Name)) { YmtPath = Corpus->PathOf(*R); }
+		// RUDE_PEDPROPS_BEGIN corpus
+		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ydd"), Name + TEXT("_p"))) { PropYddPath = Corpus->PathOf(*R); }
+		if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ytd"), Name + TEXT("_p"))) { PropYtdPath = Corpus->PathOf(*R); }
+		// RUDE_PEDPROPS_END corpus
 	}
 	if (!FPaths::FileExists(YftPath)) { return Fail(FString::Printf(TEXT("no fragment XML at %s - is the name right, and is this a component ped?"), *YftPath)); }
 	if (!FPaths::FileExists(YddPath)) { return Fail(FString::Printf(TEXT("no drawable dictionary at %s - a ped without components cannot be dressed"), *YddPath)); }
@@ -747,6 +897,83 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 		}
 	}
 
+	// RUDE_PEDPROPS_BEGIN import
+	// ---- 4b) the props: <ped>_p.ydd entries (RIGID, 977/977 measured) as static meshes under <ped>/props/, <ped>_p.ytd once ----
+	// LAWS: scratchpad/wp11/pedprops/LAWS.md. A streamed ped (mp_m_freemode_01, cs_*) keeps one ydd per prop in a
+	// <ped>_p/ folder the corpus cannot address by name - counted here as an absence, not read.
+	const bool bHasPropYdd = FPaths::FileExists(PropYddPath);
+	const bool bHasPropYtd = FPaths::FileExists(PropYtdPath);
+	int32 NumAvailProps = 0; TArray<FPropMeta> PropRows; TArray<FPropAnchorRow> PropAnchorRows;
+	if (bYmtRead) { ReadPropInfo(YmtPath, NumAvailProps, PropRows, PropAnchorRows); }
+	if (!bHasPropYdd && PropRows.Num() > 0) { Problems.Add(FString::Printf(TEXT("the ymt lists %d props but no %s_p.ydd resolves (a streamed ped keeps one ydd per prop in a %s_p/ folder - not read in v1)"), PropRows.Num(), *Name, *Name)); }
+	TArray<FString> PropYtdNames;
+	int32 PropTexImported = 0;
+	if (bHasPropYtd)
+	{
+		FXmlFile PYtd(PropYtdPath);
+		if (PYtd.IsValid()) { CollectItemNames(PYtd.GetRootNode(), PropYtdNames); }
+		const bool bAlready = PropYtdNames.Num() > 0 && FPackageName::DoesPackageExist(TexRoot / (Name + TEXT("_p")) / PropYtdNames[0]);
+		if (!bAlready)
+		{
+			const FString V = URudeToolset::ImportYtd(PropYtdPath, TEXT(""), TexRoot);
+			PropTexImported = JsonInt(V, TEXT("imported"), -1);
+			if (!V.Contains(TEXT("\"ok\":true"))) { Problems.Add(FString::Printf(TEXT("ImportYtd (%s_p): %s"), *Name, *V.Left(200))); }
+		}
+		else { PropTexImported = -2; }   // -2 = already present, skipped
+	}
+	else if (bHasPropYdd) { Problems.Add(FString::Printf(TEXT("no %s_p.ytd - prop materials bind no textures"), *Name)); }
+	TArray<FPropImported> PropEntries;
+	int32 PropsImported = 0, PropsSkinned = 0, PropsUnnamed = 0, PropVerts = 0, PropTris = 0;
+	if (bHasPropYdd)
+	{
+		FXmlFile PYdd(PropYddPath);
+		const FXmlNode* PRoot = PYdd.IsValid() ? PYdd.GetRootNode() : nullptr;
+		if (!PRoot || PRoot->GetTag() != TEXT("DrawableDictionary")) { Problems.Add(FString::Printf(TEXT("%s: not a <DrawableDictionary> - props skipped"), *PropYddPath)); }
+		else
+		{
+			FRudeTextureScope PropScope;
+			PropScope.ArchetypeTxd = Name + TEXT("_p");   // tier 2 = /Game/RUDE/Textures/<ped>_p/ (ImportYtd's landing for the prop dictionary)
+			const FString PropFolder = PedFolder / TEXT("props");
+			for (const FXmlNode* Item : PRoot->GetChildrenNodes())
+			{
+				if (Item->GetTag() != TEXT("Item")) { continue; }
+				FPropImported P;
+				P.EntryName = NodeText(Item, TEXT("Name")).ToLower();
+				if (P.EntryName.IsEmpty()) { Problems.Add(TEXT("a prop entry has no <Name> - skipped")); continue; }
+				P.bNamed = SplitPropName(P.EntryName, P.AnchorWord, P.Index);
+				if (!P.bNamed) { ++PropsUnnamed; Problems.Add(FString::Printf(TEXT("%s: not p_<anchor>_<ddd> - imported outside the prop matrix"), *P.EntryName)); }
+				P.bOwnSkeleton = Item->FindChildNode(TEXT("Skeleton")) != nullptr;
+				CountPropGeometry(Item, P);
+				if (P.SkinnedGeos > 0)
+				{
+					// no skinned prop exists in the measured game data (977/977 rigid): a counted refusal, never a silent static import
+					++PropsSkinned;
+					Problems.Add(FString::Printf(TEXT("%s: %d/%d geometries carry BlendWeights - skinned props are not imported in v1"), *P.EntryName, P.SkinnedGeos, P.Geos));
+					PropEntries.Add(P);
+					continue;
+				}
+				if (const FXmlNode* SG = Item->FindChildNode(TEXT("ShaderGroup")))
+				{
+					if (const FXmlNode* Sh = SG->FindChildNode(TEXT("Shaders")))
+					{
+						for (const FXmlNode* S : Sh->GetChildrenNodes()) { P.Presets.Add(NodeText(S, TEXT("Name"))); }
+					}
+				}
+				const FString MeshName = Name + TEXT("__") + P.EntryName;   // ped-qualified like the component twins (MI keys are per mesh name)
+				const FString V = ImportDrawableNode(Item, MeshName, PropFolder, &PropScope);
+				P.TexBound = JsonInt(V, TEXT("boundTextures"), -1); P.TexMissing = JsonInt(V, TEXT("missingTextures"), -1);
+				if (V.Contains(TEXT("\"ok\":true"))) { P.Mesh = LoadObject<UStaticMesh>(nullptr, *(PropFolder / MeshName + TEXT(".") + MeshName)); }
+				if (!P.Mesh) { Problems.Add(FString::Printf(TEXT("%s: prop import failed: %s"), *P.EntryName, *V.Left(160))); PropEntries.Add(P); continue; }
+				P.AssetPath = PropFolder / MeshName;
+				if (const FMeshDescription* PMD = P.Mesh->GetMeshDescription(0)) { P.Verts = PMD->Vertices().Num(); P.Tris = PMD->Triangles().Num(); }
+				PropVerts += P.Verts; PropTris += P.Tris;
+				++PropsImported;
+				PropEntries.Add(P);
+			}
+		}
+	}
+	// RUDE_PEDPROPS_END import
+
 	// ---- 5) the outfit: the matrix joined against the dictionary and the ytd (law 3 + 6) ----------------
 	const FString OutfitName = Name + TEXT("_outfit");
 	UPackage* OPkg = CreatePackage(*(PedFolder / OutfitName));
@@ -838,6 +1065,88 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 			if (C.Drawables.Num() > 0) { Outfit->Components.Add(MoveTemp(C)); }
 		}
 	}
+	// RUDE_PEDPROPS_BEGIN outfit
+	// ---- 5b) the prop matrix: propInfo rows joined against the prop dictionary and <ped>_p.ytd (LAWS.md laws 6, 8) ----
+	Outfit->Props.Reset();
+	Outfit->NumAvailProps = NumAvailProps;
+	Outfit->SourcePropYdd = bHasPropYdd ? PropYddPath : FString();
+	Outfit->SourcePropYtd = bHasPropYtd ? PropYtdPath : FString();
+	int32 PropsInMatrix = 0, PropsResolved = 0, PropTexInMatrix = 0, PropTexResolved = 0, AnchorsUnmapped = 0, PropsOutsideMatrix = 0;
+	{
+		TSet<FString> Placed;
+		auto AddProp = [&](const FPropAnchor* A, int32 AnchorId, int32 PropId, const FPropMeta* Meta, const FPropImported* E)
+		{
+			FRudePedProp P;
+			P.AnchorId = AnchorId; P.PropIndex = PropId;
+			P.Anchor = A ? FString(A->Word) : (E ? E->AnchorWord : FString::Printf(TEXT("anchor%d"), AnchorId));
+			P.AnchorBone = A ? FName(A->Bone) : NAME_None;
+			if (!A || !Outfit->BoneTags.Contains(P.AnchorBone))
+			{
+				++AnchorsUnmapped;
+				Problems.Add(FString::Printf(TEXT("prop anchor %d (%s): no bone to ride (%s)"), AnchorId, *P.Anchor, A ? A->Bone : TEXT("not one of the five anchor ids the game's data spells")));
+				P.AnchorBone = NAME_None;
+			}
+			if (Meta)
+			{
+				P.PropFlags = Meta->PropFlags; P.Flags = Meta->Flags; P.AudioId = Meta->AudioId;
+				for (int32 t = 0; t < Meta->Tex.Num(); ++t)
+				{
+					FRudePedTexture T;
+					T.Letter = FString::Chr((TCHAR)(TEXT('a') + t));
+					T.TexId = Meta->Tex[t].TexId; T.Distribution = Meta->Tex[t].Dist;
+					++PropTexInMatrix;
+					// p_<anchor>_diff_<ddd>_<letter> (3,230/6,670 names; no race suffix; MIXED case inside one file)
+					const FString Want = FString::Printf(TEXT("p_%s_diff_%03d_%s"), *P.Anchor, PropId, *T.Letter);
+					for (const FString& N : PropYtdNames) { if (N.Equals(Want, ESearchCase::IgnoreCase) || N.StartsWith(Want + TEXT("_"), ESearchCase::IgnoreCase)) { T.TextureName = N; break; } }
+					if (!T.TextureName.IsEmpty())
+					{
+						++PropTexResolved;
+						T.Texture = TSoftObjectPtr<UTexture2D>(FSoftObjectPath(TexRoot / (Name + TEXT("_p")) / T.TextureName + TEXT(".") + T.TextureName));
+					}
+					P.Textures.Add(T);
+				}
+			}
+			if (E) { P.Name = E->EntryName; P.Mesh = E->Mesh; P.Vertices = E->Verts; P.Triangles = E->Tris; P.ShaderPresets = E->Presets; }
+			else { P.Name = FString::Printf(TEXT("p_%s_%03d_?"), *P.Anchor, PropId); }
+			Outfit->Props.Add(MoveTemp(P));
+		};
+		auto FindProp = [&](const FString& Word, int32 Index) -> const FPropImported*
+		{
+			for (const FPropImported& E : PropEntries) { if (E.bNamed && E.AnchorWord == Word && E.Index == Index) { return &E; } }
+			return nullptr;
+		};
+		for (const FPropMeta& M : PropRows)
+		{
+			++PropsInMatrix;
+			const FPropAnchor* A = AnchorById(M.AnchorId);
+			const FPropImported* E = A ? FindProp(A->Word, M.PropId) : nullptr;
+			if (E && E->Mesh) { ++PropsResolved; }
+			else if (bHasPropYdd) { Problems.Add(FString::Printf(TEXT("prop matrix names anchor %d prop %d but the dictionary has no imported p_%s_%03d"), M.AnchorId, M.PropId, A ? A->Word : TEXT("?"), M.PropId)); }
+			AddProp(A, M.AnchorId, M.PropId, &M, E);
+			Placed.Add(FString::Printf(TEXT("%d:%d"), M.AnchorId, M.PropId));
+		}
+		// dictionary entries the matrix does not list (or no matrix at all): carried, no letters
+		for (const FPropImported& E : PropEntries)
+		{
+			if (!E.Mesh) { continue; }
+			const FPropAnchor* A = AnchorByWord(E.AnchorWord);
+			const int32 AnchorId = A ? A->Id : -1;
+			if (Placed.Contains(FString::Printf(TEXT("%d:%d"), AnchorId, E.Index))) { continue; }
+			++PropsOutsideMatrix;
+			AddProp(A, AnchorId, E.Index, nullptr, &E);
+		}
+		for (const FPropAnchorRow& R : PropAnchorRows)
+		{
+			// aAnchors.props = per-prop texture counts in propId order (1,169/1,169 measured) - a disagreement is a broken file
+			const FPropAnchor* A = nullptr;
+			for (const FPropAnchor& X : kPropAnchors) { if (R.Enum == X.Enum) { A = &X; } }
+			if (!A) { Problems.Add(FString::Printf(TEXT("aAnchors names %s - not one of the five anchors the game's data spells"), *R.Enum)); continue; }
+			int32 Rows = 0;
+			for (const FPropMeta& M : PropRows) { if (M.AnchorId == A->Id) { ++Rows; } }
+			if (Rows != R.Props.Num()) { Problems.Add(FString::Printf(TEXT("%s: aAnchors lists %d props, aPropMetaData has %d rows"), *R.Enum, R.Props.Num(), Rows)); }
+		}
+	}
+	// RUDE_PEDPROPS_END outfit
 	Outfit->MarkPackageDirty();
 	if (bNewOutfit)
 	{
@@ -848,6 +1157,7 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 	// ---- 6) the preview actor: drawable 0 of every component, letter a (what the ydd's shader binds) -------
 	FString ActorLabel;
 	int32 PartsWorn = 0;
+	int32 PropsAttached = 0;   // RUDE_PEDPROPS
 	if (UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
 	{
 		const FName PedTag(*(TEXT("RUDE_PED:") + Name));
@@ -880,6 +1190,18 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 				}
 				++PartsWorn;
 			}
+			// RUDE_PEDPROPS_BEGIN preview
+			// ---- 6b) every prop as a HIDDEN static-mesh component on its anchor bone (SetPedProp shows one per anchor) ----
+			if (Lead)
+			{
+				for (const FRudePedProp& P : Outfit->Props)
+				{
+					UStaticMesh* PM = P.Mesh.Get();
+					if (!PM) { continue; }
+					if (AttachPropComponent(Actor, Lead, RefSkel, P, PM)) { ++PropsAttached; }
+				}
+			}
+			// RUDE_PEDPROPS_END preview
 			Actor->MarkPackageDirty();
 			ActorLabel = Actor->GetActorLabel();
 		}
@@ -889,6 +1211,12 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 
 	// ---- 7) the verdict: every drop has a counter ---------------------------------------------------
 	FString MeshesJson, ProblemsJson;
+	FString PropsJson;   // RUDE_PEDPROPS
+	for (const FPropImported& P : PropEntries)
+	{
+		PropsJson += FString::Printf(TEXT("%s{\"entry\":\"%s\",\"anchor\":\"%s\",\"index\":%d,\"asset\":\"%s\",\"geometries\":%d,\"skinnedGeometries\":%d,\"vertices\":%d,\"triangles\":%d,\"texturesBound\":%d,\"texturesMissing\":%d,\"ownSkeleton\":%s}"),
+			PropsJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(P.EntryName), *RudeJsonEscape(P.AnchorWord), P.Index, *RudeJsonEscape(P.AssetPath), P.Geos, P.SkinnedGeos, P.Verts, P.Tris, P.TexBound, P.TexMissing, P.bOwnSkeleton ? TEXT("true") : TEXT("false"));
+	}
 	for (const FImported& E : Entries)
 	{
 		MeshesJson += FString::Printf(TEXT("%s{\"entry\":\"%s\",\"name\":\"%s\",\"comp\":\"%s\",\"index\":%d,\"class\":\"%s\",\"asset\":\"%s\",\"geometries\":%d,\"geometriesDropped\":%d,\"vertices\":%d,\"triangles\":%d,\"unweighted\":%d,\"influencesOutOfRange\":%d,\"texturesBound\":%d,\"texturesMissing\":%d,\"ownSkeleton\":%s}"),
@@ -901,11 +1229,17 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 		TEXT("\"drawablesInMatrix\":%d,\"drawablesResolved\":%d,\"entriesWithOwnSkeleton\":%d,\"textures\":%d,\"texturesImported\":%d,")
 		TEXT("\"texturesInMatrix\":%d,\"texturesResolved\":%d,\"skinnedVertices\":%d,\"verticesWithoutWeights\":%d,\"influencesOutOfRange\":%d,")
 		TEXT("\"trianglesOutOfRange\":%d,\"triangles\":%d,\"builtSections\":%d,\"skeleton\":\"%s\",\"outfit\":\"%s\",\"actor\":\"%s\",\"partsWorn\":%d,")
+		TEXT("\"props\":%d,\"propsImported\":%d,\"propsInMatrix\":%d,\"propsResolved\":%d,\"propsOutsideMatrix\":%d,\"propsSkinnedRefused\":%d,\"propsUnnamed\":%d,")
+		TEXT("\"propTextures\":%d,\"propTexturesImported\":%d,\"propTexturesInMatrix\":%d,\"propTexturesResolved\":%d,\"anchorsUnmapped\":%d,\"propsAttached\":%d,")
+		TEXT("\"propVertices\":%d,\"propTriangles\":%d,\"numAvailProps\":%d,\"propYdd\":\"%s\",\"propEntries\":[%s],")
 		TEXT("\"meshes\":[%s],\"problems\":[%s]}"),
 		Imported > 0 ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Name), Bones.Num(), *RudeJsonEscape(Bones[0].Name), Outfit->Components.Num(), Entries.Num(), Imported,
 		DrawablesInMatrix, DrawablesResolved, OwnSkeletons, YtdNames.Num(), TexImported,
 		TexturesInMatrix, TexturesResolved, TotalVerts, TotalUnweighted, TotalOutOfRange,
 		TotalTrisOut, TotalTris, BuiltSections, *RudeJsonEscape(PedFolder / SkelName), *RudeJsonEscape(PedFolder / OutfitName), *RudeJsonEscape(ActorLabel), PartsWorn,
+		PropEntries.Num(), PropsImported, PropsInMatrix, PropsResolved, PropsOutsideMatrix, PropsSkinned, PropsUnnamed,
+		PropYtdNames.Num(), PropTexImported, PropTexInMatrix, PropTexResolved, AnchorsUnmapped, PropsAttached,
+		PropVerts, PropTris, NumAvailProps, *RudeJsonEscape(bHasPropYdd ? PropYddPath : FString()), *PropsJson,
 		*MeshesJson, *ProblemsJson);
 }
 
@@ -1008,6 +1342,111 @@ FString URudeToolset::SetPedOutfit(const FString& ActorLabel, const FString& Slo
 		*RudeJsonEscape(PedName), *RudeJsonEscape(Comp->Slot), *RudeJsonEscape(Dr->Name), *RudeJsonEscape(M->GetPathName()), *RudeJsonEscape(Letter), *RudeJsonEscape(TexName), SlotsOverridden, *RudeJsonEscape(Part->GetName()));
 }
 
+// RUDE_PEDPROPS_BEGIN setpedprop
+// ---- SetPedProp (agent + Matt) ---------------------------------------------------------------
+// The prop matrix as a surface, mirroring SetPedOutfit: prop P of anchor A (head / eyes / ears / lwrist / rwrist,
+// an ANCHOR_* enumerant, or the id 0/1/2/6/7) on the imported ped, wearing texture index T (0 = letter a). PropIndex
+// -1 = nothing on that anchor (the game's own "no prop"). One prop per anchor, like the game: every other prop
+// component of the anchor goes dark. A prop the import did not attach (bone missing) is refused by name.
+FString URudeToolset::SetPedProp(const FString& ActorLabel, const FString& Anchor, const FString& PropIndex, const FString& TextureIndex)
+{
+	using namespace RudePeds;
+	auto Bad = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Bad(TEXT("no editor world")); }
+	AActor* A = nullptr;
+	FString PedName;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (It->GetActorLabel() != ActorLabel.TrimStartAndEnd()) { continue; }
+		for (const FName& T : It->Tags) { const FString S = T.ToString(); if (S.StartsWith(TEXT("RUDE_PED:"))) { PedName = S.Mid(9); } }
+		if (!PedName.IsEmpty()) { A = *It; break; }
+	}
+	if (!A) { return Bad(FString::Printf(TEXT("no RUDE ped actor labelled '%s' (ImportPed labels them PED_<name>)"), *ActorLabel)); }
+	const FPropAnchor* An = AnchorByText(Anchor);
+	if (!An) { return Bad(FString::Printf(TEXT("unknown anchor '%s' - head, eyes, ears, lwrist, rwrist (or ANCHOR_HEAD.. / 0,1,2,6,7)"), *Anchor)); }
+	URudePedOutfit* Outfit = nullptr;
+	{
+		FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+		TArray<FAssetData> Assets;
+		ARM.Get().GetAssetsByClass(URudePedOutfit::StaticClass()->GetClassPathName(), Assets, true);
+		for (const FAssetData& AD : Assets)
+		{
+			URudePedOutfit* O = Cast<URudePedOutfit>(AD.GetAsset());
+			if (O && O->PedName.Equals(PedName, ESearchCase::IgnoreCase)) { Outfit = O; break; }
+		}
+	}
+	if (!Outfit) { return Bad(FString::Printf(TEXT("no URudePedOutfit asset for '%s'"), *PedName)); }
+	const int32 PropIx = PropIndex.TrimStartAndEnd().IsEmpty() ? -1 : FCString::Atoi(*PropIndex);
+	ASkeletalMeshActor* SA = Cast<ASkeletalMeshActor>(A);
+	USkeletalMeshComponent* Lead = SA ? SA->GetSkeletalMeshComponent() : A->FindComponentByClass<USkeletalMeshComponent>();
+	// every prop component of this anchor goes dark; the chosen one shows (created here when the import did not attach it)
+	TArray<UStaticMeshComponent*> Comps;
+	A->GetComponents<UStaticMeshComponent>(Comps);
+	const FString TagPrefix = FString::Printf(TEXT("RUDE_PEDPROP:%d:"), An->Id);
+	UStaticMeshComponent* Shown = nullptr;
+	int32 Hidden = 0;
+	for (UStaticMeshComponent* C : Comps)
+	{
+		bool bMine = false, bWant = false;
+		for (const FName& T : C->ComponentTags)
+		{
+			const FString S = T.ToString();
+			if (!S.StartsWith(TagPrefix)) { continue; }
+			bMine = true;
+			bWant = FCString::Atoi(*S.Mid(TagPrefix.Len())) == PropIx;
+		}
+		if (!bMine) { continue; }
+		if (bWant) { Shown = C; }
+		else if (C->IsVisible()) { C->SetVisibility(false); ++Hidden; }
+	}
+	A->Modify();
+	if (PropIx < 0)
+	{
+		A->MarkPackageDirty();
+		return FString::Printf(TEXT("{\"ok\":true,\"ped\":\"%s\",\"anchor\":\"%s\",\"anchorId\":%d,\"prop\":-1,\"hidden\":%d,\"component\":\"\"}"),
+			*RudeJsonEscape(PedName), An->Word, An->Id, Hidden);
+	}
+	const FRudePedProp* Pr = Outfit->Props.FindByPredicate([&](const FRudePedProp& P) { return P.AnchorId == An->Id && P.PropIndex == PropIx; });
+	if (!Pr) { return Bad(FString::Printf(TEXT("anchor %s has no prop %d in the outfit (%d props total)"), An->Word, PropIx, Outfit->Props.Num())); }
+	UStaticMesh* PM = Pr->Mesh.LoadSynchronous();
+	if (!PM) { return Bad(FString::Printf(TEXT("prop %s has no imported mesh"), *Pr->Name)); }
+	if (!Shown)
+	{
+		if (!Lead || !Lead->GetSkeletalMeshAsset()) { return Bad(TEXT("the ped actor has no skeletal mesh to hang a prop on")); }
+		Shown = AttachPropComponent(A, Lead, Lead->GetSkeletalMeshAsset()->GetRefSkeleton(), *Pr, PM);
+		if (!Shown) { return Bad(FString::Printf(TEXT("prop %s: anchor bone '%s' is not on this skeleton (anchorsUnmapped at import)"), *Pr->Name, *Pr->AnchorBone.ToString())); }
+	}
+	Shown->SetStaticMesh(PM);
+	Shown->SetVisibility(true);
+	// the texture index as a Diffuse override on every material slot (dynamic instances, editor preview)
+	const int32 TI = TextureIndex.TrimStartAndEnd().IsEmpty() ? -1 : FCString::Atoi(*TextureIndex);
+	FString TexName;
+	int32 SlotsOverridden = 0;
+	if (TI >= 0)
+	{
+		if (!Pr->Textures.IsValidIndex(TI)) { return Bad(FString::Printf(TEXT("prop %s has no texture %d (%d letters)"), *Pr->Name, TI, Pr->Textures.Num())); }
+		UTexture2D* T = Pr->Textures[TI].Texture.LoadSynchronous();
+		if (!T) { return Bad(FString::Printf(TEXT("texture %s is not imported (the corpus has no pixels for %s_p.ytd yet)"), *Pr->Textures[TI].TextureName, *PedName)); }
+		TexName = Pr->Textures[TI].TextureName;
+		for (int32 i = 0; i < Shown->GetNumMaterials(); ++i)
+		{
+			UMaterialInterface* Base = Shown->GetMaterial(i);
+			if (!Base) { continue; }
+			UMaterialInstanceDynamic* MID = Cast<UMaterialInstanceDynamic>(Base);
+			if (!MID) { MID = UMaterialInstanceDynamic::Create(Base, A); Shown->SetMaterial(i, MID); }
+			MID->SetTextureParameterValue(FName(TEXT("Diffuse")), T);
+			++SlotsOverridden;
+		}
+	}
+	Shown->MarkRenderStateDirty();
+	A->MarkPackageDirty();
+	return FString::Printf(TEXT("{\"ok\":true,\"ped\":\"%s\",\"anchor\":\"%s\",\"anchorId\":%d,\"bone\":\"%s\",\"prop\":%d,\"entry\":\"%s\",\"mesh\":\"%s\",\"vertices\":%d,\"triangles\":%d,\"texture\":%d,\"textureName\":\"%s\",\"materialSlotsOverridden\":%d,\"hidden\":%d,\"component\":\"%s\"}"),
+		*RudeJsonEscape(PedName), An->Word, An->Id, *Pr->AnchorBone.ToString(), PropIx, *RudeJsonEscape(Pr->Name), *RudeJsonEscape(PM->GetPathName()), Pr->Vertices, Pr->Triangles,
+		TI, *RudeJsonEscape(TexName), SlotsOverridden, Hidden, *RudeJsonEscape(Shown->GetName()));
+}
+// RUDE_PEDPROPS_END setpedprop
+
 // ---- ExportPedReplace (agent + Matt) --------------------------------------------------------
 // GDD "custom clothing", the path that needs NO variation-table writer: a REPLACE resource for one ped.
 // Every drawable the outfit knows (all slots, all indices, the High mesh) goes into stream/<ped>.ydd under
@@ -1049,6 +1488,53 @@ FString URudeToolset::ExportPedReplace(const FString& OutfitAssetPath, const FSt
 	const FString YddVerdict = ExportYddBinary(Paths, Names, YddPath, Options);
 	const bool bYddOk = YddVerdict.Contains(TEXT("\"ok\":true"));
 	if (!bYddOk) { Problems.Add(TEXT("ydd: ") + YddVerdict.Left(300)); }
+	// RUDE_PEDPROPS_BEGIN export
+	// 1b) the prop dictionary: every prop with a mesh -> stream/<ped>_p.ydd (RIGID entries, the same writer), every
+	// texture under /Game/RUDE/Textures/<ped>_p/ -> stream/<ped>_p.ytd. Nothing is written when the ped has no props.
+	FString PropPaths, PropNames;
+	int32 Props = 0, PropsWithoutMesh = 0;
+	for (const FRudePedProp& P : Outfit->Props)
+	{
+		const FString MeshPath = P.Mesh.ToSoftObjectPath().ToString();
+		if (MeshPath.IsEmpty() || P.Name.IsEmpty() || P.Name.EndsWith(TEXT("_?"))) { ++PropsWithoutMesh; continue; }
+		PropPaths += (PropPaths.IsEmpty() ? TEXT("") : TEXT(",")) + MeshPath;
+		PropNames += (PropNames.IsEmpty() ? TEXT("") : TEXT(",")) + P.Name;
+		++Props;
+	}
+	FString PropYddVerdict, PropYtdVerdict;
+	bool bPropYddOk = true, bPropYtdOk = true;
+	int32 PropTextures = 0;
+	const FString PropYddPath = StreamDir / (Ped + TEXT("_p.ydd"));
+	const FString PropYtdPath = StreamDir / (Ped + TEXT("_p.ytd"));
+	if (Props > 0)
+	{
+		PropYddVerdict = ExportYddBinary(PropPaths, PropNames, PropYddPath, Options);
+		bPropYddOk = PropYddVerdict.Contains(TEXT("\"ok\":true"));
+		if (!bPropYddOk) { Problems.Add(TEXT("props ydd: ") + PropYddVerdict.Left(300)); }
+		TArray<FAssetData> PropTexAssets;
+		{
+			FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+			ARM.Get().WaitForCompletion();
+			ARM.Get().GetAssetsByPath(FName(*(TEXT("/Game/RUDE/Textures/") + Ped + TEXT("_p"))), PropTexAssets, false);
+		}
+		FString PropSpecs;
+		for (const FAssetData& AD : PropTexAssets)
+		{
+			UTexture2D* T = Cast<UTexture2D>(AD.GetAsset());
+			if (!T) { continue; }
+			const TCHAR* Usage = (T->CompressionSettings == TC_Normalmap) ? TEXT("NORMAL") : (!T->SRGB ? TEXT("SPECULAR") : TEXT("DIFFUSE"));
+			PropSpecs += FString::Printf(TEXT("%s%s;%s;%s"), PropSpecs.IsEmpty() ? TEXT("") : TEXT(","), *T->GetPathName(), *T->GetName(), Usage);
+			++PropTextures;
+		}
+		if (PropTextures > 0)
+		{
+			PropYtdVerdict = ExportYtdBinary(PropSpecs, PropYtdPath, TEXT("0"));
+			bPropYtdOk = PropYtdVerdict.Contains(TEXT("\"ok\":true"));
+			if (!bPropYtdOk) { Problems.Add(TEXT("props ytd: ") + PropYtdVerdict.Left(300)); }
+		}
+		else { Problems.Add(FString::Printf(TEXT("no textures under /Game/RUDE/Textures/%s_p - the props stream untextured (the corpus has no pixels for pedprops ytds yet)"), *Ped)); }
+	}
+	// RUDE_PEDPROPS_END export
 
 	// 2) the texture dictionary: everything ImportPed brought in from <ped>.ytd, usage read off the asset
 	TArray<FAssetData> TexAssets;
@@ -1088,17 +1574,22 @@ FString URudeToolset::ExportPedReplace(const FString& OutfitAssetPath, const FSt
 			"-- so they shadow the vanilla files - no variation table (ymt) is needed. Every drawable the ped's\n"
 			"-- table lists is inside the dictionary under its vanilla entry name (joaat of <comp>_<ddd>_<class>).\n"
 			"-- High detail only (the game's own dictionaries carry three LOD groups); if a part vanishes at\n"
-			"-- distance, that is why. Textures are every name the vanilla dictionary held, re-encoded.\n"),
-			*Ped, *Ped, *Ped);
+			"-- distance, that is why. Textures are every name the vanilla dictionary held, re-encoded.\n"
+			"-- Props (hats / glasses / earpieces / watches): stream/%s_p.ydd + stream/%s_p.ytd when the ped has any.\n"),
+			*Ped, *Ped, *Ped, *Ped, *Ped);
 		ManifestState = FFileHelper::SaveStringToFile(Manifest, *ManifestPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ? TEXT("written") : TEXT("writeFailed");
 	}
 	FString ProblemsJson;
 	for (const FString& P : Problems) { ProblemsJson += (ProblemsJson.IsEmpty() ? TEXT("") : TEXT(",")) + FString::Printf(TEXT("\"%s\""), *RudeJsonEscape(P)); }
 	return FString::Printf(TEXT("{\"ok\":%s,\"ped\":\"%s\",\"outDir\":\"%s\",\"yddPath\":\"%s\",\"drawables\":%d,\"drawablesWithoutMesh\":%d,\"yddEntries\":%d,\"yddBytes\":%d,")
-		TEXT("\"ytdPath\":\"%s\",\"textures\":%d,\"ytdBytes\":%d,\"manifest\":\"%s\",\"problems\":[%s]}"),
-		(bYddOk && (Textures == 0 || bYtdOk)) ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Ped), *RudeJsonEscape(OutDir), *RudeJsonEscape(YddPath),
+		TEXT("\"ytdPath\":\"%s\",\"textures\":%d,\"ytdBytes\":%d,")
+		TEXT("\"props\":%d,\"propsExported\":%d,\"propsWithoutMesh\":%d,\"propYddPath\":\"%s\",\"propYddEntries\":%d,\"propYddBytes\":%d,\"propTextures\":%d,\"propYtdPath\":\"%s\",\"propYtdBytes\":%d,")
+		TEXT("\"manifest\":\"%s\",\"problems\":[%s]}"),
+		(bYddOk && (Textures == 0 || bYtdOk) && bPropYddOk && bPropYtdOk) ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Ped), *RudeJsonEscape(OutDir), *RudeJsonEscape(YddPath),   // RUDE_PEDPROPS: ok folds the prop verdicts in
 		Drawables, DrawablesWithoutMesh, JsonInt(YddVerdict, TEXT("entries"), -1), JsonInt(YddVerdict, TEXT("bytes"), -1),
-		*RudeJsonEscape(YtdPath), Textures, JsonInt(YtdVerdict, TEXT("bytes"), -1), *ManifestState, *ProblemsJson);
+		*RudeJsonEscape(YtdPath), Textures, JsonInt(YtdVerdict, TEXT("bytes"), -1),
+		Outfit->Props.Num(), Props, PropsWithoutMesh, *RudeJsonEscape(PropYddPath), JsonInt(PropYddVerdict, TEXT("entries"), -1), JsonInt(PropYddVerdict, TEXT("bytes"), -1), PropTextures, *RudeJsonEscape(PropYtdPath), JsonInt(PropYtdVerdict, TEXT("bytes"), -1),
+		*ManifestState, *ProblemsJson);
 }
 
 // ---- ExportTxdReplace (agent + Matt) --------------------------------------------------------

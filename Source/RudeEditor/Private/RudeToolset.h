@@ -371,6 +371,11 @@ public:
 	// table), materials through the shared drawable lane, the ymt variation matrix -> a URudePedOutfit
 	// DataAsset, and a preview actor wearing drawable 0 / texture a of every component. Laws + numbers:
 	// scratchpad/wp10/peds/LAWS.md (a_m_m_business_01: 106 bones, 8 drawables, 46 textures, 4 components).
+	// Props (WP11, RUDE_PEDPROPS): <ped>_p.ydd entries (rigid, 977/977 measured) as static meshes under <ped>/props/,
+	// <ped>_p.ytd into /Game/RUDE/Textures/<ped>_p/, the ymt propInfo matrix into the outfit's Props (anchor / propId /
+	// texture letters), each prop a HIDDEN component on its anchor bone of the preview actor (SetPedProp shows one).
+	// Counts: props, propsImported, propsInMatrix/Resolved, propsSkinnedRefused, propTextures, anchorsUnmapped,
+	// propsAttached. Laws: scratchpad/wp11/pedprops/LAWS.md. A streamed ped's per-prop folder layout is counted, not read.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V character (ped) into Unreal: its skeleton, every clothing piece as a skinned mesh, and its outfit variations."))
 	static FString ImportPed(const FString& CorpusRoot, const FString& PedName, const FString& DestFolder);
 
@@ -536,6 +541,11 @@ public:
 	// triangles, bonesReferenced, influencesUnmapped, influencesTruncated, verticesRebound, uv1Dropped,
 	// texturesMissing, textures}], rigBones, rig, bytes, segSize, pages, sysFlags, selfCheck}.
 	// Laws + denominators: scratchpad/wp11/ydd_writer/LAWS.md. In-game load: NOT yet verified (Matt's test).
+	// RIGID entries (WP11 ped props, RUDE_PEDPROPS): a UStaticMesh content path writes an UNSKINNED entry - grmModel
+	// +0x28/+0x29/+0x2D = 0, geometry +0x68 raw NULL / +0x72 = 0, the game's own prop layout (mask 0x40F9 stride 64:
+	// Position Normal Colour0 Colour1 TexCoord0 TexCoord1 Tangent, 2,674/2,677 prop geometries), `ped` or `ped_alpha`
+	// (bucket 1, 12 params, registers 0/2/5/6) by the slot's preset, entry +0x80 = 0xFF00 | OR(1<<bucket) (1,763/1,763).
+	// Mixed lists are fine (a rig is required only when a skinned mesh is present). scratchpad/wp11/pedprops/LAWS.md.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save clothing pieces (skinned meshes on a ped skeleton) as a finished GTA V clothing file the game loads directly."))
 	static FString ExportYddBinary(const FString& SkeletalMeshAssetPaths, const FString& DrawableNames,
 	                               const FString& OutYddPath, const FString& Options);
@@ -567,6 +577,9 @@ public:
 	// A REPLACE resource for one ped (custom clothing without a variation-table writer): every drawable the
 	// outfit knows -> stream/<ped>.ydd under the game's entry names, every imported texture -> stream/<ped>.ytd,
 	// + fxmanifest.lua. OutfitAssetPath = the outfit asset or just the ped name. Options pass to ExportYddBinary.
+	// Props (WP11, RUDE_PEDPROPS): when the outfit carries any, stream/<ped>_p.ydd (rigid entries through the same
+	// writer) + stream/<ped>_p.ytd (every texture under /Game/RUDE/Textures/<ped>_p/) ride along; counts props,
+	// propsExported, propsWithoutMesh, propTextures; ok folds the prop verdicts in.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Pack a ped's clothing and textures as a FiveM resource that replaces the game's own files for that ped.", RudeAudience="agent"))
 	static FString ExportPedReplace(const FString& OutfitAssetPath, const FString& OutDir, const FString& Options);
 
@@ -575,6 +588,17 @@ public:
 	// edit path. MaxDim: downscale cap for ExportYtdBinary ("0"/empty = none).
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Pack an imported texture set as a FiveM resource that replaces the game's own texture file of that name.", RudeAudience="agent"))
 	static FString ExportTxdReplace(const FString& DictName, const FString& OutDir, const FString& MaxDim);
+
+	// RUDE_PEDPROPS_BEGIN header
+	// The prop matrix as a surface (WP11 ped props; mirrors SetPedOutfit): prop P of anchor A (head / eyes / ears /
+	// lwrist / rwrist, an ANCHOR_* enumerant, or the id 0/1/2/6/7) on the imported ped, wearing texture index T (0 =
+	// letter a; empty/-1 = leave the materials). PropIndex -1 = nothing on that anchor. One prop per anchor, like the
+	// game. The prop rides its anchor bone (SKEL_Head for head/eyes/ears, SKEL_L_Hand / SKEL_R_Hand for the wrists -
+	// RUDE's table) with the bone's bind rotation inverted: props are modeled in ped axes at the bone's origin
+	// (scratchpad/wp11/pedprops/LAWS.md law 7). Verdict: anchor, bone, prop, entry, mesh, texture, hidden, component.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Put a hat, glasses, earpiece or watch on a character, or take it off (-1), and pick its colour variant.", RudeAudience="agent"))
+	static FString SetPedProp(const FString& ActorLabel, const FString& Anchor, const FString& PropIndex, const FString& TextureIndex);
+	// RUDE_PEDPROPS_END header
 
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))

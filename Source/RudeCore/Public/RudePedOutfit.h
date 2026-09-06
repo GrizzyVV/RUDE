@@ -4,6 +4,7 @@
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
 #include "Engine/SkeletalMesh.h"
+#include "Engine/StaticMesh.h"   // RUDE_PEDPROPS: the rigid prop mesh
 #include "Engine/Texture2D.h"
 #include "Animation/Skeleton.h"
 #include "RudePedOutfit.generated.h"
@@ -100,6 +101,67 @@ struct FRudePedComponent
 	TArray<FRudePedDrawable> Drawables;
 };
 
+// RUDE_PEDPROPS_BEGIN outfit structs
+// One prop (hat / glasses / earpiece / watch / bracelet) of the ped: the <ped>_p.ydd entry p_<anchor>_<ddd> joined
+// with its ymt CPedPropMetaData row. Measured (scratchpad/wp11/pedprops/LAWS.md, 709 peds / 1,763 entries): every
+// entry is RIGID (HasSkin 0 on 977/977 base models, no BoneIDs, no Skeleton, no Bounds, High group only), modeled in
+// ped axes with the origin at the anchor bone; anchorId 0 head / 1 eyes / 2 ears / 6 left wrist / 7 right wrist are
+// the only ids the game's data spells (1,169/1,169 anchor rows).
+USTRUCT(BlueprintType)
+struct FRudePedProp
+{
+	GENERATED_BODY()
+
+	// Dictionary entry name, p_<anchor>_<ddd> (1,763/1,763 spell it; a hash_ entry never occurred).
+	UPROPERTY(EditAnywhere, Category = "RUDE|Ped Props")
+	FString Name;
+
+	// CPedPropMetaData.anchorId as spelled (0 head, 1 eyes, 2 ears, 6 lwrist, 7 rwrist measured).
+	UPROPERTY(EditAnywhere, Category = "RUDE|Ped Props")
+	int32 AnchorId = -1;
+
+	// The anchor word of the entry name (head / eyes / ears / lwrist / rwrist) = the ymt's ANCHOR_* enumerant.
+	UPROPERTY(EditAnywhere, Category = "RUDE|Ped Props")
+	FString Anchor;
+
+	// The yft bone the prop rides: SKEL_Head for head/eyes/ears, SKEL_L_Hand / SKEL_R_Hand for the wrists - RUDE's
+	// table (the game's own is code, not data); NAME_None when the skeleton lacks it (counted anchorsUnmapped).
+	UPROPERTY(EditAnywhere, Category = "RUDE|Ped Props")
+	FName AnchorBone;
+
+	// CPedPropMetaData.propId (= the ddd of the entry name; 1,169/1,169 anchor groups consistent).
+	UPROPERTY(EditAnywhere, Category = "RUDE|Ped Props")
+	int32 PropIndex = -1;
+
+	UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "RUDE|Ped Props")
+	int32 PropFlags = 0;
+
+	UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "RUDE|Ped Props")
+	int32 Flags = 0;
+
+	UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "RUDE|Ped Props")
+	FString AudioId;
+
+	// texData rows: letter a.. -> p_<anchor>_diff_<ddd>_<letter> in <ped>_p.ytd (no race suffix; case-insensitive).
+	UPROPERTY(EditAnywhere, Category = "RUDE|Ped Props")
+	TArray<FRudePedTexture> Textures;
+
+	// The rigid mesh (every measured prop is rigid). A skinned prop entry is counted at import, not built (v1).
+	UPROPERTY(EditAnywhere, Category = "RUDE|Ped Props")
+	TSoftObjectPtr<UStaticMesh> Mesh;
+
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Ped Props")
+	int32 Vertices = 0;
+
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Ped Props")
+	int32 Triangles = 0;
+
+	// The entry's shader presets in geometry order (ped / ped_alpha: a lens is ped_alpha, bucket 1).
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Ped Props")
+	TArray<FString> ShaderPresets;
+};
+// RUDE_PEDPROPS_END outfit structs
+
 // A ped's variation matrix as data: which component slots exist, which drawables each has, which texture
 // letters each drawable has, and the skeleton they all bind to. Built by ImportPed from <ped>.ymt
 // (CPedVariationInfo) joined against <ped>.ydd and <ped>.ytd. Never in-scene; the preview actor reads it.
@@ -128,6 +190,22 @@ public:
 
 	UPROPERTY(EditAnywhere, Category = "RUDE|Ped")
 	TArray<FRudePedComponent> Components;
+
+	// RUDE_PEDPROPS_BEGIN outfit members
+	// The prop matrix (<ped>.ymt propInfo joined against <ped>_p.ydd / <ped>_p.ytd); empty when the ped has none.
+	UPROPERTY(EditAnywhere, Category = "RUDE|Ped Props")
+	TArray<FRudePedProp> Props;
+
+	// CPedVariationInfo.propInfo.numAvailProps as spelled (= the row count on 709/709 peds measured).
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Ped Props")
+	int32 NumAvailProps = 0;
+
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Source")
+	FString SourcePropYdd;
+
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Source")
+	FString SourcePropYtd;
+	// RUDE_PEDPROPS_END outfit members
 
 	UPROPERTY(VisibleAnywhere, Category = "RUDE|Ped")
 	bool bHasTexVariations = false;

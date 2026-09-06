@@ -38,6 +38,8 @@
 #include "ReferenceSkeleton.h"
 #include "SkeletalMeshAttributes.h"
 #include "SkinWeightsAttributesRef.h"
+#include "Engine/StaticMesh.h"   // RUDE_PEDPROPS: rigid entries from static meshes
+#include "StaticMeshAttributes.h"
 
 namespace RudeYdd
 {
@@ -91,15 +93,48 @@ namespace RudeYdd
 	static const int32 kPedAlloc = (16 * (kPedNPar + kPedNVec) + 4 * kPedNPar + 32 + 15) & ~15; // 432, measured 3/3
 	// skinned GTAV1 layout: Position(0) BlendWeights(1) BlendIndices(2) Normal(3) Colour0(4) Colour1(5) TexCoord0(6)
 	static const uint32 kSkinMask = 0x7F; static const int32 kSkinStride = 48; static const uint8 kSkinChans = 7;
+	// RUDE_PEDPROPS_BEGIN templates
+	// ---- ped props (WP11, scratchpad/wp11/pedprops/LAWS.md): the RIGID entry and the `ped_alpha` template ----
+	// The game's prop layout: Position(0) Normal(3) Colour0(4) Colour1(5) TexCoord0(6) TexCoord1(7) Tangent(14) ->
+	// mask 0x40F9, stride 64, 7 channels (2,674/2,677 prop geometries over 709 peds). The fvf nibble word is the same
+	// GTAV1 constant (channel 14 = type 7 = float4). Bytes: +0 pos | +12 nrm | +24 c0 | +28 c1 | +32 uv0 | +40 uv1 | +48 tan.
+	static const uint32 kRigidMask = 0x40F9; static const int32 kRigidStride = 64; static const uint8 kRigidChans = 7;
+	// `ped_alpha` (bucket 1; the lens of every 2-geometry prop, 932/2,672 prop shaders; FileName ped_alpha.sps 8/8):
+	// 12 params, 4 samplers - no VolumeSampler, Bump/Spec on registers 5/6 (registers verbatim from the game's files),
+	// the same 8 vec4s on 187..180. Vector VALUES vary per file (a_m_m_business_01 p_eyes_000 shown): per-shader
+	// constants, copied, never computed.
+	static const FPedParam kPedAlpha[12] =
+	{
+		{ TEXT("DiffuseSampler"),        0,   true,  { 0.f, 0.f, 0.f, 0.f } },
+		{ TEXT("TextureSamplerDiffPal"), 2,   true,  { 0.f, 0.f, 0.f, 0.f } },
+		{ TEXT("BumpSampler"),           5,   true,  { 0.f, 0.f, 0.f, 0.f } },
+		{ TEXT("SpecSampler"),           6,   true,  { 0.f, 0.f, 0.f, 0.f } },
+		{ TEXT("umGlobalParams"),        187, false, { 0.0025f, 0.0025f, 7.f, 7.f } },
+		{ TEXT("envEffFatThickness"),    186, false, { 25.f, 25.f, 0.f, 0.f } },
+		{ TEXT("specularIntensityMult"), 185, false, { 0.9f, 0.f, 0.f, 0.f } },
+		{ TEXT("specularFalloffMult"),   184, false, { 400.f, 0.f, 0.f, 0.f } },
+		{ TEXT("specularFresnel"),       183, false, { 0.8f, 0.f, 0.f, 0.f } },
+		{ TEXT("bumpiness"),             182, false, { 0.65f, 0.f, 0.f, 0.f } },
+		{ TEXT("detailSettings"),        181, false, { 0.1f, 0.75f, 40.f, 0.f } },
+		{ TEXT("StubbleControl"),        180, false, { 2.f, 0.6f, 0.f, 0.f } },
+	};
+	struct FShaderTemplate { const TCHAR* Name; const FPedParam* Params; int32 NPar; int32 NVec; int32 NTex; int32 Bucket; };
+	static const FShaderTemplate kTplPed = { TEXT("ped"), kPed, kPedNPar, kPedNVec, kPedNTex, 0 };
+	static const FShaderTemplate kTplPedAlpha = { TEXT("ped_alpha"), kPedAlpha, 12, 8, 4, 1 };
+	static int32 TplHashOfs(const FShaderTemplate& T) { return 16 * (T.NPar + T.NVec); }                                    // the measured +0x14 (336 ped / 320 ped_alpha)
+	static int32 TplAlloc(const FShaderTemplate& T) { return (16 * (T.NPar + T.NVec) + 4 * T.NPar + 32 + 15) & ~15; }   // the fitted +0x16 (432 / 400)
+	static const int32 kPedAlphaAlloc = (16 * (12 + 8) + 4 * 12 + 32 + 15) & ~15;                                        // 400
+	// RUDE_PEDPROPS_END templates
 	// measured vfts of dictionary objects (3/3 binaries) - build residue, kept for likeness, not load-bearing
 	static const uint32 VFT_DICT = 0x40571578u, VFT_DRAWABLE = 0x40571168u, VFT_SG = 0x406117F0u, VFT_STUB = 0x406187F8u,
 	                    VFT_MODEL = 0x4060EA98u, VFT_GEO = 0x40616798u, VFT_VB = 0x4061B3F8u, VFT_IB = 0x4061B158u;
 
 	struct FSkin { uint8 W[4]; uint8 I[4]; };
-	struct FYddVert { FVector3f P; FVector3f N; FVector2f UV; uint8 C[4]; FSkin S; };
+	struct FYddVert { FVector3f P; FVector3f N; FVector2f UV; uint8 C[4]; FSkin S; FVector2f UV1 = FVector2f::ZeroVector; FVector4f T = FVector4f(1.f, 0.f, 0.f, 1.f); };   // RUDE_PEDPROPS: UV1 + tangent ride rigid entries
 	struct FGeo
 	{
 		FString Slot, Diffuse, Normal, Spec, Mat;   // Mat = the material the slot resolved to (measurement)
+		FString Preset; bool bRigid = false;        // RUDE_PEDPROPS: the slot's shader preset (ped / ped_alpha); rigid = no skin
 		TArray<FYddVert> V; TArray<int32> Idx;
 		FVector3f Mn = FVector3f(FLT_MAX), Mx = FVector3f(-FLT_MAX);
 	};
@@ -109,10 +144,107 @@ namespace RudeYdd
 		TArray<FGeo> Geos;
 		FVector3f Mn = FVector3f(FLT_MAX), Mx = FVector3f(-FLT_MAX);
 		int32 SrcVerts = 0, InflUnmapped = 0, InflTruncated = 0, Rebound = 0, BonesUnmapped = 0, Uv1Dropped = 0, TexMissing = 0, MaxRig = -1;
+		bool bRigid = false; int32 ShaderSubstituted = 0;   // RUDE_PEDPROPS
 	};
 
 	static FString Fail(const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); }
 	static uint8 Byte01(float F) { return (uint8)FMath::Clamp(FMath::RoundToInt(F * 255.f), 0, 255); }
+	// RUDE_PEDPROPS_BEGIN rigid gather
+	// The RIGID entry's geometry from a UStaticMesh's LOD0 description (a ped prop: ImportPed's <ped>/props/ meshes):
+	// one geometry per polygon group, welded by (vertex, normal, uv0, uv1, colour, tangent), positions / normals /
+	// tangents back through the importer's Y mirror (tangent handedness flips under a reflection). The shader preset
+	// rides on the slot name (<preset>__<geo>, ImportDrawableNode's spelling) so a lens keeps ped_alpha.
+	static bool GatherRigid(UStaticMesh* SM, FDrawable& D, FString& Err)
+	{
+		const FMeshDescription* MD = SM->GetMeshDescription(0);
+		if (!MD) { Err = FString::Printf(TEXT("%s: no MeshDescription on LOD0 (no source geometry to export)"), *D.Asset); return false; }
+		FStaticMeshConstAttributes A(*MD);
+		TVertexAttributesConstRef<FVector3f> Positions = A.GetVertexPositions();
+		TVertexInstanceAttributesConstRef<FVector3f> InstNormals = A.GetVertexInstanceNormals();
+		TVertexInstanceAttributesConstRef<FVector3f> InstTangents = A.GetVertexInstanceTangents();
+		TVertexInstanceAttributesConstRef<float> InstSigns = A.GetVertexInstanceBinormalSigns();
+		TVertexInstanceAttributesConstRef<FVector2f> InstUVs = A.GetVertexInstanceUVs();
+		TVertexInstanceAttributesConstRef<FVector4f> InstColors = A.GetVertexInstanceColors();
+		TPolygonGroupAttributesConstRef<FName> GroupSlots = A.GetPolygonGroupMaterialSlotNames();
+		const int32 NumUV = InstUVs.GetNumChannels();
+		D.SrcVerts = MD->Vertices().Num();
+		const TArray<FStaticMaterial>& Mats = SM->GetStaticMaterials();
+		for (const FPolygonGroupID GroupID : MD->PolygonGroups().GetElementIDs())
+		{
+			FGeo G;
+			G.bRigid = true;
+			G.Slot = GroupSlots[GroupID].ToString();
+			{
+				FString L, R;
+				G.Preset = G.Slot.Split(TEXT("__"), &L, &R, ESearchCase::CaseSensitive, ESearchDir::FromEnd) ? L.ToLower() : G.Slot.ToLower();
+			}
+			int32 SlotIdx = INDEX_NONE;
+			for (int32 i = 0; i < Mats.Num(); ++i) { if (Mats[i].MaterialSlotName == GroupSlots[GroupID]) { SlotIdx = i; break; } }
+			if (SlotIdx == INDEX_NONE && Mats.IsValidIndex(GroupID.GetValue())) { SlotIdx = GroupID.GetValue(); }
+			if (Mats.IsValidIndex(SlotIdx))
+			{
+				G.Mat = Mats[SlotIdx].MaterialInterface ? Mats[SlotIdx].MaterialInterface->GetPathName() : FString(TEXT("null"));
+				if (const UMaterialInstanceConstant* MIC = Cast<UMaterialInstanceConstant>(Mats[SlotIdx].MaterialInterface))
+				{
+					auto TexName = [&](const TCHAR* Param) -> FString
+					{
+						UTexture* T = nullptr;
+						if (!MIC->GetTextureParameterValue(FMaterialParameterInfo(Param), T) || !T) { return FString(); }
+						if (T->GetPathName().StartsWith(TEXT("/Engine/"))) { return FString(); }   // a master's unused slot
+						return T->GetName().ToLower();
+					};
+					G.Diffuse = TexName(TEXT("Diffuse")); G.Normal = TexName(TEXT("Normal")); G.Spec = TexName(TEXT("Specular"));
+				}
+			}
+			TMap<FString, int32> Weld;
+			for (const FPolygonID PolyID : MD->GetPolygonGroupPolygonIDs(GroupID))
+			{
+				for (const FTriangleID TriID : MD->GetPolygonTriangles(PolyID))
+				{
+					for (const FVertexInstanceID Inst : MD->GetTriangleVertexInstances(TriID))
+					{
+						const FVertexID VID = MD->GetVertexInstanceVertex(Inst);
+						const FVector3f P = Positions[VID];
+						const FVector3f N = InstNormals[Inst];
+						const FVector3f Tn = InstTangents[Inst];
+						const float Sg = InstSigns[Inst];
+						const FVector2f UV = InstUVs.Get(Inst, 0);
+						const FVector2f UV1 = NumUV > 1 ? InstUVs.Get(Inst, 1) : FVector2f::ZeroVector;
+						const FVector4f C = InstColors[Inst];
+						const FString Key = FString::Printf(TEXT("%d|%.3f,%.3f,%.3f|%.4f,%.4f|%.4f,%.4f|%.3f,%.3f,%.3f,%.3f|%.3f,%.3f,%.3f,%.1f"),
+							VID.GetValue(), N.X, N.Y, N.Z, UV.X, UV.Y, UV1.X, UV1.Y, C.X, C.Y, C.Z, C.W, Tn.X, Tn.Y, Tn.Z, Sg);
+						int32 Index;
+						if (const int32* Found = Weld.Find(Key)) { Index = *Found; }
+						else
+						{
+							FYddVert V;
+							V.P = FVector3f(P.X / 100.f, -P.Y / 100.f, P.Z / 100.f);   // UE cm -> GTA metres, Y mirror (the importer inverted)
+							V.N = FVector3f(N.X, -N.Y, N.Z);
+							V.UV = UV; V.UV1 = UV1;
+							// mirrored tangent; the bitangent sign flips under the reflection (B = w N x T, det -1): a UE +1 is a RAGE -1
+							V.T = FVector4f(Tn.X, -Tn.Y, Tn.Z, Sg >= 0.f ? -1.f : 1.f);
+							V.C[0] = Byte01(C.X); V.C[1] = Byte01(C.Y); V.C[2] = Byte01(C.Z); V.C[3] = Byte01(C.W);
+							FMemory::Memzero(V.S);
+							Index = G.V.Num();
+							G.V.Add(V);
+							Weld.Add(Key, Index);
+							G.Mn = G.Mn.ComponentMin(V.P); G.Mx = G.Mx.ComponentMax(V.P);
+						}
+						G.Idx.Add(Index);
+					}
+				}
+			}
+			if (G.V.Num() > 0 && G.Idx.Num() >= 3)
+			{
+				if (G.V.Num() > 65535) { Err = FString::Printf(TEXT("%s/%s: geometry exceeds 65535 vertices (u16 indices) - split the mesh"), *D.Asset, *G.Slot); return false; }
+				D.Mn = D.Mn.ComponentMin(G.Mn); D.Mx = D.Mx.ComponentMax(G.Mx);
+				D.Geos.Add(MoveTemp(G));
+			}
+		}
+		if (D.Geos.Num() == 0) { Err = FString::Printf(TEXT("%s: no polygon group with triangles"), *D.Asset); return false; }
+		return true;
+	}
+	// RUDE_PEDPROPS_END rigid gather
 }
 
 // ---- ExportYddBinary -------------------------------------------------------------------------
@@ -137,19 +269,27 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 	}
 
 	// ---- 1) the meshes and the rig (bone ORDER = the ped's yft order, as ImportPed built the USkeleton) ----
+	// RUDE_PEDPROPS: an entry is a USkeletalMesh (skinned - clothing) or a UStaticMesh (RIGID - a ped prop: hats /
+	// glasses / earpieces / watches; 977/977 game prop models are unskinned, scratchpad/wp11/pedprops/LAWS.md). The
+	// rig is needed only when a skinned mesh is present.
 	TArray<USkeletalMesh*> Meshes;
+	TArray<UStaticMesh*> Statics;   // parallel to Meshes: exactly one of the two is non-null per entry
 	for (const FString& P : Paths)
 	{
-		USkeletalMesh* M = LoadObject<USkeletalMesh>(nullptr, *P.TrimStartAndEnd());
-		if (!M) { return Fail(FString::Printf(TEXT("SkeletalMesh not found: %s"), *P.TrimStartAndEnd())); }
-		Meshes.Add(M);
+		UObject* O = LoadObject<UObject>(nullptr, *P.TrimStartAndEnd());
+		USkeletalMesh* SK = Cast<USkeletalMesh>(O);
+		UStaticMesh* SM = Cast<UStaticMesh>(O);
+		if (!SK && !SM) { return Fail(FString::Printf(TEXT("neither a SkeletalMesh nor a StaticMesh: %s"), *P.TrimStartAndEnd())); }
+		Meshes.Add(SK); Statics.Add(SM);
 	}
-	USkeleton* RigSkel = RigPath.IsEmpty() ? Meshes[0]->GetSkeleton() : LoadObject<USkeleton>(nullptr, *RigPath);
+	USkeletalMesh* FirstSkinned = nullptr;
+	for (USkeletalMesh* M : Meshes) { if (M) { FirstSkinned = M; break; } }
+	USkeleton* RigSkel = RigPath.IsEmpty() ? (FirstSkinned ? FirstSkinned->GetSkeleton() : nullptr) : LoadObject<USkeleton>(nullptr, *RigPath);
 	if (!RigPath.IsEmpty() && !RigSkel) { return Fail(FString::Printf(TEXT("SKELETON not found: %s"), *RigPath)); }
-	const FReferenceSkeleton* Rig = RigSkel ? &RigSkel->GetReferenceSkeleton() : &Meshes[0]->GetRefSkeleton();
-	const FString RigName = RigSkel ? RigSkel->GetPathName() : (Meshes[0]->GetPathName() + TEXT(" (own reference skeleton; no USkeleton assigned)"));
-	const int32 NumRig = Rig->GetNum();
-	if (NumRig <= 0) { return Fail(TEXT("the rig has no bones")); }
+	const FReferenceSkeleton* Rig = RigSkel ? &RigSkel->GetReferenceSkeleton() : (FirstSkinned ? &FirstSkinned->GetRefSkeleton() : nullptr);
+	const FString RigName = RigSkel ? RigSkel->GetPathName() : (FirstSkinned ? FirstSkinned->GetPathName() + TEXT(" (own reference skeleton; no USkeleton assigned)") : FString(TEXT("none (every entry rigid)")));
+	const int32 NumRig = Rig ? Rig->GetNum() : 0;
+	if (FirstSkinned && NumRig <= 0) { return Fail(TEXT("the rig has no bones")); }
 	// grmModel+0x28 is a byte and BlendIndices are bytes: the measured rigs are 98..106 bones
 	if (NumRig > 255) { return Fail(FString::Printf(TEXT("the rig has %d bones; the format carries the bone count in a byte (grmModel+0x28) and blend indices as bytes"), NumRig)); }
 	TMap<FName, int32> RigIndex;
@@ -159,8 +299,21 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 	TArray<FDrawable> Ds;
 	for (int32 mi = 0; mi < Meshes.Num(); ++mi)
 	{
-		USkeletalMesh* SK = Meshes[mi];
 		FDrawable D;
+		if (Statics[mi])
+		{
+			// RUDE_PEDPROPS: the RIGID entry - a static mesh gathered without skin (GatherRigid)
+			UStaticMesh* SM = Statics[mi];
+			D.Asset = SM->GetPathName();
+			D.bRigid = true;
+			D.Name = Names.IsValidIndex(mi) && !Names[mi].TrimStartAndEnd().IsEmpty() ? Names[mi].TrimStartAndEnd().ToLower() : SM->GetName().ToLower();
+			D.Hash = RudeJoaat(D.Name);
+			FString GErr;
+			if (!GatherRigid(SM, D, GErr)) { return Fail(GErr); }
+			Ds.Add(MoveTemp(D));
+			continue;
+		}
+		USkeletalMesh* SK = Meshes[mi];
 		D.Asset = SK->GetPathName();
 		D.Name = Names.IsValidIndex(mi) && !Names[mi].TrimStartAndEnd().IsEmpty() ? Names[mi].TrimStartAndEnd().ToLower() : SK->GetName().ToLower();
 		D.Hash = RudeJoaat(D.Name);
@@ -317,13 +470,13 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 	{
 		for (const FGeo& G : D.Geos)
 		{
-			Largest = FMath::Max(Largest, (uint32)G.V.Num() * (uint32)kSkinStride);
+			Largest = FMath::Max(Largest, (uint32)G.V.Num() * (uint32)(G.bRigid ? kRigidStride : kSkinStride));   // RUDE_PEDPROPS: per-entry stride
 			Largest = FMath::Max(Largest, (uint32)G.Idx.Num() * 2u);
 		}
 		const uint32 NG = (uint32)D.Geos.Num();
 		Largest = FMath::Max(Largest, (NG + 1) * 0x20u);       // geoBounds
 		Largest = FMath::Max(Largest, NG * 8u);                // geometry / shader pointer arrays
-		Largest = FMath::Max(Largest, (uint32)kPedAlloc);      // one shader's parameter block
+		Largest = FMath::Max(Largest, (uint32)FMath::Max(kPedAlloc, kPedAlphaAlloc));      // one shader's parameter block (either template)
 	}
 	Largest = FMath::Max(Largest, (uint32)N * 0xD0u);          // the contiguous record block
 	Largest = FMath::Max(Largest, (uint32)N * 8u);
@@ -365,12 +518,24 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 		for (int32 gi = 0; gi < NG; ++gi)
 		{
 			const FGeo& G = D.Geos[gi];
-			// vertex data: stride 48, channels in ascending bit order (LAWS section 4)
-			TArray<uint8> VD; VD.SetNumZeroed(G.V.Num() * kSkinStride);
+			// RUDE_PEDPROPS: a rigid entry writes the game's own prop layout (mask 0x40F9, stride 64, 2,674/2,677 measured):
+			// +0 pos f3 | +12 normal f3 | +24 Colour0 u8x4 | +28 Colour1 u8x4 (0) | +32 uv0 f2 | +40 uv1 f2 | +48 tangent f4
+			const int32 Stride = G.bRigid ? kRigidStride : kSkinStride;
+			TArray<uint8> VD; VD.SetNumZeroed(G.V.Num() * Stride);
 			for (int32 v = 0; v < G.V.Num(); ++v)
 			{
-				const FYddVert& X = G.V[v]; const int32 o = v * kSkinStride;
+				const FYddVert& X = G.V[v]; const int32 o = v * Stride;
 				PVEC3(VD, o + 0, X.P);
+				if (G.bRigid)
+				{
+					PVEC3(VD, o + 12, X.N);
+					for (int32 k = 0; k < 4; ++k) { VD[o + 24 + k] = X.C[k]; VD[o + 28 + k] = 0; }   // Colour1 = 0 (2,587/2,676 first vertices)
+					PF32(VD, o + 32, X.UV.X); PF32(VD, o + 36, X.UV.Y);
+					PF32(VD, o + 40, X.UV1.X); PF32(VD, o + 44, X.UV1.Y);
+					PF32(VD, o + 48, X.T.X); PF32(VD, o + 52, X.T.Y); PF32(VD, o + 56, X.T.Z); PF32(VD, o + 60, X.T.W);
+					continue;
+				}
+				// skinned: stride 48, channels in ascending bit order (LAWS section 4)
 				for (int32 k = 0; k < 4; ++k) { VD[o + 12 + k] = X.S.W[k]; VD[o + 16 + k] = X.S.I[k]; }
 				PVEC3(VD, o + 20, X.N);
 				for (int32 k = 0; k < 4; ++k) { VD[o + 32 + k] = X.C[k]; VD[o + 36 + k] = 0; }   // Colour1 = 0 (17/18 measured)
@@ -380,17 +545,22 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 			TArray<uint8> ID; ID.SetNumZeroed(G.Idx.Num() * 2);
 			for (int32 i = 0; i < G.Idx.Num(); ++i) { PU16(ID, i * 2, (uint16)G.Idx[i]); }
 			const int32 OI = Emit(ID);
-			// the bone-id table: identity over the rig (56/56 + 7/7 measured); OWN copy per geometry
-			TArray<uint8> Bid; Bid.SetNumZeroed(NumRig * 2);
-			for (int32 k = 0; k < NumRig; ++k) { PU16(Bid, k * 2, (uint16)k); }
-			const int32 OBid = Emit(Bid);
+			// the bone-id table: identity over the rig (56/56 + 7/7 measured); OWN copy per geometry. A RIGID entry has
+			// none (0 <BoneIDs> in 2,677/2,677 prop geometries): +0x68 stays raw NULL (RUDE_PEDPROPS)
+			int32 OBid = -1;
+			if (!G.bRigid)
+			{
+				TArray<uint8> Bid; Bid.SetNumZeroed(NumRig * 2);
+				for (int32 k = 0; k < NumRig; ++k) { PU16(Bid, k * 2, (uint16)k); }
+				OBid = Emit(Bid);
+			}
 			TArray<uint8> Fvf; Fvf.AddZeroed(0x10);                              // own fvf per geometry (crash #6)
-			PU32(Fvf, 0x00, kSkinMask); PU16(Fvf, 0x04, (uint16)kSkinStride); Fvf[0x07] = kSkinChans;
+			PU32(Fvf, 0x00, G.bRigid ? kRigidMask : kSkinMask); PU16(Fvf, 0x04, (uint16)Stride); Fvf[0x07] = G.bRigid ? kRigidChans : kSkinChans;   // RUDE_PEDPROPS
 			PU32(Fvf, 0x08, 0x55996996u); PU32(Fvf, 0x0c, 0x77555555u);
 			const int32 OFvf = Emit(Fvf);
 			TArray<uint8> Vb; Vb.AddZeroed(0x80);
 			PU32(Vb, 0x00, VFT_VB); PU32(Vb, 0x04, 1);
-			PU16(Vb, 0x08, (uint16)kSkinStride); PU16(Vb, 0x0a, 0);              // +0x0A = 0 in the game (7/7)
+			PU16(Vb, 0x08, (uint16)Stride); PU16(Vb, 0x0a, 0);                   // +0x0A = 0 in the game (7/7; 2,677/2,677 props)
 			PPTR(Vb, 0x10, OV); PU32(Vb, 0x18, (uint32)G.V.Num()); PPTR(Vb, 0x20, OV); PPTR(Vb, 0x30, OFvf);
 			const int32 OVb = Emit(Vb);
 			TArray<uint8> Ib; Ib.AddZeroed(0x60);
@@ -401,12 +571,12 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 			PPTR(Ge, 0x18, OVb); PPTR(Ge, 0x38, OIb);
 			PU32(Ge, 0x58, (uint32)G.Idx.Num()); PU32(Ge, 0x5c, (uint32)(G.Idx.Num() / 3));
 			PU16(Ge, 0x60, (uint16)G.V.Num()); PU16(Ge, 0x62, 3);
-			PPTR(Ge, 0x68, OBid);                                                // the skinned delta
-			PU16(Ge, 0x70, (uint16)kSkinStride); PU16(Ge, 0x72, (uint16)NumRig);  // stride is a u16; +0x72 = bone-id count
+			if (!G.bRigid) { PPTR(Ge, 0x68, OBid); }                             // the skinned delta; a rigid entry keeps +0x68 raw NULL
+			PU16(Ge, 0x70, (uint16)Stride); PU16(Ge, 0x72, (uint16)(G.bRigid ? 0 : NumRig));  // stride is a u16; +0x72 = bone-id count (0 rigid)
 			PPTR(Ge, 0x78, OV);
 			const int32 OGe = Emit(Ge);
 			OGeo.Add(OGe);
-			GeoBoneIdSlots.Add(OGe + 0x68);
+			if (!G.bRigid) { GeoBoneIdSlots.Add(OGe + 0x68); }   // RUDE_PEDPROPS: no table to audit on a rigid entry
 			const int32 Pair = (bUnion ? gi + 1 : gi) * 0x20;
 			PVEC3(GeoBounds, Pair, G.Mn); PVEC3(GeoBounds, Pair + 0x10, G.Mx);
 			PU16(ShaderMap, gi * 2, (uint16)gi);
@@ -422,9 +592,10 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 		PU32(Model, 0x00, VFT_MODEL); PU32(Model, 0x04, 1);
 		PPTR(Model, 0x08, OGa); PU16(Model, 0x10, (uint16)NG); PU16(Model, 0x12, (uint16)NG);
 		PPTR(Model, 0x18, OGb); PPTR(Model, 0x20, OSm);
-		Model[0x28] = (uint8)NumRig;                                             // rig bone count (52/52, 7/7)
-		PU16(Model, 0x29, 1);                                                    // skinned (52/52, 7/7)
-		Model[0x2b] = 0; Model[0x2c] = 0xff; Model[0x2d] = 1;                    // BoneIndex, RenderMask, skinned flag
+		// RUDE_PEDPROPS: a rigid entry keeps the static record's zeros (977/977 prop models: Unknown1 0, Unknown29 0, Flags 0)
+		Model[0x28] = D.bRigid ? (uint8)0 : (uint8)NumRig;                       // rig bone count (52/52, 7/7) / 0 rigid
+		PU16(Model, 0x29, D.bRigid ? (uint16)0 : (uint16)1);                     // skinned (52/52, 7/7) / 0 rigid
+		Model[0x2b] = 0; Model[0x2c] = 0xff; Model[0x2d] = D.bRigid ? (uint8)0 : (uint8)1;   // BoneIndex, RenderMask, skinned flag / 0 rigid
 		PU16(Model, 0x2e, (uint16)NG);
 		const int32 OM = Emit(Model);
 		TArray<uint8> ModelArr; ModelArr.AddZeroed(8); PPTR(ModelArr, 0, OM);
@@ -434,6 +605,7 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 
 		// shaders: one `ped` shader per geometry (shader i <-> geometry i, the static writer's pairing)
 		TArray<int32> OSh;
+		uint32 BucketBits = 0;   // RUDE_PEDPROPS: OR of 1<<bucket over the entry's shaders -> +0x80 (FlagsHigh law, 1,763/1,763)
 		for (int32 gi = 0; gi < NG; ++gi)
 		{
 			const FGeo& G = D.Geos[gi];
@@ -444,37 +616,47 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 				PU32(St, 0x00, VFT_STUB); PU32(St, 0x04, 1); PPTR(St, 0x28, ON); PU32(St, 0x30, 0x00020001u);
 				return Emit(St);
 			};
-			int32 StubOfs[13]; for (int32 k = 0; k < 13; ++k) { StubOfs[k] = -1; }
+			// RUDE_PEDPROPS: the template follows the slot's preset - ped_alpha (bucket 1, 12 params, 4 samplers; the lens of
+			// every 2-geometry prop, 932/2,672 prop shaders) for a lens, else `ped`; any other preset is written as `ped`
+			// and COUNTED (shaderSubstituted). The entry's +0x80 flags OR every shader's 1<<bucket (1,763/1,763 measured).
+			const FShaderTemplate& Tp = (G.Preset == TEXT("ped_alpha")) ? kTplPedAlpha : kTplPed;
+			if (!G.Preset.IsEmpty() && G.Preset != TEXT("ped") && G.Preset != TEXT("ped_alpha")) { ++Ds[di].ShaderSubstituted; }
+			BucketBits |= (1u << Tp.Bucket);
 			if (G.Diffuse.IsEmpty()) { ++Ds[di].TexMissing; }
-			StubOfs[0] = Stub(G.Diffuse.IsEmpty() ? FString(TEXT("none")) : G.Diffuse);
-			StubOfs[2] = Stub(TEXT("givemechecker"));
-			if (!G.Normal.IsEmpty()) { StubOfs[3] = Stub(G.Normal); }            // unbound sampler = raw NULL (measured legal)
-			if (!G.Spec.IsEmpty()) { StubOfs[4] = Stub(G.Spec); }
-			TArray<uint8> Zero; Zero.AddZeroed(kPedAlloc);
+			TArray<uint8> Zero; Zero.AddZeroed(TplAlloc(Tp));
 			const int32 OTbl = Emit(Zero);
 			int32 VecIdx = 0;
-			for (int32 pi = 0; pi < kPedNPar; ++pi)
+			for (int32 pi = 0; pi < Tp.NPar; ++pi)
 			{
-				const FPedParam& PP = kPed[pi];
+				const FPedParam& PP = Tp.Params[pi];
 				PU32(Seg, OTbl + pi * 16, (PP.bTexture ? 0u : 1u) | ((uint32)PP.Reg << 8));   // class | register<<8
-				if (PP.bTexture) { if (StubOfs[pi] >= 0) { PPTR(Seg, OTbl + pi * 16 + 8, StubOfs[pi]); } }
+				if (PP.bTexture)
+				{
+					const FString PN(PP.Name);
+					int32 StubO = -1;
+					if (PN == TEXT("DiffuseSampler")) { StubO = Stub(G.Diffuse.IsEmpty() ? FString(TEXT("none")) : G.Diffuse); }
+					else if (PN == TEXT("VolumeSampler")) { StubO = Stub(TEXT("givemechecker")); }
+					else if (PN == TEXT("BumpSampler") && !G.Normal.IsEmpty()) { StubO = Stub(G.Normal); }   // unbound sampler = raw NULL (measured legal)
+					else if (PN == TEXT("SpecSampler") && !G.Spec.IsEmpty()) { StubO = Stub(G.Spec); }
+					if (StubO >= 0) { PPTR(Seg, OTbl + pi * 16 + 8, StubO); }
+				}
 				else
 				{
-					const int32 VOfs = OTbl + kPedNPar * 16 + VecIdx * 16;
+					const int32 VOfs = OTbl + Tp.NPar * 16 + VecIdx * 16;
 					for (int32 c = 0; c < 4; ++c) { PF32(Seg, VOfs + c * 4, PP.V[c]); }
 					PPTR(Seg, OTbl + pi * 16 + 8, VOfs);
 					++VecIdx;
 				}
-				PU32(Seg, OTbl + kPedHashOfs + pi * 4, RudeJoaat(PP.Name));
+				PU32(Seg, OTbl + TplHashOfs(Tp) + pi * 4, RudeJoaat(PP.Name));
 			}
 			TArray<uint8> Blk; Blk.AddZeroed(0x30);
 			PPTR(Blk, 0x00, OTbl);
-			PU32(Blk, 0x08, RudeJoaat(TEXT("ped")));
-			PU32(Blk, 0x10, 0x80000000u | (uint32)kPedNPar);                    // npar | bucket 0 <<8 | 0x8000<<16
-			PU32(Blk, 0x14, ((uint32)kPedAlloc << 16) | (uint32)kPedHashOfs);
-			PU32(Blk, 0x18, RudeJoaat(TEXT("ped.sps")));
-			PU32(Blk, 0x20, 0x0000ff01u);
-			PU32(Blk, 0x24, (uint32)kPedNTex << 24);
+			PU32(Blk, 0x08, RudeJoaat(Tp.Name));
+			PU32(Blk, 0x10, 0x80000000u | (uint32)Tp.NPar | ((uint32)Tp.Bucket << 8));   // npar | bucket<<8 | 0x8000<<16
+			PU32(Blk, 0x14, ((uint32)TplAlloc(Tp) << 16) | (uint32)TplHashOfs(Tp));
+			PU32(Blk, 0x18, RudeJoaat(FString(Tp.Name) + TEXT(".sps")));
+			PU32(Blk, 0x20, 0x0000ff00u | (1u << Tp.Bucket));
+			PU32(Blk, 0x24, (uint32)Tp.NTex << 24);
 			OSh.Add(Emit(Blk));
 		}
 		TArray<uint8> ShArr; ShArr.AddZeroed(OSh.Num() * 8);
@@ -498,7 +680,7 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 		}
 		PPTR(Seg, Base + 0x50, OMh);
 		for (int32 k = 0; k < 4; ++k) { PF32(Seg, Base + 0x70 + k * 4, 9998.f); }
-		PU32(Seg, Base + 0x80, 0x0000ff01u);                                     // High present, bucket 0
+		PU32(Seg, Base + 0x80, 0x0000ff00u | (BucketBits ? BucketBits : 1u));     // High present | 1<<bucket per shader (RUDE_PEDPROPS: FlagsHigh = OR of bucket bits, 1,763/1,763)
 		PU32(Seg, Base + 0x98, 0x00120000u);                                     // the static writer's constant (meaning unknown, not load-bearing)
 		PPTR(Seg, Base + 0xa0, OMh);
 		PPTR(Seg, Base + 0xa8, OName);
@@ -557,30 +739,31 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 	IFileManager::Get().MakeDirectory(*FPaths::GetPath(OutYddPath), true);
 	if (!FFileHelper::SaveArrayToFile(Out, *OutYddPath)) { return Fail(FString::Printf(TEXT("write failed: %s"), *OutYddPath)); }
 
-	FString DJson;
+	FString DJson; int32 RigidEntries = 0;   // RUDE_PEDPROPS
 	for (const FDrawable& D : Ds)
 	{
 		int32 DV = 0, DT = 0; FString Tex;
+		if (D.bRigid) { ++RigidEntries; }
 		for (const FGeo& G : D.Geos)
 		{
 			DV += G.V.Num(); DT += G.Idx.Num() / 3;
-			Tex += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"diffuse\":\"%s\",\"normal\":\"%s\",\"spec\":\"%s\"}"), Tex.IsEmpty() ? TEXT("") : TEXT(","),
-				*RudeJsonEscape(G.Slot), *RudeJsonEscape(G.Mat), *RudeJsonEscape(G.Diffuse), *RudeJsonEscape(G.Normal), *RudeJsonEscape(G.Spec));
+			Tex += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"preset\":\"%s\",\"material\":\"%s\",\"diffuse\":\"%s\",\"normal\":\"%s\",\"spec\":\"%s\"}"), Tex.IsEmpty() ? TEXT("") : TEXT(","),
+				*RudeJsonEscape(G.Slot), *RudeJsonEscape(G.Preset), *RudeJsonEscape(G.Mat), *RudeJsonEscape(G.Diffuse), *RudeJsonEscape(G.Normal), *RudeJsonEscape(G.Spec));   // RUDE_PEDPROPS: + preset
 		}
 		DJson += FString::Printf(
 			TEXT("%s{\"name\":\"%s\",\"hash\":\"0x%08x\",\"asset\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"sourceVertices\":%d,\"triangles\":%d,")
 			TEXT("\"bonesReferenced\":%d,\"meshBonesUnmapped\":%d,\"influencesUnmapped\":%d,\"influencesTruncated\":%d,\"verticesRebound\":%d,")
-			TEXT("\"uv1Dropped\":%d,\"texturesMissing\":%d,\"textures\":[%s]}"),
+			TEXT("\"uv1Dropped\":%d,\"texturesMissing\":%d,\"rigid\":%s,\"shaderSubstituted\":%d,\"textures\":[%s]}"),
 			DJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(D.Name), D.Hash, *RudeJsonEscape(D.Asset), D.Geos.Num(), DV, D.SrcVerts, DT,
-			D.MaxRig + 1, D.BonesUnmapped, D.InflUnmapped, D.InflTruncated, D.Rebound, D.Uv1Dropped, D.TexMissing, *Tex);
+			D.MaxRig + 1, D.BonesUnmapped, D.InflUnmapped, D.InflTruncated, D.Rebound, D.Uv1Dropped, D.TexMissing, D.bRigid ? TEXT("true") : TEXT("false"), D.ShaderSubstituted, *Tex);
 	}
 	return FString::Printf(
-		TEXT("{\"ok\":true,\"yddPath\":\"%s\",\"entries\":%d,\"drawables\":[%s],\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,")
-		TEXT("\"rigBones\":%d,\"rig\":\"%s\",\"layout\":\"mask 0x7f stride 48 (Position BlendWeights BlendIndices Normal Colour0 Colour1 TexCoord0)\",")
+		TEXT("{\"ok\":true,\"yddPath\":\"%s\",\"entries\":%d,\"rigidEntries\":%d,\"drawables\":[%s],\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,")
+		TEXT("\"rigBones\":%d,\"rig\":\"%s\",\"layout\":\"skinned: mask 0x7f stride 48 (Position BlendWeights BlendIndices Normal Colour0 Colour1 TexCoord0); rigid: mask 0x40f9 stride 64 (Position Normal Colour0 Colour1 TexCoord0 TexCoord1 Tangent)\",")
 		TEXT("\"shader\":\"ped (13 params, alloc %d, hashOfs %d)\",\"bytes\":%d,\"segSize\":%d,\"page\":%d,\"pages\":%u,\"sysFlags\":\"0x%08x\",")
 		TEXT("\"selfCheck\":\"passed (dictionary-wide single ownership + geoBounds/count + declarations)\",")
 		TEXT("\"note\":\"the game also needs the matching .ytd (ExportYtdBinary / ExportMeshTextures) and a ped variation (ymt) row for the drawable index; in-game load unverified\"}"),
-		*RudeJsonEscape(OutYddPath), N, *DJson, TotalGeos, TotalVerts, TotalTris, NumRig, *RudeJsonEscape(RigName), kPedAlloc, kPedHashOfs,
+		*RudeJsonEscape(OutYddPath), N, RigidEntries, *DJson, TotalGeos, TotalVerts, TotalTris, NumRig, *RudeJsonEscape(RigName), kPedAlloc, kPedHashOfs,
 		Out.Num(), Seg.Num(), PAGE, NPages, SysFlag);
 #else
 	return Fail(TEXT("editor-only"));
