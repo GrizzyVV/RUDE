@@ -53,3 +53,12 @@ FString RudeImportYddEntryScoped(const FString& XmlPath, const FString& EntryNam
                                  const FRudeTextureScope* TextureScope);
 // Jenkins one-at-a-time over the lowercased name (the game's joaat).
 uint32 RudeJoaat(const FString& Name);
+
+// ---- LOD lineage (RudeLevelTools.cpp; ENGINEERING_LOG laws 24-28) ----
+// Resolve every entity's parentIndex into LodParent / LodChildren by the measured rule: the ymap named
+// by CMapData/parent first, then the entity's own ymap, accepting the candidate exactly one LOD level
+// coarser. YmapParent maps ymap (lower) -> its CMapData/parent. Counts: links made, links that resolved
+// to nothing (tagged RUDE_LOD_UNRESOLVED), parents whose stored numChildren != children present
+// (bLodPartial, tagged RUDE_LOD_PARTIAL).
+void RudeResolveLodLineage(UWorld* World, const TMap<FString, FString>& YmapParent,
+                           int32& OutLinks, int32& OutUnresolved, int32& OutPartial);

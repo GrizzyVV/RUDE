@@ -281,6 +281,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show the size numbers of an imported model: bounds, real vertex extents, collision pieces.", RudeAudience="agent"))
 	static FString InspectMesh(const FString& AssetPath);
 
+	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
+	static FString LodLineage(const FString& ActorLabel);
+
+	// Re-parent an entity in the LOD chain (empty ParentLabel = make it an orphan). Refuses links the
+	// ymap format cannot express; previews the fields the export will derive.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Change which distant version an object hands over to. Leave the parent empty to make it stand alone.", RudeAudience="agent"))
+	static FString SetLodParent(const FString& ActorLabel, const FString& ParentLabel);
+
+	// Derived-vs-stored over every entity in the level; zero diffs on an untouched level is the proof.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Check every object's LOD links against its stored numbers and report any that disagree.", RudeAudience="agent"))
+	static FString LodAudit();
+
 	// WP4 spike: new World Partition level + one Data Layer + one actor on it + save, headless.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Test that RUDE can create a streaming level with a toggleable layer and save it. Give a content path for the new level.", RudeAudience="agent"))
 	static FString ProbeWorldPartitionLevel(const FString& LevelPath);

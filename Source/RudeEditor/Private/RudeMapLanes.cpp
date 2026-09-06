@@ -1115,8 +1115,8 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 			RudeXmlNodeToString(E, ItemXml, 2);
 			EntJson += FString::Printf(TEXT(
 				"%s{\"archetype\":\"%s\",\"drawable\":%s,\"lodLevel\":\"%s\","
-				"\"ue_location\":[%f,%f,%f],\"ue_quat\":[%f,%f,%f,%f],\"scaleXY\":%f,"
-				"\"scaleZ\":%f,\"timeFlags\":%u,"
+				"\"ue_location\":[%.10g,%.10g,%.10g],\"ue_quat\":[%.9g,%.9g,%.9g,%.9g],\"scaleXY\":%.9g,"
+				"\"scaleZ\":%.9g,\"timeFlags\":%u,"
 				"\"flags\":%.0f,\"guid\":%.0f,\"lodDist\":%f,\"childLodDist\":%f,"
 				"\"numChildren\":%.0f,\"parentIndex\":%.0f,\"priorityLevel\":\"%s\","
 				"\"aoMultiplier\":%f,\"artificialAo\":%f,\"tintValue\":%.0f,"
@@ -1143,8 +1143,12 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 		// demand), bit 1 = LOD container - measured over downtown's 158 ymaps 2026-09-05.
 		uint32 YmapFlags = 0;
 		if (const FXmlNode* FN = Root->FindChildNode(TEXT("flags"))) { YmapFlags = (uint32)FCString::Strtoui64(*FN->GetAttribute(TEXT("value")), nullptr, 10); }
-		ScenesJson += FString::Printf(TEXT("%s{\"ymap\":\"%s\",\"ymapFlags\":%u,\"entities\":[%s]}"),
-			ScenesJson.IsEmpty() ? TEXT("") : TEXT(","), *YmapName, YmapFlags, *EntJson);
+		// CMapData/parent: the ymap whose entities this file's parentIndex values may point into
+		// (ENGINEERING_LOG law 24). Empty for a top-level LOD container.
+		FString YmapParent;
+		if (const FXmlNode* PN = Root->FindChildNode(TEXT("parent"))) { YmapParent = PN->GetContent().TrimStartAndEnd(); }
+		ScenesJson += FString::Printf(TEXT("%s{\"ymap\":\"%s\",\"ymapFlags\":%u,\"ymapParent\":\"%s\",\"entities\":[%s]}"),
+			ScenesJson.IsEmpty() ? TEXT("") : TEXT(","), *YmapName, YmapFlags, *RudeJsonEscape(YmapParent), *EntJson);
 	}
 	const FString ManifestPath = FPaths::ProjectSavedDir() / TEXT("RUDE") /
 		FString::Printf(TEXT("area_%s_manifest.json"),
@@ -3101,6 +3105,7 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 	// instead of silently spawning something the game would not have drawn.
 	int32 EntitiesInManifest = 0, FilteredByLod = 0, UnknownLodLevel = 0, EmptyLodLevel = 0;
 	int32 MalformedEntities = 0, UniqueMeshLookups = 0;
+	TMap<FString, FString> YmapParentMap;   // ymap (lower) -> CMapData/parent, for the lineage resolve
 
 	for (const TSharedPtr<FJsonValue>& SceneVal : Scenes)
 	{
@@ -3109,6 +3114,11 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		const TArray<TSharedPtr<FJsonValue>>* Entities;
 		if (!(*SceneObj)->TryGetArrayField(TEXT("entities"), Entities)) { continue; }
 		const FString YmapName = (*SceneObj)->GetStringField(TEXT("ymap"));
+		{
+			FString YP;
+			(*SceneObj)->TryGetStringField(TEXT("ymapParent"), YP);
+			YmapParentMap.Add(YmapName.ToLower(), YP);
+		}
 
 		AActor* Actor = nullptr;
 		USceneComponent* Root = nullptr;
@@ -3323,16 +3333,19 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 	//     a gate that cannot fail is worse than no gate (ENGINEERING_LOG "MEASUREMENT LAWS").
 	//     Note this also catches the case a filter typo produces: every entity filtered out by LOD,
 	//     nothing spawned, previously ok:true.
+	// ACTORS mode: resolve parentIndex links into LodParent / LodChildren (ENGINEERING_LOG law 24)
+	int32 LodLinks = 0, LodUnresolved = 0, LodPartial = 0;
+	if (bActors) { RudeResolveLodLineage(World, YmapParentMap, LodLinks, LodUnresolved, LodPartial); }
 	const bool bOk = (MalformedEntities == 0) && (NumYmaps > 0) && (NumEntities > 0);
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"ymaps\":%d,\"entitiesInManifest\":%d,\"entities\":%d,")
 		TEXT("\"filteredByLod\":%d,\"unknownLodLevel\":%d,\"emptyLodLevel\":%d,")
 		TEXT("\"malformedEntities\":%d,\"instances\":%d,\"proxies\":%d,")
 		TEXT("\"uniqueMeshes\":%d,\"uniqueMeshLookups\":%d,\"missingMeshes\":%d,\"topMissing\":[%s],")
-		TEXT("\"mode\":\"%s\",\"actors\":%d}"),
+		TEXT("\"mode\":\"%s\",\"actors\":%d,\"lodLinks\":%d,\"lodUnresolved\":%d,\"lodPartial\":%d}"),
 		bOk ? TEXT("true") : TEXT("false"),
 		NumYmaps, EntitiesInManifest, NumEntities, FilteredByLod, UnknownLodLevel, EmptyLodLevel,
 		MalformedEntities, NumInstances, NumProxies,
 		UniqueMeshes, UniqueMeshLookups, Missing.Num(), *TopMissing,
-		bActors ? TEXT("ACTORS") : TEXT("ISM"), NumActors);
+		bActors ? TEXT("ACTORS") : TEXT("ISM"), NumActors, LodLinks, LodUnresolved, LodPartial);
 }

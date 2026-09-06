@@ -5,6 +5,8 @@
 #include "Components/ActorComponent.h"
 #include "RudeEntityComponent.generated.h"
 
+class AActor;
+
 // One element the importer did not bind to a property, kept exactly as spelled so export can
 // re-emit it. Name = element tag; Text = its text content; Attributes = "k=v" pairs in file order.
 USTRUCT(BlueprintType)
@@ -75,6 +77,30 @@ public:
 	// Index of the parent entity in the PARENT map's list (-1 = none). Lineage, never hierarchy.
 	UPROPERTY(EditAnywhere, Category = "RUDE|LOD")
 	int32 ParentIndex = -1;
+
+	// The LOD parent as a LINK: the next-coarser entity this one hands over to. Resolved at import by
+	// the rule measured on downtown (ENGINEERING_LOG law 24: the parent ymap first, then this ymap,
+	// exactly one level coarser - 2,813/2,813 unique) and the thing you EDIT to re-parent. At export
+	// parentIndex, numChildren and HD/ORPHANHD are DERIVED from links (laws 25, 27); lodDist and
+	// childLodDist never are - they are authored (law 26).
+	// SOFT on purpose: every ymap is its own runtime Data Layer and a HARD actor reference across
+	// layers is a MapCheck error (measured 2026-09-06); a soft one resolves while the layer is loaded.
+	UPROPERTY(EditAnywhere, Category = "RUDE|LOD")
+	TSoftObjectPtr<AActor> LodParent;
+
+	// Back-links, maintained by the build and by SetLodParent; LodAudit re-derives them.
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|LOD")
+	TArray<TSoftObjectPtr<AActor>> LodChildren;
+
+	// Stored numChildren != children present in this level (they live in ymaps outside it): the
+	// count stays verbatim and re-parenting under this entity is refused (law 25).
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|LOD")
+	bool bLodPartial = false;
+
+	// CMapData/parent of the source ymap: the only OTHER file a parent may live in (law 24).
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Source")
+	FString SourceYmapParent;
+
 
 	// PRI_REQUIRED / PRI_OPTIONAL_HIGH / _MEDIUM / _LOW, as the game spells it.
 	UPROPERTY(EditAnywhere, Category = "RUDE|LOD")

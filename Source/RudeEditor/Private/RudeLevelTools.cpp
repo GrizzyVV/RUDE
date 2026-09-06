@@ -82,14 +82,153 @@
 #include "Serialization/JsonSerializer.h"
 #include "RudeToolsetInternal.h"
 
+// =========================== LOD lineage (ENGINEERING_LOG laws 24-28) ===========================
+// Measured on downtown 2026-09-06 (158 ymaps, 14,248 entities; scratchpad/wp7/lod_rules*.py):
+//   24. parentIndex points into the ymap named by CMapData/parent OR into the entity's own ymap -
+//       whichever holds the entity exactly one LOD level coarser (2,813/2,813 unique, 0 ambiguous).
+//   25. numChildren is a pure count (14,236/14,248; the 12 misses have children outside the district).
+//   26. lodDist and childLodDist are AUTHORED (entity == archetype only 2,722/14,248): never derived.
+//   27. HD vs ORPHANHD is exactly "has a parent" (1,758/1,758 and 11,394/11,394).
+//   28. the extents boxes follow no reproducible formula: containing boxes, grow-only.
+static int32 RudeLodRank(const FString& Level)
+{
+	static const TCHAR* Levels[] = { TEXT("LODTYPES_DEPTH_HD"), TEXT("LODTYPES_DEPTH_LOD"), TEXT("LODTYPES_DEPTH_SLOD1"),
+		TEXT("LODTYPES_DEPTH_SLOD2"), TEXT("LODTYPES_DEPTH_SLOD3"), TEXT("LODTYPES_DEPTH_SLOD4") };
+	for (int32 i = 0; i < UE_ARRAY_COUNT(Levels); ++i) { if (Level == Levels[i]) { return i; } }
+	if (Level == TEXT("LODTYPES_DEPTH_ORPHANHD")) { return 0; }
+	return -1;
+}
+static bool RudeIsHdLevel(const FString& Level)
+{
+	return Level == TEXT("LODTYPES_DEPTH_HD") || Level == TEXT("LODTYPES_DEPTH_ORPHANHD");
+}
+
+void RudeResolveLodLineage(UWorld* World, const TMap<FString, FString>& YmapParent,
+                           int32& OutLinks, int32& OutUnresolved, int32& OutPartial)
+{
+	OutLinks = OutUnresolved = OutPartial = 0;
+	TMap<FString, TMap<int32, URudeEntityComponent*>> ByYmap;   // ymap (lower) -> source ordinal -> component
+	TArray<URudeEntityComponent*> All;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>();
+		if (!R || R->SourceIndex < 0 || R->SourceYmap.IsEmpty()) { continue; }
+		const FString Y = R->SourceYmap.ToLower();
+		ByYmap.FindOrAdd(Y).Add(R->SourceIndex, R);
+		if (const FString* P = YmapParent.Find(Y)) { R->SourceYmapParent = *P; }
+		R->LodParent.Reset();
+		R->LodChildren.Reset();
+		R->bLodPartial = false;
+		All.Add(R);
+	}
+	for (URudeEntityComponent* R : All)
+	{
+		if (R->ParentIndex < 0) { continue; }
+		const int32 Want = RudeLodRank(R->LodLevel) + 1;
+		URudeEntityComponent* Parent = nullptr;
+		const TArray<FString> Tables = { R->SourceYmapParent.ToLower(), R->SourceYmap.ToLower() };
+		for (const FString& Y : Tables)
+		{
+			if (Y.IsEmpty()) { continue; }
+			if (TMap<int32, URudeEntityComponent*>* M = ByYmap.Find(Y))
+			{
+				if (URudeEntityComponent** C = M->Find(R->ParentIndex))
+				{
+					if (RudeLodRank((*C)->LodLevel) == Want) { Parent = *C; break; }
+				}
+			}
+		}
+		if (!Parent)
+		{
+			++OutUnresolved;
+			R->GetOwner()->Tags.AddUnique(FName(TEXT("RUDE_LOD_UNRESOLVED")));
+			continue;
+		}
+		R->LodParent = Parent->GetOwner();
+		Parent->LodChildren.Add(R->GetOwner());
+		++OutLinks;
+	}
+	for (URudeEntityComponent* R : All)
+	{
+		if (R->NumChildren != R->LodChildren.Num())
+		{
+			R->bLodPartial = true;
+			R->GetOwner()->Tags.AddUnique(FName(TEXT("RUDE_LOD_PARTIAL")));
+			++OutPartial;
+		}
+	}
+}
+
+// What the links say the derived fields should be. Ordinal: component -> its ordinal in the file the
+// export is about to write (empty map = use SourceIndex, the audit's view). Returns false with a named
+// reason when the link is one the ymap format cannot express.
+struct FRudeLodDerived
+{
+	int32 ParentIndex = -1;
+	int32 NumChildren = 0;
+	FString LodLevel;
+	bool bChanged = false;
+};
+static bool RudeDeriveLodFields(const URudeEntityComponent* R, const TMap<const AActor*, URudeEntityComponent*>& Comp,
+                                const TMap<const URudeEntityComponent*, int32>& Kids, const TMap<const URudeEntityComponent*, int32>& Ordinal,
+                                const FString& NewYmap, FRudeLodDerived& Out, FString& Why)
+{
+	Out.ParentIndex = -1;
+	Out.NumChildren = R->bLodPartial ? R->NumChildren : Kids.FindRef(R);
+	Out.LodLevel = R->LodLevel;
+	if (!R->LodParent.IsNull())
+	{
+		const URudeEntityComponent* P = Comp.FindRef(R->LodParent.Get());
+		if (!P) { Why = TEXT("LodParent actor carries no RUDE entity"); return false; }
+		const FString YmapR = R->SourceYmap.IsEmpty() ? NewYmap : R->SourceYmap.ToLower();
+		const FString YmapP = P->SourceYmap.IsEmpty() ? NewYmap : P->SourceYmap.ToLower();
+		if (YmapP != YmapR && YmapP != R->SourceYmapParent.ToLower())
+		{
+			Why = FString::Printf(TEXT("LodParent lives in '%s', which is neither this entity's ymap '%s' nor its parent ymap '%s' - the format cannot point there"),
+				*YmapP, *YmapR, *R->SourceYmapParent.ToLower());
+			return false;
+		}
+		if (RudeLodRank(P->LodLevel) != RudeLodRank(R->LodLevel) + 1)
+		{
+			Why = FString::Printf(TEXT("LodParent is %s, not the level one step coarser than %s"), *P->LodLevel, *R->LodLevel);
+			return false;
+		}
+		Out.ParentIndex = Ordinal.Contains(P) ? Ordinal[P] : P->SourceIndex;
+	}
+	if (RudeIsHdLevel(R->LodLevel)) { Out.LodLevel = !R->LodParent.IsNull() ? TEXT("LODTYPES_DEPTH_HD") : TEXT("LODTYPES_DEPTH_ORPHANHD"); }
+	Out.bChanged = Out.ParentIndex != R->ParentIndex || Out.NumChildren != R->NumChildren || Out.LodLevel != R->LodLevel;
+	return true;
+}
+// Children per parent, from the links as they stand now.
+static void RudeCountLodKids(UWorld* World, TMap<const AActor*, URudeEntityComponent*>& Comp, TMap<const URudeEntityComponent*, int32>& Kids, TArray<URudeEntityComponent*>& All)
+{
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>()) { Comp.Add(*It, R); All.Add(R); }
+	}
+	for (const URudeEntityComponent* R : All)
+	{
+		if (!R->LodParent.IsNull()) { if (const URudeEntityComponent* P = Comp.FindRef(R->LodParent.Get())) { Kids.FindOrAdd(P)++; } }
+	}
+}
+
 // ---- ExportLevelYmaps --------------------------------------------------------------------
 // A number as the game's files spell it: shortest fixed form, no trailing zeros ("1", "15000",
 // "-153.610275"). Only EDITED entities are spelled this way; untouched ones go out verbatim.
+// The game's values are float32 and the corpus spells them the way .NET's "R" format does (the
+// CodeWalker-parity oracle ROUT reproduces byte-for-byte): SEVEN significant digits when that reads
+// back to the same float, otherwise NINE - never eight (178.533508, 37.2113342, 0.9848078, and
+// 0.17364794 is %.9g with its trailing zero dropped). Measured 2026-09-06 on the re-parent gate:
+// "%.6f" re-spelt 37.2113342 as 37.211334, and a shortest-round-trip search gave 178.53351 (8).
 static FString RudeNum(double V)
 {
-	FString S = FString::Printf(TEXT("%.6f"), V);
-	if (S.Contains(TEXT(".")))
+	const float F = (float)V;
+	FString S = FString::Printf(TEXT("%.7g"), (double)F);
+	if ((float)FCString::Atod(*S) != F) { S = FString::Printf(TEXT("%.9g"), (double)F); }
+	if (S.Contains(TEXT("e")))
 	{
+		// tiny/huge magnitudes: fall back to a plain decimal spelling
+		S = FString::Printf(TEXT("%.9f"), (double)F);
 		while (S.EndsWith(TEXT("0"))) { S.LeftChopInline(1); }
 		if (S.EndsWith(TEXT("."))) { S.LeftChopInline(1); }
 	}
@@ -137,7 +276,7 @@ static FString RudeEntityDefXml(const URudeEntityComponent* R, const FTransform&
 
 struct FRudeExportEntity
 {
-	const URudeEntityComponent* R = nullptr;
+	URudeEntityComponent* R = nullptr;
 	FTransform Xf;
 	bool bUntouched = false;
 };
@@ -169,7 +308,7 @@ FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& Yma
 	int32 Seen = 0, Unsourced = 0, UnsourcedDropped = 0;
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
-		const URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>();
+		URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>();
 		if (!R) { continue; }
 		++Seen;
 		FString Ymap = R->SourceYmap.ToLower();
@@ -183,12 +322,73 @@ FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& Yma
 		FRudeExportEntity E;
 		E.R = R;
 		E.Xf = It->GetActorTransform();
-		E.bUntouched = !R->SourceXml.IsEmpty() && R->SourceIndex >= 0
-			&& E.Xf.Equals(R->SourceTransform, 1e-3f)
-			&& R->FieldsKey() == R->SourceFieldsKey;
 		Groups.FindOrAdd(Ymap).Add(E);
 	}
 	if (Groups.Num() == 0) { return Fail(FString::Printf(TEXT("no RUDE entities to export (%d components seen)"), Seen)); }
+
+	// ---- 1b) LOD lineage -> fields (laws 24-27). The links are what gets edited; parentIndex,
+	// numChildren and HD/ORPHANHD are derived from them HERE, before keying, so an unchanged lineage
+	// keys identical (verbatim bytes) and a re-parent rebuilds exactly the entities whose fields moved.
+	// lodDist / childLodDist are never touched (law 26). Ordinals: source entities keep theirs (deletions
+	// in lineage files are refused below); added entities are appended in the export's own order.
+	int32 LineageDerived = 0;
+	TMap<FString, FString> LineageBad;   // ymap -> why the whole file is refused
+	{
+		TMap<const AActor*, URudeEntityComponent*> Comp;
+		TMap<const URudeEntityComponent*, int32> Kids;
+		TArray<URudeEntityComponent*> AllComps;
+		RudeCountLodKids(World, Comp, Kids, AllComps);
+		TMap<const URudeEntityComponent*, int32> Ordinal;
+		for (auto& KV : Groups)
+		{
+			KV.Value.Sort([](const FRudeExportEntity& A, const FRudeExportEntity& B)
+			{
+				const int32 IA = A.R->SourceIndex < 0 ? INT32_MAX : A.R->SourceIndex;
+				const int32 IB = B.R->SourceIndex < 0 ? INT32_MAX : B.R->SourceIndex;
+				if (IA != IB) { return IA < IB; }
+				return A.R->ArchetypeName < B.R->ArchetypeName;
+			});
+			int32 Next = 0;
+			for (const FRudeExportEntity& E : KV.Value)
+			{
+				if (E.R->SourceIndex >= 0) { Next = FMath::Max(Next, E.R->SourceIndex + 1); }
+			}
+			for (const FRudeExportEntity& E : KV.Value)
+			{
+				Ordinal.Add(E.R, E.R->SourceIndex >= 0 ? E.R->SourceIndex : Next++);
+			}
+		}
+		for (auto& KV : Groups)
+		{
+			for (FRudeExportEntity& E : KV.Value)
+			{
+				FRudeLodDerived D;
+				FString Why;
+				if (!RudeDeriveLodFields(E.R, Comp, Kids, Ordinal, NewYmap, D, Why))
+				{
+					if (!LineageBad.Contains(KV.Key)) { LineageBad.Add(KV.Key, FString::Printf(TEXT("%s: %s"), *E.R->GetOwner()->GetActorLabel(), *Why)); }
+					continue;
+				}
+				if (D.bChanged)
+				{
+					E.R->ParentIndex = D.ParentIndex;
+					E.R->NumChildren = D.NumChildren;
+					E.R->LodLevel = D.LodLevel;
+					++LineageDerived;
+				}
+			}
+		}
+	}
+	for (auto& KV : Groups)
+	{
+		for (FRudeExportEntity& E : KV.Value)
+		{
+			const URudeEntityComponent* R = E.R;
+			E.bUntouched = !R->SourceXml.IsEmpty() && R->SourceIndex >= 0
+				&& E.Xf.Equals(R->SourceTransform, 1e-3f)
+				&& R->FieldsKey() == R->SourceFieldsKey;
+		}
+	}
 
 	IFileManager::Get().MakeDirectory(*(OutDir / TEXT("stream")), true);
 	int32 YmapsWritten = 0, YmapsRefused = 0;
@@ -198,6 +398,13 @@ FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& Yma
 	{
 		const FString& YmapName = KV.Key;
 		TArray<FRudeExportEntity>& Ents = KV.Value;
+		if (const FString* Bad = LineageBad.Find(YmapName))
+		{
+			++YmapsRefused;
+			Refused += FString::Printf(TEXT("%s\"%s: LOD link the format cannot express - %s\""),
+				Refused.IsEmpty() ? TEXT("") : TEXT(","), *YmapName, *RudeJsonEscape(*Bad));
+			continue;
+		}
 		Ents.Sort([](const FRudeExportEntity& A, const FRudeExportEntity& B)
 		{
 			const int32 IA = A.R->SourceIndex < 0 ? INT32_MAX : A.R->SourceIndex;
@@ -390,9 +597,9 @@ FString URudeToolset::ExportLevelYmaps(const FString& OutDir, const FString& Yma
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"componentsSeen\":%d,\"unsourced\":%d,\"unsourcedDropped\":%d,")
 		TEXT("\"ymapsWritten\":%d,\"ymapsRefused\":%d,\"kept\":%d,\"edited\":%d,\"added\":%d,\"removed\":%d,")
-		TEXT("\"editsNotRebuilt\":%d,\"extentsGrown\":%d,\"files\":[%s],\"refused\":[%s]}"),
+		TEXT("\"editsNotRebuilt\":%d,\"extentsGrown\":%d,\"lineageDerived\":%d,\"files\":[%s],\"refused\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"), Seen, Unsourced, UnsourcedDropped,
-		YmapsWritten, YmapsRefused, Kept, Edited, Added, Removed, EditsNotRebuilt, ExtentsGrown, *Files, *Refused);
+		YmapsWritten, YmapsRefused, Kept, Edited, Added, Removed, EditsNotRebuilt, ExtentsGrown, LineageDerived, *Files, *Refused);
 }
 
 // ---- MoveRudeEntity (agent; the scriptable edit for the export gate) ----------------------
@@ -642,6 +849,7 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 	int32 NumYmaps = 0, NumLayers = 0, NumActors = 0, NumProxies = 0, NumFiltered = 0, NumMalformed = 0, LayerFailures = 0;
 	int32 NumScriptYmaps = 0, NumScriptActors = 0, NumSuspect = 0;
 	TMap<FString, int32> Missing;
+	TMap<FString, FString> YmapParentMap;   // ymap (lower) -> CMapData/parent, for the lineage resolve
 	for (const TSharedPtr<FJsonValue>& SceneVal : Scenes)
 	{
 		const TSharedPtr<FJsonObject>* SceneObj;
@@ -652,6 +860,11 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 		++NumYmaps;
 		double YmapFlagsD = 0.0;
 		(*SceneObj)->TryGetNumberField(TEXT("ymapFlags"), YmapFlagsD);
+		{
+			FString YP;
+			(*SceneObj)->TryGetStringField(TEXT("ymapParent"), YP);
+			YmapParentMap.Add(YmapName.ToLower(), YP);
+		}
 		const bool bScriptYmap = (((uint32)YmapFlagsD) & 1u) != 0;   // CMapData flags bit 0 (measured)
 		if (bScriptYmap) { ++NumScriptYmaps; }
 		// one Data Layer per ymap: asset DL_<ymap> beside the level, Runtime, loaded in editor
@@ -726,6 +939,9 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 		}
 		if (Layer && LayerActors.Num() > 0) { DlSub->AddActorsToDataLayers(LayerActors, { Layer }); }
 	}
+	// LOD lineage: parentIndex links become LodParent / LodChildren (ENGINEERING_LOG law 24)
+	int32 LodLinks = 0, LodUnresolved = 0, LodPartial = 0;
+	RudeResolveLodLineage(World, YmapParentMap, LodLinks, LodUnresolved, LodPartial);
 	// save: the map (SaveMap writes external actors + assets; the headless map leg writes the .umap)
 	bool bSaved = FEditorFileUtils::SaveMap(World, Path);
 	FString MapFile;
@@ -754,11 +970,11 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 		TEXT("{\"ok\":%s,\"level\":\"%s\",\"worldPartition\":true,\"ymaps\":%d,\"layers\":%d,\"layerFailures\":%d,")
 		TEXT("\"actors\":%d,\"proxies\":%d,\"filteredByLod\":%d,\"malformedEntities\":%d,\"missingMeshes\":%d,")
 		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"previousFilesCleared\":%d,")
-		TEXT("\"scriptYmaps\":%d,\"scriptActorsHidden\":%d,\"suspectBounds\":%d,\"topMissing\":[%s]}"),
+		TEXT("\"scriptYmaps\":%d,\"scriptActorsHidden\":%d,\"suspectBounds\":%d,\"lodLinks\":%d,\"lodUnresolved\":%d,\"lodPartial\":%d,\"topMissing\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Path), NumYmaps, NumLayers, LayerFailures,
 		NumActors, NumProxies, NumFiltered, NumMalformed, Missing.Num(),
 		bSaved ? TEXT("true") : TEXT("false"), FPaths::FileExists(MapFile) ? TEXT("true") : TEXT("false"),
-		GRudeLastSaved, GRudeLastSaveFailed, Cleared, NumScriptYmaps, NumScriptActors, NumSuspect, *TopMissing);
+		GRudeLastSaved, GRudeLastSaveFailed, Cleared, NumScriptYmaps, NumScriptActors, NumSuspect, LodLinks, LodUnresolved, LodPartial, *TopMissing);
 }
 
 // Raw item slices: the text of each "  <Item ...>" ... "  </Item>" (indent 2) inside the named
@@ -1349,6 +1565,177 @@ FString URudeToolset::SetYmapVisible(const FString& YmapName, const FString& Vis
 	}
 	return FString::Printf(TEXT("{\"ok\":%s,\"ymap\":\"%s\",\"visible\":%s,\"actors\":%d,\"lodGoverned\":%d}"),
 		Touched > 0 ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Want), bShow ? TEXT("true") : TEXT("false"), Touched, SkippedLod);
+}
+
+// ---- LodLineage (agent + Matt) -------------------------------------------------------------
+// The chain an entity hands over along: up through its LodParent links to the top, and its children.
+// Labels are archetype names (not unique), so "ymap:index" (the entity's source ordinal) is accepted too.
+static AActor* RudeFindActorByLabel(UWorld* World, const FString& Label)
+{
+	const FString L = Label.TrimStartAndEnd();
+	FString Ymap, Idx;
+	if (L.Split(TEXT(":"), &Ymap, &Idx) && Idx.IsNumeric())
+	{
+		const int32 I = FCString::Atoi(*Idx);
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			const URudeEntityComponent* R = It->FindComponentByClass<URudeEntityComponent>();
+			if (R && R->SourceIndex == I && R->SourceYmap.Equals(Ymap, ESearchCase::IgnoreCase)) { return *It; }
+		}
+		return nullptr;
+	}
+	for (TActorIterator<AActor> It(World); It; ++It) { if (It->GetActorLabel() == L) { return *It; } }
+	return nullptr;
+}
+static FString RudeLodRow(const AActor* A)
+{
+	const URudeEntityComponent* R = A ? A->FindComponentByClass<URudeEntityComponent>() : nullptr;
+	if (!R) { return TEXT("null"); }
+	return FString::Printf(TEXT("{\"actor\":\"%s\",\"archetype\":\"%s\",\"ymap\":\"%s\",\"index\":%d,\"lodLevel\":\"%s\",\"lodDist\":%g,\"childLodDist\":%g,\"parentIndex\":%d,\"numChildren\":%d,\"childrenHere\":%d,\"partial\":%s}"),
+		*RudeJsonEscape(A->GetActorLabel()), *RudeJsonEscape(R->ArchetypeName), *RudeJsonEscape(R->SourceYmap), R->SourceIndex,
+		*R->LodLevel, R->LodDist, R->ChildLodDist, R->ParentIndex, R->NumChildren, R->LodChildren.Num(), R->bLodPartial ? TEXT("true") : TEXT("false"));
+}
+FString URudeToolset::LodLineage(const FString& ActorLabel)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	AActor* A = RudeFindActorByLabel(World, ActorLabel);
+	if (!A) { return Fail(FString::Printf(TEXT("no actor labelled '%s'"), *ActorLabel)); }
+	const URudeEntityComponent* R = A->FindComponentByClass<URudeEntityComponent>();
+	if (!R) { return Fail(TEXT("that actor carries no RUDE entity")); }
+	FString Up;
+	int32 Depth = 0;
+	for (const AActor* P = R->LodParent.Get(); P && Depth < 8; ++Depth)
+	{
+		Up += (Up.IsEmpty() ? TEXT("") : TEXT(",")) + RudeLodRow(P);
+		const URudeEntityComponent* PR = P->FindComponentByClass<URudeEntityComponent>();
+		P = PR ? PR->LodParent.Get() : nullptr;
+	}
+	FString Kids;
+	int32 N = 0;
+	for (const TSoftObjectPtr<AActor>& C : R->LodChildren)
+	{
+		if (N++ < 24) { Kids += (Kids.IsEmpty() ? TEXT("") : TEXT(",")) + RudeLodRow(C.Get()); }
+	}
+	return FString::Printf(TEXT("{\"ok\":true,\"entity\":%s,\"ymapParent\":\"%s\",\"up\":[%s],\"children\":%d,\"childrenListed\":[%s]}"),
+		*RudeLodRow(A), *RudeJsonEscape(R->SourceYmapParent), *Up, R->LodChildren.Num(), *Kids);
+}
+
+// ---- SetLodParent (agent + Matt) -----------------------------------------------------------
+// Re-parent an entity (empty ParentLabel = orphan it). Refuses what the ymap format cannot express:
+// a parent outside this ymap and its parent ymap, a parent not exactly one level coarser, or a parent
+// whose children are not all in this level (its numChildren is verbatim). The fields the export will
+// derive are previewed in the verdict; lodDist / childLodDist are left exactly as they were.
+FString URudeToolset::SetLodParent(const FString& ActorLabel, const FString& ParentLabel)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	AActor* A = RudeFindActorByLabel(World, ActorLabel);
+	if (!A) { return Fail(FString::Printf(TEXT("no actor labelled '%s'"), *ActorLabel)); }
+	URudeEntityComponent* R = A->FindComponentByClass<URudeEntityComponent>();
+	if (!R) { return Fail(TEXT("that actor carries no RUDE entity")); }
+	AActor* PA = nullptr;
+	URudeEntityComponent* P = nullptr;
+	if (!ParentLabel.TrimStartAndEnd().IsEmpty())
+	{
+		PA = RudeFindActorByLabel(World, ParentLabel);
+		if (!PA) { return Fail(FString::Printf(TEXT("no actor labelled '%s'"), *ParentLabel)); }
+		if (PA == A) { return Fail(TEXT("an entity cannot be its own parent")); }
+		P = PA->FindComponentByClass<URudeEntityComponent>();
+		if (!P) { return Fail(TEXT("the parent actor carries no RUDE entity")); }
+		if (RudeLodRank(P->LodLevel) != RudeLodRank(R->LodLevel) + 1)
+		{
+			return Fail(FString::Printf(TEXT("parent is %s; the parent of a %s must be the level one step coarser"), *P->LodLevel, *R->LodLevel));
+		}
+		const FString YmapR = R->SourceYmap.ToLower(), YmapP = P->SourceYmap.ToLower();
+		if (!YmapR.IsEmpty() && !YmapP.IsEmpty() && YmapP != YmapR && YmapP != R->SourceYmapParent.ToLower())
+		{
+			return Fail(FString::Printf(TEXT("parent lives in '%s'; a parent must be in this entity's ymap '%s' or its parent ymap '%s' (ENGINEERING_LOG law 24)"), *YmapP, *YmapR, *R->SourceYmapParent.ToLower()));
+		}
+		if (P->bLodPartial && !P->LodChildren.Contains(A))
+		{
+			return Fail(TEXT("that parent's children are not all in this level, so its numChildren is kept verbatim and cannot absorb another child"));
+		}
+	}
+	if (AActor* Old = R->LodParent.Get())
+	{
+		if (Old != PA)
+		{
+			if (URudeEntityComponent* OR = Old->FindComponentByClass<URudeEntityComponent>())
+			{
+				if (OR->bLodPartial) { return Fail(TEXT("this entity's current parent has children outside the level; its count is verbatim and cannot drop one")); }
+				Old->Modify();
+				OR->LodChildren.Remove(A);
+			}
+		}
+	}
+	A->Modify();
+	R->LodParent = PA;
+	if (PA && P)
+	{
+		PA->Modify();
+		P->LodChildren.AddUnique(A);
+	}
+	// preview of what the export derives
+	TMap<const AActor*, URudeEntityComponent*> Comp;
+	TMap<const URudeEntityComponent*, int32> Kids;
+	TArray<URudeEntityComponent*> All;
+	RudeCountLodKids(World, Comp, Kids, All);
+	FRudeLodDerived D;
+	FString Why;
+	const TMap<const URudeEntityComponent*, int32> NoOrdinals;
+	const bool bOk = RudeDeriveLodFields(R, Comp, Kids, NoOrdinals, TEXT(""), D, Why);
+	return FString::Printf(TEXT("{\"ok\":%s,\"actor\":\"%s\",\"parent\":\"%s\",\"willExport\":{\"parentIndex\":%d,\"lodLevel\":\"%s\",\"numChildren\":%d},\"parentChildrenNow\":%d,\"note\":\"%s\"}"),
+		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(A->GetActorLabel()), PA ? *RudeJsonEscape(PA->GetActorLabel()) : TEXT(""),
+		D.ParentIndex, *D.LodLevel, D.NumChildren, P ? P->LodChildren.Num() : 0,
+		bOk ? TEXT("lodDist and childLodDist are authored values and were not touched (law 26)") : *RudeJsonEscape(Why));
+}
+
+// ---- LodAudit (agent) ----------------------------------------------------------------------
+// Every entity: what the links derive vs what the fields store. On an untouched level this MUST be
+// zero diffs - that is the proof the derivation reproduces the game's own data before it is trusted
+// to write any.
+FString URudeToolset::LodAudit()
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	TMap<const AActor*, URudeEntityComponent*> Comp;
+	TMap<const URudeEntityComponent*, int32> Kids;
+	TArray<URudeEntityComponent*> All;
+	RudeCountLodKids(World, Comp, Kids, All);
+	const TMap<const URudeEntityComponent*, int32> NoOrdinals;
+	int32 Links = 0, Partial = 0, Unresolved = 0, Diffs = 0, Refusals = 0, DiffParent = 0, DiffCount = 0, DiffLevel = 0;
+	FString Rows;
+	for (const URudeEntityComponent* R : All)
+	{
+		if (!R->LodParent.IsNull()) { ++Links; }
+		if (R->bLodPartial) { ++Partial; }
+		if (R->GetOwner()->Tags.Contains(FName(TEXT("RUDE_LOD_UNRESOLVED")))) { ++Unresolved; }
+		FRudeLodDerived D;
+		FString Why;
+		if (!RudeDeriveLodFields(R, Comp, Kids, NoOrdinals, TEXT(""), D, Why))
+		{
+			++Refusals;
+			if (Refusals <= 10) { Rows += FString::Printf(TEXT("%s{\"actor\":\"%s\",\"refused\":\"%s\"}"), Rows.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(R->GetOwner()->GetActorLabel()), *RudeJsonEscape(Why)); }
+			continue;
+		}
+		if (!D.bChanged) { continue; }
+		++Diffs;
+		if (D.ParentIndex != R->ParentIndex) { ++DiffParent; }
+		if (D.NumChildren != R->NumChildren) { ++DiffCount; }
+		if (D.LodLevel != R->LodLevel) { ++DiffLevel; }
+		if (Diffs <= 10)
+		{
+			Rows += FString::Printf(TEXT("%s{\"actor\":\"%s\",\"ymap\":\"%s\",\"stored\":[%d,%d,\"%s\"],\"derived\":[%d,%d,\"%s\"]}"),
+				Rows.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(R->GetOwner()->GetActorLabel()), *RudeJsonEscape(R->SourceYmap),
+				R->ParentIndex, R->NumChildren, *R->LodLevel, D.ParentIndex, D.NumChildren, *D.LodLevel);
+		}
+	}
+	return FString::Printf(TEXT("{\"ok\":%s,\"entities\":%d,\"links\":%d,\"unresolved\":%d,\"partial\":%d,\"diffs\":%d,\"diffParentIndex\":%d,\"diffNumChildren\":%d,\"diffLodLevel\":%d,\"refusals\":%d,\"first\":[%s]}"),
+		(Diffs == 0 && Refusals == 0) ? TEXT("true") : TEXT("false"), All.Num(), Links, Unresolved, Partial, Diffs, DiffParent, DiffCount, DiffLevel, Refusals, *Rows);
 }
 
 // ---- PickAt (agent) -----------------------------------------------------------------------
