@@ -22,3 +22,5 @@ AActor* RudeSpawnEntityActor(UWorld* World, const FString& YmapName, const TShar
 // Headless-safe dirty-package save (UPackage::Save when there is no Slate); counts land in the globals.
 bool RudeSaveDirty(bool bMaps, bool bContent);
 extern int32 GRudeLastSaved, GRudeLastSaveFailed;
+// Sum of an integer field across a JSON verdict list (batch tools fold per-item verdicts with it).
+int32 RudeSumField(const FString& Json, const TCHAR* Key);

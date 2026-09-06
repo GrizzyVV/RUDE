@@ -321,7 +321,10 @@ Content/Masters/                 M_RUDE_Opaque / Cutout / DecalGeo / Foliage / T
 Source/RudeEditor/Private/
   RudeToolset.h                  THE tool surface (every UFUNCTION tool). Start here.
   RudeToolset.cpp                the implementations (bulk: intake, textures, ydr/yft/ybn import,
-                                 masters, scene import, binary export lanes)
+                                 masters, scene import)
+  RudeBinaryLanes.cpp            the binary lane (split 2026-09-06): the RSC7 ydr reader, the ytd and
+                                 ybn writers, ExportYdrBinary[Batch] / ExportYtdBinary / ExportYbnBinary /
+                                 ProbeYdrBinary
   RudeLevelTools.cpp             the level lane (split 2026-09-06): BuildDistrictLevel / OpenLevel /
                                  palette / interiors / ExportLevelYmaps / SetLodView / PickAt / InspectMesh
   RudeToolsetInternal.h          private plumbing shared by the .cpp lanes (RudeJsonEscape, the XML
