@@ -4,6 +4,7 @@
 // SetWorldHour and ImportScene (manifest -> actors/ISM). Split out of RudeToolset.cpp 2026-09-06.
 #include "RudeToolset.h"
 #include "RudeToolsetInternal.h"
+#include "Interfaces/IPluginManager.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/ARFilter.h"
 #include "AssetCompilingManager.h"
@@ -1229,10 +1230,18 @@ FString URudeToolset::ImportArea(const FString& AreaName, const FString& Catalog
 	{
 		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
 	};
-	FString Raw;
-	if (!FFileHelper::LoadFileToString(Raw, *CatalogPath))
+	// An empty CatalogPath means the catalog bundled with the plugin (<plugin>/Catalogs/area_aliases.json),
+	// so a user never has to know where the file lives. Until that file ships, the tool says so by name.
+	FString Catalog = CatalogPath.TrimStartAndEnd();
+	if (Catalog.IsEmpty())
 	{
-		return Fail(TEXT("cannot read the area catalog (CatalogPath)"));
+		const TSharedPtr<IPlugin> Self = IPluginManager::Get().FindPlugin(TEXT("RUDE"));
+		if (Self.IsValid()) { Catalog = Self->GetBaseDir() / TEXT("Catalogs") / TEXT("area_aliases.json"); }
+	}
+	FString Raw;
+	if (Catalog.IsEmpty() || !FFileHelper::LoadFileToString(Raw, *Catalog))
+	{
+		return Fail(FString::Printf(TEXT("cannot read the area catalog at %s - pass CatalogPath, or use ImportMapArea with a ymap prefix"), *Catalog));
 	}
 	TArray<TSharedPtr<FJsonValue>> Entries;
 	{

@@ -25,6 +25,7 @@ public class RudeEditor : ModuleRules
 			"InputCore",
 			"WorkspaceMenuStructure",
 			"XmlParser",
+			"Projects",   // IPluginManager: the plugin locates its own bundled catalog
 			"MeshDescription",
 			"StaticMeshDescription",
 			"MeshReductionInterface",
