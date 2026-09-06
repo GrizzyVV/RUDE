@@ -1733,8 +1733,18 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 		const FXmlNode* FileNode = Item->FindChildNode(TEXT("FileName"));
 		const FString DdsName = FileNode && !FileNode->GetContent().TrimStartAndEnd().IsEmpty()
 			? FileNode->GetContent().TrimStartAndEnd() : (TexName + TEXT(".dds"));
-		const FString DdsPath = PixelFolder / DdsName;
-		const FString PngPath = PixelFolder / (TexName + TEXT(".png"));
+		// An EMPTY PixelFolder means the corpus's own sidecar folder beside the XML ("<dir>/<stem>/"),
+		// the way ImportMapArea resolves it; a relative bare file name never exists (measured 2026-09-06:
+		// burrito.ytd declared 11, imported 0 with the 11 DDS files sitting right there).
+		FString Pix = PixelFolder.TrimStartAndEnd();
+		if (Pix.IsEmpty())
+		{
+			FString Stem = FPaths::GetBaseFilename(XmlPath);   // "burrito.ytd"
+			if (Stem.EndsWith(TEXT(".ytd"), ESearchCase::IgnoreCase)) { Stem.LeftChopInline(4); }
+			Pix = FPaths::GetPath(XmlPath) / Stem;
+		}
+		const FString DdsPath = Pix / DdsName;
+		const FString PngPath = Pix / (TexName + TEXT(".png"));
 		TArray<uint8> PngBytes;
 		TArray<uint8> BGRA;
 		int32 W = 0, H = 0;
