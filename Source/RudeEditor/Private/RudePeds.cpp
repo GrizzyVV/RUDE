@@ -1100,3 +1100,54 @@ FString URudeToolset::ExportPedReplace(const FString& OutfitAssetPath, const FSt
 		Drawables, DrawablesWithoutMesh, JsonInt(YddVerdict, TEXT("entries"), -1), JsonInt(YddVerdict, TEXT("bytes"), -1),
 		*RudeJsonEscape(YtdPath), Textures, JsonInt(YtdVerdict, TEXT("bytes"), -1), *ManifestState, *ProblemsJson);
 }
+
+// ---- ExportTxdReplace (agent + Matt) --------------------------------------------------------
+// One imported texture dictionary back to the game as a REPLACE resource: every UTexture2D under
+// /Game/RUDE/Textures/<dict>/ (edited or not) into stream/<dict>.ytd under its own name, usage read off
+// the asset (normal map / linear = specular / sRGB = diffuse), + fxmanifest.lua. Streamed, it shadows the
+// game's <dict>.ytd - the livery / paint / prop-texture edit path with no model writer involved.
+FString URudeToolset::ExportTxdReplace(const FString& DictName, const FString& OutDir, const FString& MaxDim)
+{
+	using namespace RudePeds;
+	auto Bad = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	const FString Dict = DictName.TrimStartAndEnd().ToLower();
+	if (Dict.IsEmpty()) { return Bad(TEXT("give the dictionary name (the folder under /Game/RUDE/Textures/, e.g. blista)")); }
+	if (OutDir.TrimStartAndEnd().IsEmpty()) { return Bad(TEXT("OutDir is empty")); }
+	TArray<FAssetData> TexAssets;
+	{
+		FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		ARM.Get().WaitForCompletion();
+		ARM.Get().GetAssetsByPath(FName(*(TEXT("/Game/RUDE/Textures/") + Dict)), TexAssets, false);
+	}
+	FString Specs;
+	int32 Textures = 0, NotTextures = 0;
+	for (const FAssetData& AD : TexAssets)
+	{
+		UTexture2D* T = Cast<UTexture2D>(AD.GetAsset());
+		if (!T) { ++NotTextures; continue; }
+		const TCHAR* Usage = (T->CompressionSettings == TC_Normalmap) ? TEXT("NORMAL") : (!T->SRGB ? TEXT("SPECULAR") : TEXT("DIFFUSE"));
+		Specs += FString::Printf(TEXT("%s%s;%s;%s"), Specs.IsEmpty() ? TEXT("") : TEXT(","), *T->GetPathName(), *T->GetName(), Usage);
+		++Textures;
+	}
+	if (Textures == 0) { return Bad(FString::Printf(TEXT("no textures under /Game/RUDE/Textures/%s (ImportYtd / ImportVehicleComposite / ImportPed fill it)"), *Dict)); }
+	const FString StreamDir = OutDir / TEXT("stream");
+	IFileManager::Get().MakeDirectory(*StreamDir, true);
+	const FString YtdPath = StreamDir / (Dict + TEXT(".ytd"));
+	const FString YtdVerdict = ExportYtdBinary(Specs, YtdPath, MaxDim.TrimStartAndEnd().IsEmpty() ? TEXT("0") : MaxDim);
+	const bool bOk = YtdVerdict.Contains(TEXT("\"ok\":true"));
+	const FString ManifestPath = OutDir / TEXT("fxmanifest.lua");
+	FString ManifestState = TEXT("kept");
+	if (bOk && !FPaths::FileExists(ManifestPath))
+	{
+		const FString Manifest = FString::Printf(TEXT(
+			"fx_version 'cerulean'\ngame 'gta5'\n\n"
+			"-- Texture-dictionary REPLACE resource: stream/%s.ytd carries the game's own dictionary name, so it\n"
+			"-- shadows the vanilla file. Every texture the imported dictionary held is inside under its own name\n"
+			"-- (%d), re-encoded (DXT1/DXT5 for colour, ATI2 for normal maps, full mip chains).\n"),
+			*Dict, Textures);
+		ManifestState = FFileHelper::SaveStringToFile(Manifest, *ManifestPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ? TEXT("written") : TEXT("writeFailed");
+	}
+	return FString::Printf(TEXT("{\"ok\":%s,\"dict\":\"%s\",\"outDir\":\"%s\",\"ytdPath\":\"%s\",\"textures\":%d,\"notTextures\":%d,\"ytdBytes\":%d,\"manifest\":\"%s\",\"ytd\":%s}"),
+		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Dict), *RudeJsonEscape(OutDir), *RudeJsonEscape(YtdPath), Textures, NotTextures,
+		JsonInt(YtdVerdict, TEXT("bytes"), -1), *ManifestState, bOk ? *YtdVerdict : *Bad(YtdVerdict.Left(300)));
+}

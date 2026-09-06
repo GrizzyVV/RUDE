@@ -570,6 +570,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Pack a ped's clothing and textures as a FiveM resource that replaces the game's own files for that ped.", RudeAudience="agent"))
 	static FString ExportPedReplace(const FString& OutfitAssetPath, const FString& OutDir, const FString& Options);
 
+	// One imported texture dictionary back to the game as a REPLACE resource: every texture under
+	// /Game/RUDE/Textures/<dict>/ -> stream/<dict>.ytd (+ fxmanifest.lua). The livery / paint / prop-texture
+	// edit path. MaxDim: downscale cap for ExportYtdBinary ("0"/empty = none).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Pack an imported texture set as a FiveM resource that replaces the game's own texture file of that name.", RudeAudience="agent"))
+	static FString ExportTxdReplace(const FString& DictName, const FString& OutDir, const FString& MaxDim);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);
