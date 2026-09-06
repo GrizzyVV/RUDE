@@ -32,6 +32,7 @@
 #include "RudeToolset.h"
 #include "RudeCorpus.h"
 #include "RudeToolsetInternal.h"
+#include "Misc/ScopeExit.h"
 #include "RudeVehicleAsset.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -703,6 +704,10 @@ namespace RudeVehicle
 		return O;
 	}
 
+	// The texture scope every mesh of the composite binds by: the vehicle's own dictionary + the game's
+	// txdRelationships chain. Set by ImportVehicleComposite for the span of its imports (editor thread only).
+	static const FRudeTextureScope* GRudeVehicleTxdScope = nullptr;
+
 	// Import a re-spelled drawable buffer as <DestFolder>/<MeshName> unless the package exists (the
 	// same skip-if-exists idempotence as ImportOrLoad), then hand back the loaded mesh.
 	static UStaticMesh* ImportBuffer(const FString& Buffer, const FString& MeshName, const FString& DestFolder,
@@ -718,7 +723,7 @@ namespace RudeVehicle
 					*JsonEscape(Doc.GetLastError()));
 				return nullptr;
 			}
-			OutVerdict = ImportDrawableNode(Doc.GetRootNode(), MeshName, DestFolder, nullptr);
+			OutVerdict = ImportDrawableNode(Doc.GetRootNode(), MeshName, DestFolder, GRudeVehicleTxdScope);
 			// A mesh the importer BUILT (its verdict names an assetPath) is kept even when that verdict
 			// is not ok, so the composite finishes and REPORTS the gate instead of dying on it (rule
 			// added on the live tree by another session, 2026-09-06, kept here; the composite folds a
@@ -976,18 +981,58 @@ FString URudeToolset::ImportVehicleComposite(const FString& CorpusRoot, const FS
 		}
 	}
 
-	// ---- 0b) the textures first, the way ImportPed does: the vehicle's own dictionaries and the shared
-	// vehshare, into /Game/RUDE/Textures (an empty PixelFolder = the corpus sidecar). Since the 2026-09-06
-	// re-export the corpus carries every vehicle's DDS; before it these imported 0 and the body came in grey.
+	// ---- 0b) the textures first, the way ImportPed does: the vehicle's own dictionaries, then the game's
+	// OWN sharing rule - vehicles.meta <txdRelationships> (child -> parent), multi-level (blista ->
+	// vehicles_schaf_interior -> vehshare; burrito -> vehicles_van_interior -> vehshare_truck -> vehshare;
+	// 284 of the base game's 318 chains have two or more levels, measured 2026-09-06). Every dictionary on
+	// the chain is imported (an empty PixelFolder = the corpus sidecar) and the chain becomes the body's
+	// texture scope (the resolver's tier 3), so a name two shared dictionaries both hold resolves the way
+	// the game resolves it. Before this the blista's dials and dash (the Schafter's) were 5 of its 6 misses.
+	TArray<FString> TxdChain;
 	{
-		FString VehShareSlot;
-		const FString VehSharePath = Effective(TEXT("ytd"), TEXT("vehshare"), VehShareSlot);
-		for (const FString& TxdPath : { YtdPath, HiYtdPath, VehSharePath })
+		int32 ChainSearched = 0;
+		FString Cur = Name;
+		for (int32 Depth = 0; Depth < 6; ++Depth)
+		{
+			FMetaHit Rel = FindMetaItem(*Corpus, TEXT("meta"), TEXT("vehicles"), TEXT("child"), Cur, ChainSearched);
+			const FString Parent = Rel.bFound ? Rel.Fields.FindRef(TEXT("parent")).TrimStartAndEnd().ToLower() : FString();
+			if (Parent.IsEmpty() || TxdChain.Contains(Parent) || Parent == Name.ToLower()) { break; }
+			TxdChain.Add(Parent);
+			Cur = Parent;
+		}
+		if (!TxdChain.Contains(TEXT("vehshare"))) { TxdChain.Add(TEXT("vehshare")); }   // the root every measured chain ends on
+	}
+	// A copy of a dictionary that HAS its pixel sidecar beats a higher-slot copy without one: the DLC
+	// copies of vehicles_schaf_interior carry no DDS, the base copy does. History() is lowest slot first.
+	auto YtdWithPixels = [&](const FString& N) -> FString
+	{
+		FString Best;
+		for (const FRudeCorpusEntry* E : Corpus->History(TEXT("ytd"), N))
+		{
+			const FString P = Corpus->PathOf(*E);
+			if (Best.IsEmpty()) { Best = P; }
+			FString Stem = FPaths::GetBaseFilename(P);
+			Stem.RemoveFromEnd(TEXT(".ytd"));
+			if (FPaths::DirectoryExists(FPaths::GetPath(P) / Stem)) { Best = P; }
+		}
+		return Best;
+	};
+	int32 TxdsImported = 0;
+	{
+		TArray<FString> Dicts = { YtdPath, HiYtdPath };
+		for (const FString& P : TxdChain) { Dicts.Add(YtdWithPixels(P)); }
+		for (const FString& TxdPath : Dicts)
 		{
 			if (TxdPath.IsEmpty()) { continue; }
-			URudeToolset::ImportYtd(TxdPath, TEXT(""), TEXT("/Game/RUDE/Textures"));
+			const FString V = URudeToolset::ImportYtd(TxdPath, TEXT(""), TEXT("/Game/RUDE/Textures"));
+			if (V.Contains(TEXT("\"ok\":true"))) { ++TxdsImported; }
 		}
 	}
+	FRudeTextureScope TxdScope;
+	TxdScope.ArchetypeTxd = Name.ToLower();
+	TxdScope.ParentTxdChain = TxdChain;
+	GRudeVehicleTxdScope = &TxdScope;
+	ON_SCOPE_EXIT { GRudeVehicleTxdScope = nullptr; };
 	// ---- 1) the skeleton (the base file's; the _hi's is the same one: 68/68 and 74/74 measured) --
 	TArray<FBone> Bones;
 	TArray<FTransform> WorldGta;
@@ -1513,7 +1558,7 @@ FString URudeToolset::ImportVehicleComposite(const FString& CorpusRoot, const FS
 	const bool bOk = bBodyVerdictOk && bWheelsIntact && ChildComponents == Children.Num() && LodFailed == 0;
 	return FString::Printf(TEXT(
 		"{\"ok\":%s,\"vehicle\":\"%s\",\"actor\":\"%s\",\"asset\":\"%s\",\"bodyAsset\":\"%s\",\"bodyGeos\":%d,"
-		"\"bodyMissingTextures\":%d,\"bodyVerdictOk\":%s,\"hiFragment\":%s,\"lodCount\":%d,\"lodSources\":[%s],\"lodFailed\":%d,"
+		"\"bodyMissingTextures\":%d,\"txdChain\":[%s],\"txdsImported\":%d,\"bodyVerdictOk\":%s,\"hiFragment\":%s,\"lodCount\":%d,\"lodSources\":[%s],\"lodFailed\":%d,"
 		"\"bonesRead\":%d,\"wheelBones\":%d,\"wheelsPlaced\":%d,\"wheelsMirrored\":%d,"
 		"\"children\":%d,\"childrenWithGeometry\":%d,\"childComponents\":%d,\"boundChildren\":%d,\"boundTypes\":{%s},\"boundsSkippedDisc\":%d,"
 		"\"liveries\":%d,\"liveryTextures\":[%s],\"liveryShaderIndex\":%d,\"liveryShader\":\"%s\",\"liverySampler\":\"%s\","
@@ -1523,7 +1568,7 @@ FString URudeToolset::ImportVehicleComposite(const FString& CorpusRoot, const FS
 		"\"missingCount\":%d,\"missingTruncated\":%d,\"missing\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"),
 		*Name, *JsonEscape(Actor->GetActorLabel()), *JsonEscape(AssetPkgName), *JsonEscape(BodyAssetPath), BodyGeos,
-		BodyMissingTex, bBodyVerdictOk ? TEXT("true") : TEXT("false"), HiDrawable ? TEXT("true") : TEXT("false"), LodCount, *JsonStrings(LodSources), LodFailed,
+		BodyMissingTex, *JsonStrings(TxdChain), TxdsImported, bBodyVerdictOk ? TEXT("true") : TEXT("false"), HiDrawable ? TEXT("true") : TEXT("false"), LodCount, *JsonStrings(LodSources), LodFailed,
 		Bones.Num(), WheelBones, WheelsPlaced, WheelsMirrored,
 		Children.Num(), ChildrenWithGeometry, ChildComponents, BoundChildren.Num(), *BoundJson, BoundsSkippedDisc,
 		LiveryKeys.Num(), *JsonStrings(LiveryNames), LiveryShaderIndex, *JsonEscape(LiveryPreset), *JsonEscape(LiverySampler),
