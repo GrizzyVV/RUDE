@@ -504,6 +504,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Dress a character: pick which clothing piece a body slot wears and which colour variant.", RudeAudience="agent"))
 	static FString SetPedOutfit(const FString& ActorLabel, const FString& Slot, const FString& DrawableIndex, const FString& TextureLetter);
 
+	// An interior's entity set on or off in the editor (the game's per-instance activation).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Switch one of an interior's optional prop sets on or off.", RudeAudience="agent"))
+	static FString SetEntitySet(const FString& InteriorName, const FString& SetName, const FString& Visible);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

@@ -1777,6 +1777,76 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 	UStaticMesh* ProxyCube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
 	TMap<FString, UStaticMesh*> MeshCache;   // lowercase drawable -> mesh (nullptr = known-missing)
 	int32 Spawned = 0, Proxies = 0, NumLights = 0, Unresolved = 0;
+	// ---- entity SETS (GDD: "entity sets -> variants; activation is per instance"): every set's entities
+	// spawn under their own actor, HIDDEN, tagged RUDE_MLO_EntitySet:<set> - SetEntitySet (editor) and the
+	// sandbox shim's ActivateInteriorEntitySet (PIE) toggle them. Rough: lights of set entities are skipped.
+	int32 SetEntitiesSpawned = 0, SetEntitiesProxied = 0, SetActors = 0;
+	if (const FXmlNode* SetsN = Mlo->FindChildNode(TEXT("entitySets")))
+	{
+		for (const FXmlNode* S : SetsN->GetChildrenNodes())
+		{
+			const FXmlNode* SN = S->FindChildNode(TEXT("name"));
+			const FXmlNode* SE = S->FindChildNode(TEXT("entities"));
+			if (!SN || !SE || SE->GetChildrenNodes().Num() == 0) { continue; }
+			const FString SetName = SN->GetContent().TrimStartAndEnd();
+			AActor* SA = World->SpawnActor<AActor>();
+			if (!SA) { continue; }
+			USceneComponent* SR = NewObject<USceneComponent>(SA, TEXT("Root"));
+			SA->SetRootComponent(SR);
+			SR->SetMobility(EComponentMobility::Static);
+			SR->RegisterComponent();
+			SA->AddInstanceComponent(SR);
+			SA->SetActorLabel(Label + TEXT("_set_") + SetName);
+			SA->SetFolderPath(FName(TEXT("RUDE_MLO")));
+			SA->Tags.Add(IdTag);
+			SA->Tags.Add(FName(*(TEXT("RUDE_MLO_EntitySet:") + SetName)));
+			SA->AttachToActor(RootActor, FAttachmentTransformRules::KeepWorldTransform);
+			TMap<FString, UInstancedStaticMeshComponent*> SetIsm;
+			for (const FXmlNode* E : SE->GetChildrenNodes())
+			{
+				const FXmlNode* AN = E->FindChildNode(TEXT("archetypeName"));
+				const FXmlNode* Pos = E->FindChildNode(TEXT("position"));
+				if (!AN || !Pos) { continue; }
+				const FString ArchLower = AN->GetContent().TrimStartAndEnd().ToLower();
+				const double Px = FCString::Atod(*Pos->GetAttribute(TEXT("x"))), Py = FCString::Atod(*Pos->GetAttribute(TEXT("y"))), Pz = FCString::Atod(*Pos->GetAttribute(TEXT("z")));
+				double Qx = 0, Qy = 0, Qz = 0, Qw = 1;
+				if (const FXmlNode* Rot = E->FindChildNode(TEXT("rotation")))
+				{
+					Qx = FCString::Atod(*Rot->GetAttribute(TEXT("x"))); Qy = FCString::Atod(*Rot->GetAttribute(TEXT("y")));
+					Qz = FCString::Atod(*Rot->GetAttribute(TEXT("z"))); Qw = FCString::Atod(*Rot->GetAttribute(TEXT("w")));
+				}
+				const FTransform Xf(FQuat(Qx, -Qy, Qz, Qw), FVector(Px * 100.0, -Py * 100.0, Pz * 100.0), FVector::OneVector);
+				const FString* Asset = Index.ArchToAsset.Find(ArchLower);
+				UStaticMesh* Mesh = nullptr;
+				if (Asset)
+				{
+					if (UStaticMesh** Cached = MeshCache.Find(*Asset)) { Mesh = *Cached; }
+					else { Mesh = LoadObject<UStaticMesh>(nullptr, *(DestMeshFolder / *Asset)); MeshCache.Add(*Asset, Mesh); }
+				}
+				const FString MeshKey = Mesh ? *Asset : FString(TEXT("proxy"));
+				UStaticMesh* Use = Mesh ? Mesh : ProxyCube;
+				if (!Use) { continue; }
+				UInstancedStaticMeshComponent* Ism = SetIsm.FindRef(MeshKey);
+				if (!Ism)
+				{
+					Ism = NewObject<UInstancedStaticMeshComponent>(SA, FName(*FString::Printf(TEXT("ISM_%d"), SetIsm.Num())));
+					Ism->SetStaticMesh(Use);
+					Ism->SetMobility(EComponentMobility::Static);
+					Ism->SetupAttachment(SR);
+					Ism->RegisterComponent();
+					SA->AddInstanceComponent(Ism);
+					Ism->ComponentTags.Add(FName(TEXT("RUDE_MLO_SET_ISM")));
+					SetIsm.Add(MeshKey, Ism);
+				}
+				Ism->AddInstance(Xf, /*bWorldSpace*/ true);
+				if (Mesh) { ++SetEntitiesSpawned; } else { ++SetEntitiesProxied; }
+			}
+			// hidden until activated (the game's own default: a set is off unless the instance lists it)
+			SA->SetActorHiddenInGame(true);
+			for (auto& KV : SetIsm) { KV.Value->SetVisibility(false, true); }
+			++SetActors;
+		}
+	}
 	for (int32 i = 0; i < Ents.Num(); ++i)
 	{
 		const FMloEntity& E = Ents[i];
@@ -1909,7 +1979,7 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 	return FString::Printf(TEXT(
 		"{\"ok\":%s,\"archetype\":\"%s\",\"requested\":\"%s\",\"ytyp\":\"%s\","
 		"\"rooms\":%d,\"roomNames\":[%s],\"portals\":%d,\"portalRooms\":[%s],"
-		"\"entitySets\":[%s],\"entities\":%d,\"entitiesMissingTransform\":%d,"
+		"\"entitySets\":[%s],\"entitySetActors\":%d,\"entitySetEntitiesSpawned\":%d,\"entitySetEntitiesProxied\":%d,\"entities\":%d,\"entitiesMissingTransform\":%d,"
 		"\"spawned\":%d,\"proxies\":%d,"
 		"\"unresolvedArchetypes\":%d,\"lights\":%d,\"lightsSkipped\":%d,%s"
 		"\"otherExtensions\":%d,\"badAttachedRefs\":%d,\"unroomedEntities\":%d,"
@@ -1918,7 +1988,7 @@ FString URudeToolset::ImportMlo(const FString& CorpusRoot, const FString& MloArc
 		bMloOk ? TEXT("true") : TEXT("false"),
 		*Search.FoundName, *Wanted, *FPaths::GetCleanFilename(Search.FoundFile),
 		Rooms.Num(), *RoomNamesJson, Portals.Num(), *PortalsJson,
-		*SetsJson, Ents.Num(), EntitiesMissingTransform, Spawned, Proxies,
+		*SetsJson, SetActors, SetEntitiesSpawned, SetEntitiesProxied, Ents.Num(), EntitiesMissingTransform, Spawned, Proxies,
 		Unresolved, NumLights, LightsSkipped, *LightProblemJson,
 		OtherExtensions, BadRefs, Unroomed,
 		MeshOk, MeshSkip, MeshFail, MeshMissing, *Tally.ToJson());

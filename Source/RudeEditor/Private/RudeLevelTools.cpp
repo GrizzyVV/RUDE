@@ -2660,6 +2660,40 @@ FString URudeToolset::SetLightField(const FString& ActorLabel, const FString& Li
 		*RudeJsonEscape(A->GetActorLabel()), Idx, *RudeJsonEscape(F), *RudeJsonEscape(Value), LC->Intensity, LC->AttenuationRadius);
 }
 
+// ---- SetEntitySet (agent + Matt) ----------------------------------------------------------
+// Activate / deactivate one of an interior's entity sets in the editor (the game's per-instance
+// defaultEntitySets, ActivateInteriorEntitySet): shows or hides the actor ImportMlo spawned for it.
+FString URudeToolset::SetEntitySet(const FString& InteriorName, const FString& SetName, const FString& Visible)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	const FName IdTag(*(TEXT("RUDE_MLO:") + InteriorName.TrimStartAndEnd()));
+	const FString SetLower = SetName.TrimStartAndEnd().ToLower();
+	const bool bShow = Visible.TrimStartAndEnd().Equals(TEXT("true"), ESearchCase::IgnoreCase) || Visible.TrimStartAndEnd() == TEXT("1");
+	int32 Touched = 0, Instances = 0;
+	TArray<FString> Known;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (!It->Tags.Contains(IdTag)) { continue; }
+		FString ThisSet;
+		for (const FName& T : It->Tags) { const FString S = T.ToString(); if (S.StartsWith(TEXT("RUDE_MLO_EntitySet:"))) { ThisSet = S.Mid(19); } }
+		if (ThisSet.IsEmpty()) { continue; }
+		Known.AddUnique(ThisSet);
+		if (ThisSet.ToLower() != SetLower) { continue; }
+		It->Modify();
+		It->SetActorHiddenInGame(!bShow);
+		TArray<UInstancedStaticMeshComponent*> Isms;
+		It->GetComponents<UInstancedStaticMeshComponent>(Isms);
+		for (UInstancedStaticMeshComponent* C : Isms) { C->SetVisibility(bShow, true); Instances += C->GetInstanceCount(); }
+		It->MarkPackageDirty();
+		++Touched;
+	}
+	if (Touched == 0) { return Fail(FString::Printf(TEXT("no entity set '%s' on interior '%s' (sets present: %s)"), *SetName, *InteriorName, *FString::Join(Known, TEXT(", ")))); }
+	return FString::Printf(TEXT("{\"ok\":true,\"interior\":\"%s\",\"set\":\"%s\",\"visible\":%s,\"actors\":%d,\"instances\":%d,\"setsPresent\":%d}"),
+		*RudeJsonEscape(InteriorName), *RudeJsonEscape(SetName), bShow ? TEXT("true") : TEXT("false"), Touched, Instances, Known.Num());
+}
+
 // ---- PickAt (agent) -----------------------------------------------------------------------
 // What is under a pixel of a CaptureView frame? CamSpec = "x,y,z,pitch,yaw" (';' accepted) as
 // CaptureView; U,V = 0..1 across the frame (aspect = the capture's, default 2103x1230, HFOV 90).
