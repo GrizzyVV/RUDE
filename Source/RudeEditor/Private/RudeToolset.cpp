@@ -852,13 +852,59 @@ namespace RudeYdr
 		// Vertices: parse the whole token STREAM, LineWidth floats per vertex.
 		// (FXmlFile content does not preserve line structure - the 1-vertex-per-
 		// geometry bug of 2026-07-24. Never rely on newlines in XML payloads.)
+		// ⛔ THE NORMAL'S WIDTH COMES FROM THE DATA (2026-09-05). GTAV2 lines carry a 4-component
+		// normal (x y z 0): 17 tokens against the semantic sum of 16, and the old "tokens % width"
+		// check passed by coincidence (288 x 17 = 4896, divisible by 16) - 306 shifted vertices out
+		// to 255 m for a 7 m cloth tarp. FXmlFile flattens <Data> to one line, so the stream stays
+		// flat; the width is chosen among {sum, sum+1} by divisibility AND by the first vertex's
+		// Colour0 decoding as four integers 0..255, with a GTAV2+ layout breaking a tie toward 4.
 		TArray<FString> Toks;
 		VData->GetContent().ParseIntoArrayWS(Toks);
-		if (Toks.Num() % LineWidth != 0)
+		FString LayoutType;
+		if (const FXmlNode* Layout = VB->FindChildNode(TEXT("Layout"))) { LayoutType = Layout->GetAttribute(TEXT("type")); }
+		int32 NormalWidth = SemanticWidth(TEXT("Normal"));
 		{
-			Error = FString::Printf(TEXT("vertex stream misaligned: %d tokens %% %d width = %d - layout mismatch"),
-				Toks.Num(), LineWidth, Toks.Num() % LineWidth);
-			return false;
+			auto ColourSane = [&](int32 NW) -> bool
+			{
+				int32 Off = 0;
+				for (const FString& Sem : Semantics)
+				{
+					const int32 W = (Sem == TEXT("Normal")) ? NW : SemanticWidth(Sem);
+					if (Sem == TEXT("Colour0") || Sem == TEXT("Colour1"))
+					{
+						for (int32 k = 0; k < 4; ++k)
+						{
+							if (!Toks.IsValidIndex(Off + k)) { return false; }
+							const FString& T = Toks[Off + k];
+							if (T.Contains(TEXT("."))) { return false; }
+							const int32 Val = FCString::Atoi(*T);
+							if (Val < 0 || Val > 255) { return false; }
+						}
+						return true;
+					}
+					Off += W;
+				}
+				return true;   // no colour semantic to check against
+			};
+			const bool bHasNormal = Semantics.Contains(TEXT("Normal"));
+			const int32 W3 = LineWidth, W4 = LineWidth + 1;
+			const bool bDiv3 = Toks.Num() % W3 == 0, bDiv4 = bHasNormal && Toks.Num() % W4 == 0;
+			const bool bOk3 = bDiv3 && ColourSane(SemanticWidth(TEXT("Normal")));
+			const bool bOk4 = bDiv4 && ColourSane(SemanticWidth(TEXT("Normal")) + 1);
+			if (bOk3 && bOk4)
+			{
+				// both decode: the layout type decides (GTAV1 = 3-wide; GTAV2 and later = 4-wide)
+				NormalWidth = LayoutType.Equals(TEXT("GTAV1"), ESearchCase::IgnoreCase) ? SemanticWidth(TEXT("Normal")) : SemanticWidth(TEXT("Normal")) + 1;
+			}
+			else if (bOk4) { NormalWidth = SemanticWidth(TEXT("Normal")) + 1; }
+			else if (bOk3) { NormalWidth = SemanticWidth(TEXT("Normal")); }
+			else
+			{
+				Error = FString::Printf(TEXT("vertex stream misaligned: %d tokens, layout '%s' sums to %d (+1 tried) - neither decodes"),
+					Toks.Num(), *LayoutType, LineWidth);
+				return false;
+			}
+			if (NormalWidth != SemanticWidth(TEXT("Normal"))) { LineWidth += 1; }
 		}
 		const int32 NumVerts = Toks.Num() / LineWidth;
 		for (int32 V = 0; V < NumVerts; ++V)
@@ -871,7 +917,7 @@ namespace RudeYdr
 			FVector4f Col1(0, 0, 0, 0);
 			for (const FString& Sem : Semantics)
 			{
-				const int32 W = SemanticWidth(Sem);
+				const int32 W = (Sem == TEXT("Normal")) ? NormalWidth : SemanticWidth(Sem);
 				if (Sem == TEXT("Position"))
 				{
 					Pos = FVector3f(FCString::Atof(*Toks[Off]),
