@@ -681,6 +681,81 @@ public:
 	static FString SetWeaponComponent(const FString& ActorLabel, const FString& AttachPoint,
 	                                  const FString& ComponentName);
 
+	// ---- WP12 ycd_export lane (RudeYcdExport.cpp) ----
+	// Write a clip dictionary (.ycd) back out as the XML the game's own files are spelled in, from
+	// UAnimSequence tracks on a ped skeleton. The write half of ImportClipDictionary. Laws + numbers:
+	// maintainer lane `ycd_export` (`LAWS.md`) - 24,844 .ycd.xml in the corpus, a seeded 303-file sample
+	// (2,206 animations, 2,673 sequences, 106,005 BoneIds rows, 278,075 channels) and a 40-file draw for
+	// the round-trip numbers (10,746 QuantizeFloat channels / 1,382,180 frame values).
+	// XML, NOT BINARY - MEASURED (LAWS.md H): the maintainer's shipped C++ exporter has no .ycd writer
+	// (37 .cpp, the one that names ycd is the reader, 0 named *_write or xml2*), and its Python write
+	// direction is binary->binary donor repack - no ycd module reads XML at all. Packing this XML into a
+	// .ycd image is NOT done here and is NOT claimed.
+	// A TEMPLATE IS REQUIRED. An animation carries eight fields, a sequence three, and the dictionary a
+	// RecordUnknown00 block, that no UAnimSequence models (Unknown10/1C/38/3C, SequenceFrameLimit,
+	// Duration, StartTime/EndTime - EndTime == Duration on only 1,626/1,857 clips, so it is carried, never
+	// recomputed). The template's BYTES are copied and only the channel number lines being authored are
+	// replaced, so an untouched dictionary comes out byte-identical by construction and an authored one is
+	// a surgical diff. Line-oriented on purpose: FXmlFile does not preserve line structure (section 6.5)
+	// and "ten values per line" (131,483/131,483) and "one space per depth" (303/303) are line laws.
+	// HOW A CHANNEL IS WRITTEN, and why the round trip survives it:
+	//   * metres->UE cm->metres is not the float32 identity (1,199,600/1,382,180 exact, worst 3.05e-05 m)
+	//     and the import's quaternion normalise loses a little too (1,259,661/1,259,820, worst 6.56e-07);
+	//   * requantising against the DONOR channel's own Quantum/Offset absorbs both - 1,382,180/1,382,180
+	//     frame values and 1,089,954/1,089,954 rotation labels come back byte-identical. So Quantum and
+	//     Offset are PRESERVED and only the raws are re-derived; re-deriving the quantum is opt-in
+	//     (Options rescale=0 refuses instead) and every rescaled channel is counted and flagged, because
+	//     it needs a wider binary payload than the donor's.
+	//   * a StaticFloat has no quantum to round into (53 labels moved), so it is CARRIED VERBATIM; an
+	//     authored value further than Options statictol from it is a REFUSAL, not a rewrite - making a
+	//     static channel vary is a size change and that is not built.
+	//   * bone tag 0 / track 0 (root translation) is GATED behind Options authorroot=1: a +0.5 m root edit
+	//     crashed the game natively once (maintainer lane `ycd_layer_b`, in-game 2026-08-22, cause still
+	//     unknown) while every structural referee stayed clean. 646/2,206 animations carry a varying root.
+	//   * tracks other than 0 and 1 (43,916 of 106,005 BoneIds rows), IndirectQuantizeFloat (7,736
+	//     channels) and RawFloat (317) are CARRIED and counted - never reshaped, never dropped.
+	//   * a pool-6 channel (37,104 of 131,483 QuantizeFloat) carries RiceSelector and PayloadTail, which
+	//     describe the DONOR's packed payload. This writer rewrites decoded numbers only, so those two
+	//     are carried unchanged and every such channel is COUNTED in channelsPool6Written - a packer has
+	//     to re-derive them. A channel carrying a second value list (<RawValues>, 11 of 131,483) is
+	//     REFUSED rather than half-rewritten.
+	// Floats are spelled the way the corpus spells them: 7 significant digits widening to 9 when 7 does
+	// not round-trip float32, ties AWAY FROM ZERO, %G fixed/scientific, uppercase E with a two-digit
+	// exponent (1,414,618/1,414,618 floats exact over 40 files; plain %.7G matches only 57,737/131,483).
+	// AnimSequenceAssetPaths: ";"-separated UAnimSequence paths. A bare path matches the template
+	// animation whose hash spells the asset's name minus the "A_" prefix (ImportClipDictionary's own
+	// naming, so a round trip needs no mapping); "<hash>=/Game/..." names one explicitly. Empty = author
+	// nothing, i.e. re-emit the template (the true no-op referee: byteIdenticalToTemplate must be true).
+	// ClipNames: ";"-separated animation hashes to restrict the write to; empty = every matched animation.
+	// OutYcdPath: the .ycd.xml file to write (UTF-8, LF, trailing newline - the corpus's own form).
+	// Options: "key=value;..." - template=<corpus ycd name or .ycd.xml path> (REQUIRED),
+	// corpus=<filebase root>, outfit=<URudePedOutfit asset supplying BoneTags>, authorroot=0|1 (default 0),
+	// rescale=0|1 (default 1), statictol=<metres|units> (default 1e-5).
+	// Verdict: {ok, file, template, templateSource, boneMap, animationsInTemplate, animationsAuthored,
+	// byteIdenticalToTemplate, channelsWritten, channelsCarried, channelsRescaled, channelsRefused,
+	// framesWritten, staticCarried, staticRefused, rootChannelsGated, tracksNotAuthored, bonesUnmapped,
+	// bonesWithoutTrack, inverseNotExact, channelsPool6Written, rawValuesRefused, authoredButWroteNothing,
+	// firstRefusal, anims[]}; ok is COMPUTED - false on any refusal, on an unmapped bone, and on a run
+	// that loaded animations and wrote no channel at all (without outfit= that no-op used to report ok
+	// true and byteIdenticalToTemplate true, which reads exactly like a clean round trip).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Write animations from Unreal back out as a GTA V animation dictionary. Give the game dictionary it came from as the template; untouched animations come out exactly as they went in."))
+	static FString ExportClipDictionary(const FString& AnimSequenceAssetPaths, const FString& ClipNames,
+	                                    const FString& OutYcdPath, const FString& Options);
+
+	// Re-read a clip dictionary XML and check it against the corpus's own structural laws, counted:
+	// the declaration and root element (303/303 files), LF-only with a trailing newline (303/303), one
+	// SequenceData item per BoneIds row (2,673/2,673), and per QuantizeFloat channel - Offset == min(Values)
+	// (131,483/131,483), Quantum > 0 (131,483/131,483), len(Values) == the sequence's FrameCount
+	// (131,483/131,483), the line form - at most ten numbers on one line, eleven or more as a block of
+	// ceil(n/10) rows (2,198 one-line and 62,339 block <Values> measured, 0 violations), every raw
+	// non-negative (131,483/131,483), no QuantizeFloat channel with an EMPTY value list (a dictionary
+	// with no animation data in it fails here by name), and whether the quantiser inverse is exact
+	// (131,482/131,483 in the corpus - reported, not required).
+	// The comparator for an export: run it on the written file, then diff against the source with
+	// `compare_ycd.py` (maintainer lane `ycd_export`). Returns JSON; ok is COMPUTED from the laws above.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Check an animation dictionary file RUDE wrote: that it is shaped and spelled the way the game's own files are.", RudeAudience="agent"))
+	static FString ProbeYcdXml(const FString& XmlPath);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

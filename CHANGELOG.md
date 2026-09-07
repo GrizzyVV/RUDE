@@ -16,7 +16,7 @@ looked at it. Anything marked **measured** carries the number it was measured at
 ## [Unreleased]
 
 Everything after the 0.2.0 draft, 2026-07-31 → 2026-09-06. The tool surface went from **24
-tools to 90**; the authoritative per-tool list with each gate's numbers is `AGENTS.md` §3.
+tools to 94**; the authoritative per-tool list with each gate's numbers is `AGENTS.md` §3.
 Nothing below is **proven in-game** unless it says so; **measured** means checked against the
 game's own files (byte-identical where a writer exists, field-by-field otherwise) on the
 maintainer's filebase and never yet loaded by the running game.
@@ -50,6 +50,15 @@ maintainer's filebase and never yet loaded by the running game.
   `ImportTimecycles` / `ExportTimecycles`, `ImportText` / `ExportText`, `BuildBlipCatalog`,
   `ImportAwc` (counts the game's encrypted banks honestly) / `ExportAwc` (your own sounds),
   `CatalogLane` (passthrough catalogs of the game's remaining file types), `DebugDrawNavmesh` (view-only).
+- **Animation write direction:** `ExportClipDictionary` writes UAnimSequence tracks back out as a
+  clip dictionary XML over a REQUIRED template from the game (the template's bytes are copied and
+  only the channel number lines being authored are replaced, so an untouched dictionary is
+  byte-identical by construction), and `ProbeYcdXml` re-reads what it wrote and counts the corpus's
+  structural laws on it. Measured, not assumed: preserving the donor channel's `Quantum`/`Offset`
+  and re-deriving only the raws reproduced 1,382,180/1,382,180 frame values and 1,089,954/1,089,954
+  rotation labels through Unreal's centimetres, and the corpus float spelling was reproduced on
+  1,414,618/1,414,618 floats. XML only - nothing here packs a `.ycd` binary, and neither tool has
+  been run in the editor or loaded by the game yet.
 - **Editor sandbox (PIE):** `SandboxSetup`, a walkable pawn, `Rude.Native` console words that
   mirror FiveM natives (map toggles, clock, interiors, cutscenes, entering a vehicle).
 - **Corpus:** RUDE reads a ledgered filebase (load-order slots + `_FILEBASE.json` /
