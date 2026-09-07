@@ -1324,6 +1324,96 @@ public:
 	static FString ExportCutscene(const FString& LevelSequenceAssetPath, const FString& OutPath,
 	                              const FString& CorpusRoot, const FString& Options);
 
+	// FRAGMENTS, the read half. What does this `.yft` actually own, and who owns it?
+	// A fragment is not one thing: the visual DRAWABLE owns the shader group, the skeleton and the
+	// LOD model blocks (mean 90.46% of the file's bytes, min 38.89%, max 99.91%, over the 237 of 245
+	// measured fragments that have a drawable), while the FRAGMENT hierarchy owns `BoneTransforms`,
+	// `Physics` (mean 7.67%, max 52.80%, n=241 - and that block is NOT only collision: its children
+	// own real drawables on 241 of 245 files, 677 in all, and on 12 of 245 those own geometry, 40 in
+	// all, which a visual replacement leaves as the donor's), `Lights`, `RecordUnknown00` and - on 5 of 245 -
+	// `VehicleGlassWindows`. Bones have TWO owners: `Drawable/Skeleton/Bones` count equals the
+	// top-level `BoneTransforms` count on 237 of 237, which is why the clone lane never touches one.
+	// Reports the top-level and drawable child lists AS SPELLED (not a normalised view), the shader
+	// count, the bone counts, the physics child/group counts, and per LOD block the model count, the
+	// geometry count, how many models are skinned, and the DISTINCT layout semantic lists in play -
+	// because `GTAV1` is a NAME, not a layout: 1,736 of 1,736 measured geometries call their layout
+	// GTAV1 and that one name covers 11 different column sets. Read this before authoring against a
+	// template; it is the sheet `ExportYftClone` will hold you to.
+	// `ok` is COMPUTED and can be false: a fragment with a drawable but no shader table or no LOD
+	// block is a probe that learned nothing.
+	// Returns {ok, name, path, slot, bytes, fragChildren[], hasDrawable, drawableChildren[], shaders,
+	// drawableBones, embeddedTextures, boneTransforms, physChildren, physGroups, physChildDrawables,
+	// physChildGeometries, drawableBytes, drawableFraction, physicsBytes, physicsFraction, lods{},
+	// hiTwinInCorpus, note}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Report what one fragment owns - its drawable, its bones, its physics and its LOD blocks - before you author against it.", RudeAudience="agent"))
+	static FString ProbeYftFragment(const FString& SourceName, const FString& CorpusRoot,
+	                                const FString& Options);
+
+	// FRAGMENTS, the write half - CLONE AND EDIT, which is the only reachable path and here is why.
+	// The writers that reproduce a fragment byte-exact all do it from the ORIGINAL BINARY, carrying
+	// most of its image forward unchanged; a writer that photocopies most of a file cannot construct
+	// one that has no original. So this starts from a fragment the
+	// game already ships (`SourceName`, resolved through the corpus ledger - 42,029 distinct stems,
+	// 16,199 of them in more than one load-order slot, so never by globbing), replaces the geometry
+	// of one LOD block with meshes authored in Unreal, and CARRIES EVERY OTHER BYTE: the physics
+	// hierarchy, the bone transforms, the shader group, the glass windows, the lights, and every
+	// `Unknown*` field nobody has modelled. WHAT IS CARRIED IS NAMED in the verdict, not implied:
+	// `carriedTopLevelBlocks` and `carriedDrawableBlocks` list the blocks copied byte for byte, and
+	// `physChildDrawables`/`physChildGeometries` count what the physics hierarchy is still holding -
+	// its children own real drawables on 241 of 245 measured fragments (677 in all), and on 12 of
+	// 245 those own geometry (40 in all), which a replacement leaves as the DONOR's and warns about.
+	// `MeshAssetPaths`: comma-separated StaticMesh content paths, mesh i -> model i of the target LOD
+	// block. EMPTY = a pure clone, which is the tool's own self-test.
+	// `Options`: `lod=High|Medium|Low|VeryLow` (default High; measured presence over 237 fragments
+	// with a drawable: High 237, Medium 200, Low 198, VeryLow 5 - an unrecognised spelling is
+	// REFUSED, never defaulted); `name=<newname>` to re-spell the fragment's `<Name>` line (A-Z a-z
+	// 0-9 _ - only, and a source with no `<Name>` is refused rather than silently skipped); and
+	// `pair=name|index` (default `name`).
+	// ⛔ HOW A MESH SLOT FINDS ITS GEOMETRY. By SHADER NAME, not by order: `ImportYdr` names every
+	// material slot `<preset>__<n>` and every template geometry resolves its `<ShaderIndex>` to a
+	// preset (1,736 of 1,736 measured indices are in range), so the two are matched by name and
+	// Unreal's polygon-group order never has to be assumed to agree with the fragment's document
+	// order. Where one preset repeats inside a model (216 of 644 measured models) the name cannot
+	// separate those geometries and the residual order assumption is COUNTED as
+	// `pairsSharingAShaderName`. If the names cannot be matched the run REFUSES; `pair=index` opts
+	// into mesh slot i -> geometry i, an order NOBODY HAS MEASURED, and reports itself as
+	// `byIndexUnverified` with a warning.
+	// ⛔ THE MEASURE, and the tool computes it rather than claiming it: a clone that replaces NOTHING
+	// must reproduce the source byte for byte (proven 245/245 on the corpus by the lane's own
+	// instrument), and a run that fails that writes nothing at all. Replacing one geometry changes
+	// only that geometry's own contiguous span (proven 237/237).
+	// REFUSES LOUDLY, and writes nothing when it does: a source with no `<Drawable>` (8 of 245 - the
+	// cloth and flag fragments); a mesh count that does not equal the LOD block's model count; a mesh
+	// whose material slot count does not equal the template model's geometry count (the shader index
+	// is the only join the file gives us); a template geometry whose layout carries
+	// BlendWeights/BlendIndices against a UStaticMesh that has no skinning to give it (34 of 644
+	// measured models are skinned); a layout semantic this lane cannot author; an empty material slot.
+	// Columns that exist in the layout but not in the mesh are written NEUTRAL and COUNTED, never
+	// guessed: `colourValuesNeutral`, `tangentValuesNeutral`, `uvChannelsSynthesised`. A replaced
+	// geometry's bounding box has its x/y/z recomputed and its `w` written to match `x`, because `w`
+	// equals `x` on 3,472 of 3,472 measured geometry bbox lines - counted as `bboxWFollowedX`, and
+	// ⛔ nobody has modelled what `w` means; this follows the corpus's invariant, it does not
+	// understand it.
+	// ⚠ XML INTERCHANGE ONLY. Nothing packs a fragment XML back into a `.yft` - the fragment code
+	// that exists decodes, and the writers that reproduce one are keyed to its original binary - and
+	// section 6.7 says drawables need BINARY on both FiveM Legacy and Enhanced. So the game cannot
+	// load what this writes; the binary fragment writer is a separate lane and is NOT BUILT. The
+	// verdict says so in `note` on every run.
+	// ⚠ The `_hi` twin is a SEPARATE fragment (936 of 936 `_hi` stems have a base twin; the twin
+	// carries more geometries than its base on 8 of 8 sampled pairs). Cloning the base warns that the
+	// twin was not cloned rather than quietly shipping half a vehicle.
+	// Returns {ok, written, source, sourcePath, slot, outPath, sourceBytes, outBytes, byteIdentical,
+	// pureClone, renamed, lodRequested, targetLod, models, templateGeometries, shaders, meshesGiven,
+	// geometriesReplaced, verticesWritten, trianglesWritten, pairing, pairedByShaderName,
+	// pairedByIndexUnverified, pairsSharingAShaderName, bytesRewritten, bytesCarriedVerbatim,
+	// carriedFraction, colourValuesNeutral, tangentValuesNeutral, uvChannelsSynthesised,
+	// bboxWFollowedX, physChildDrawables, physChildGeometries, fragChildren[], drawableChildren[],
+	// carriedTopLevelBlocks[], carriedDrawableBlocks[], hiTwinInCorpus, refusals[], warnings[], note}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Copy a game fragment and swap its visual geometry for meshes you authored, keeping every byte RUDE does not understand.", RudeAudience="agent"))
+	static FString ExportYftClone(const FString& SourceName, const FString& MeshAssetPaths,
+	                              const FString& OutYftPath, const FString& CorpusRoot,
+	                              const FString& Options);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);
