@@ -969,6 +969,70 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Paint an imported weapon in one of the colours the game gives it. Give the weapon actor's name and the tint number, counting from 0."))
 	static FString SetWeaponTint(const FString& ActorLabel, const FString& TintIndex);
 
+	// ---- product debt (maintainer lane `product_debt`) ----
+	// THE AREA CATALOG `ImportArea` ASKS FOR, DERIVED FROM THE CORPUS ITSELF. Until this tool
+	// existed the repository shipped no catalog and `ImportArea` could only answer "cannot read
+	// the area catalog" - a named tool with no data behind it (AGENTS §9).
+	// Walks the corpus ledger's ymap rows (the copy the game would LOAD, one per name), reads each
+	// one's declared `<entitiesExtentsMin/Max>` and counts its `CEntityDef` items, groups them into
+	// prefix families, and files each family under the region the game's OWN `popzone.ipl` puts its
+	// centre in (smallest containing box wins - popzone nests districts inside catch-alls).
+	// Writes ONE JSON array in the schema `ImportArea` already reads: {alias, prefixes[]} plus
+	// provenance fields that reader ignores (source, named, ymaps, entities, zone, extentMin/Max,
+	// note). Two kinds of entry:
+	//   "prefix" - one per ymap family, alias = the prefix. Always resolvable, never a guess.
+	//   "zone"   - one per popzone region word, prefixes = every family whose ymaps mostly land in
+	//              it. This is the human name, and it is the game's own word, not an invention.
+	// A family the region data cannot place keeps the prefix as its alias and SAYS SO in `note` -
+	// no name is ever fabricated. An alias that would collide case-insensitively with a prefix
+	// alias is suffixed " (zone)", because `ImportArea` matches exactly and breaks on the first hit,
+	// so a duplicate name would silently make the second entry unreachable.
+	// CorpusRoot: a ledgered filebase. OutJsonPath: absolute *.json; EMPTY writes
+	// <plugin>/Catalogs/area_aliases.json, exactly where `ImportArea` looks with an empty CatalogPath.
+	// ⛔ THE CATALOG IS NEVER SHIPPED WITH RUDE. It is derived from the game's own files, and this
+	// repository ships no game data - so every user generates their own with this tool, from their own
+	// install. `ImportArea` refuses until they do, and names this tool when it refuses.
+	// ⚠ COST: it reads every effective ymap in full - 11,086 files, 9,956,359,597 bytes on the
+	// maintainer's corpus (maintainer lane `product_debt`, `measure_product_debt.json`). The Python
+	// twin that measured it took 19.2 s with the OS cache warm; a first run on a cold cache is
+	// materially slower, and this C++ has never been run, so no timing for it is quoted here. It is a
+	// once-per-corpus generator, not a per-session call.
+	// Returns JSON: {ok, outPath, wrote, entries, prefixEntries, zoneEntries, aliasCollisionsSuffixed,
+	// families, familiesWithZone, familiesWithoutZone, zonesParsed, popzone, ymapsListed, ymapsRead,
+	// ymapsMissing, ymapsNoExtents, ymapsDegenerateExtents, ymapsZoned, ymapsUnzoned, entities,
+	// xmlBytesRead} or {ok:false, error}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Build the list of district names you can type into ImportArea, worked out from your own game folder. Run it once after you point RUDE at a new folder.", RudeAudience="agent"))
+	static FString BuildAreaCatalog(const FString& CorpusRoot, const FString& OutJsonPath);
+
+	// ONE CALL THAT ANSWERS "why doesn't this work on my machine". Pure diagnosis: it reads, it
+	// never writes, and it never regenerates anything. Checks, in order, the things a new user gets
+	// wrong: the engine version RUDE is measured against (5.8); whether RUDE and ToolsetRegistry are
+	// present AND enabled (a disabled ToolsetRegistry costs the whole tool surface) and whether the
+	// OPTIONAL ModelContextProtocol surface is there - reported, never a fault, because the panel and
+	// the CLI are whole surfaces without it; whether the plugin's own Content mounted (an unmounted
+	// /RUDE/Masters fails deep inside an import instead of here); how many master materials exist and
+	// whether any is stale - by CALLING RudeGeneratedMasterHealth, the single rule the generators
+	// themselves call, so the doctor cannot drift from it (it covers the generated masters plus
+	// M_RUDE_Detail and M_RUDE_Cutout; the other four named masters have no upgrade rule to check);
+	// whether an area catalog is present and parses; whether CorpusRoot is a LEDGERED filebase or
+	// just a flat folder of XML (both are folders - only one has the manifest every corpus lookup
+	// goes through) and, when it is ledgered, its title, rout version, row count and per-lane rows;
+	// and whether there is an editor world at all.
+	// CorpusRoot: a filebase to check; EMPTY skips only the corpus section (it is reported as
+	// checked:false, never as a pass).
+	// Every fault found is one plain sentence in `problemList`, and `ok` is COMPUTED as
+	// "problems == 0" - a doctor that always says ok is not a doctor. An OPTIONAL surface that is
+	// absent is reported in `plugins` and is NOT a problem: a false alarm on the headline signal
+	// teaches people to ignore the headline.
+	// ❓ Neither this tool nor BuildAreaCatalog has been run in the editor: they were written and
+	// reviewed on 2026-09-07 and the gate that exercises them (`gate.jsonl`) has not been executed.
+	// Returns JSON: {ok, problems, problemList, engine, engineExpected, engineMatches, plugins,
+	// pluginsEnabled, mastersMounted, masters, generatedMasters, staleMasters, unparsedMasters,
+	// staleMasterNames, catalogPath, catalogPresent, catalogEntries, corpus, headless, unattended,
+	// editorWorld}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Check this machine and say what is wrong: engine version, plugins, materials, the district list, and whether your game folder is the kind RUDE can read."))
+	static FString RudeDoctor(const FString& CorpusRoot);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

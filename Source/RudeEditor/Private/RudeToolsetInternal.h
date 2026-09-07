@@ -24,6 +24,24 @@ bool RudeSaveDirty(bool bMaps, bool bContent);
 extern int32 GRudeLastSaved, GRudeLastSaveFailed;
 // Sum of an integer field across a JSON verdict list (batch tools fold per-item verdicts with it).
 int32 RudeSumField(const FString& Json, const TCHAR* Key);
+// ---- generated-master staleness (RudeToolset.cpp) ----
+// THE definition of "stale" for a master RUDE generates, so that there is exactly one and every
+// generator that upgrades a master in place (EnsureGeneratedMaster, EnsureDetailMaster,
+// EnsureCutoutMaster) and the reporter (RudeDoctor) all call it instead of each keeping a copy.
+// Unreadable = the material would not load, or the name is not one this rule covers; that is
+// counted separately and never reported as healthy. OutWhy is a plain phrase naming the failed
+// condition, empty when Healthy.
+enum class ERudeMasterHealth : uint8 { Healthy, Stale, Unreadable };
+ERudeMasterHealth RudeGeneratedMasterHealth(class UMaterial* M, const FString& AssetName, FString& OutWhy);
+
+// ---- fxmanifest merge (RudeMapLanes.cpp) ----
+// Merge the directives a RUDE export REQUIRES into an fxmanifest.lua that may already carry a
+// person's own `client_script` / `files` lines. Keeps the existing bytes VERBATIM and appends only
+// the directives the file does not already declare. OutPreserved = lines the existing file had (all
+// carried through), OutAlready = required directives it already declared, OutAdded = directives
+// appended. False only when the write itself failed (OutError says why).
+bool RudeMergeManifest(const FString& Path, const TArray<FString>& RequiredLines,
+                       int32& OutPreserved, int32& OutAlready, int32& OutAdded, FString& OutError);
 
 // ---- import plumbing shared by RudeToolset.cpp (single-file lanes) and RudeMapLanes.cpp (map/area) ----
 // Every scoping signal a caller can PROVE for texture resolution; nothing here is inferred from a path.

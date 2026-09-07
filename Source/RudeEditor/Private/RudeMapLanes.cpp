@@ -29,6 +29,7 @@
 #include "UObject/SavePackage.h"
 #include "Framework/Application/SlateApplication.h"
 #include "XmlFile.h"
+#include "Misc/EngineVersion.h"
 #include "RudeCorpus.h"
 #include "RudeDds.h"
 #include "RudeEntityComponent.h"
@@ -1230,18 +1231,25 @@ FString URudeToolset::ImportArea(const FString& AreaName, const FString& Catalog
 	{
 		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *Why);
 	};
-	// An empty CatalogPath means the catalog bundled with the plugin (<plugin>/Catalogs/area_aliases.json),
-	// so a user never has to know where the file lives. Until that file ships, the tool says so by name.
+	// An empty CatalogPath means the catalog beside the plugin (<plugin>/Catalogs/area_aliases.json).
+	// ⛔ RUDE SHIPS NO CATALOG AND NEVER WILL: it is derived from the game's own files, and this
+	// repository's promise is that no game data lives in it. So an absent catalog is not a broken
+	// tool - it is a tool whose data has not been generated yet, on this machine, from this user's
+	// own install. The refusal therefore names the ONE command that makes it: a missing catalog must
+	// read as "run this", never as "this is broken".
 	FString Catalog = CatalogPath.TrimStartAndEnd();
+	bool bBundledPath = false;
 	if (Catalog.IsEmpty())
 	{
 		const TSharedPtr<IPlugin> Self = IPluginManager::Get().FindPlugin(TEXT("RUDE"));
-		if (Self.IsValid()) { Catalog = Self->GetBaseDir() / TEXT("Catalogs") / TEXT("area_aliases.json"); }
+		if (Self.IsValid()) { Catalog = Self->GetBaseDir() / TEXT("Catalogs") / TEXT("area_aliases.json"); bBundledPath = true; }
 	}
 	FString Raw;
 	if (Catalog.IsEmpty() || !FFileHelper::LoadFileToString(Raw, *Catalog))
 	{
-		return Fail(FString::Printf(TEXT("cannot read the area catalog at %s - pass CatalogPath, or use ImportMapArea with a ymap prefix"), *Catalog));
+		return Fail(bBundledPath
+			? FString::Printf(TEXT("no area catalog at %s - RUDE ships none (it is derived from your own game files): run BuildAreaCatalog once, with your CorpusRoot and an empty OutJsonPath, to write it there - or use ImportMapArea with a ymap prefix"), *Catalog)
+			: FString::Printf(TEXT("cannot read the area catalog at %s - run BuildAreaCatalog to write one, give a different CatalogPath, or use ImportMapArea with a ymap prefix"), *Catalog));
 	}
 	TArray<TSharedPtr<FJsonValue>> Entries;
 	{
@@ -2413,15 +2421,33 @@ FString URudeToolset::ExportYmap(const FString& EntitiesJsonPath, const FString&
 	{
 		return Fail(TEXT("failed to write ymap"));
 	}
-	const FString Manifest = TEXT(
-		"fx_version 'cerulean'\ngame 'gta5'\n\n"
-		"author 'RUDE - RAGE <-> Unreal Development Environment'\n"
-		"description 'RUDE-authored placement resource'\n\n"
-		"-- Required for streamed ymaps to take effect (reloads map storage on load).\n"
-		"this_is_a_map 'yes'\n");
-	FFileHelper::SaveStringToFile(Manifest, *(OutDir / TEXT("fxmanifest.lua")),
-		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
-	return FString::Printf(TEXT("{\"ok\":true,\"ymapPath\":\"%s\",\"entities\":%d}"), *YmapPath, Count);
+	// ⛔ MERGE, NEVER OVERWRITE (AGENTS §9, fixed in maintainer lane `product_debt`). This write was
+	// unconditional: a second export into a resource folder someone had added `client_script` or
+	// `files` to deleted those lines, silently, and the write result was not even tested. A resource
+	// folder is the user's. RudeMergeManifest keeps every byte the file already has and appends only
+	// the directives it does not already declare - so a hand-added line survives any number of
+	// exports, and the second export over a complete manifest writes nothing at all.
+	const TArray<FString> RequiredManifest = {
+		TEXT("fx_version 'cerulean'"),
+		TEXT("game 'gta5'"),
+		TEXT(""),
+		TEXT("author 'RUDE - RAGE <-> Unreal Development Environment'"),
+		TEXT("description 'RUDE-authored placement resource'"),
+		TEXT(""),
+		TEXT("-- Required for streamed ymaps to take effect (reloads map storage on load)."),
+		TEXT("this_is_a_map 'yes'")
+	};
+	int32 ManifestPreserved = 0, ManifestAlready = 0, ManifestAdded = 0;
+	FString ManifestError;
+	const bool bManifest = RudeMergeManifest(OutDir / TEXT("fxmanifest.lua"), RequiredManifest,
+		ManifestPreserved, ManifestAlready, ManifestAdded, ManifestError);
+	// ok is COMPUTED over BOTH writes: a ymap whose resource has no manifest does not load, so a
+	// verdict that said ok:true on the strength of the ymap alone would be lying about the product.
+	return FString::Printf(TEXT(
+		"{\"ok\":%s,\"ymapPath\":\"%s\",\"entities\":%d,\"manifestLinesPreserved\":%d,")
+		TEXT("\"manifestDirectivesAlreadyPresent\":%d,\"manifestDirectivesAdded\":%d,\"manifestError\":\"%s\"}"),
+		bManifest ? TEXT("true") : TEXT("false"), *YmapPath, Count,
+		ManifestPreserved, ManifestAlready, ManifestAdded, *RudeJsonEscape(ManifestError));
 }
 
 FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& DestFolder,
@@ -2687,10 +2713,16 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 // the moment the CLI tried to persist 1,954 freshly imported dictionaries. Headless, every dirty
 // content package is saved directly through UPackage::SavePackage - no prompt, no notification,
 // no Slate - and the count of what was written is what the caller gets.
+// The names behind the counts. A verdict that says "saved 3032" and cannot say WHICH is not
+// checkable by the caller, and this is the one choke point every agent chain persists through.
+// Only the headless leg can fill these: FEditorFileUtils::SaveDirtyPackages returns one bool and
+// no names at all, which SaveAssets reports as namesKnown:false rather than as an empty list.
+static TArray<FString> GRudeSaveWroteNames, GRudeSaveFailedNames;
 int32 GRudeLastSaved = 0, GRudeLastSaveFailed = 0;
 bool RudeSaveDirty(bool bMaps, bool bContent)   // declared in RudeToolsetInternal.h
 {
 	GRudeLastSaved = 0; GRudeLastSaveFailed = 0;
+	GRudeSaveWroteNames.Reset(); GRudeSaveFailedNames.Reset();
 	if (!FSlateApplication::IsInitialized())
 	{
 		TArray<UPackage*> Dirty;
@@ -2702,7 +2734,10 @@ bool RudeSaveDirty(bool bMaps, bool bContent)   // declared in RudeToolsetIntern
 			const bool bIsMap = UWorld::FindWorldInPackage(Pkg) != nullptr;
 			const FString Ext = bIsMap ? FPackageName::GetMapPackageExtension() : FPackageName::GetAssetPackageExtension();
 			FString Filename;
-			if (!FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), Filename, Ext)) { ++GRudeLastSaveFailed; continue; }
+			if (!FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), Filename, Ext))
+			{
+				++GRudeLastSaveFailed; GRudeSaveFailedNames.Add(Pkg->GetName()); continue;
+			}
 			FSavePackageArgs Args;
 			Args.TopLevelFlags = RF_Public | RF_Standalone;
 			Args.SaveFlags = SAVE_NoError;
@@ -2719,11 +2754,13 @@ bool RudeSaveDirty(bool bMaps, bool bContent)   // declared in RudeToolsetIntern
 			if (R == ESavePackageResult::Success)
 			{
 				++GRudeLastSaved;
+				GRudeSaveWroteNames.Add(Filename);
 				if (bExisted) { FM.Delete(*Aside, false, true, true); }
 			}
 			else
 			{
 				++GRudeLastSaveFailed;
+				GRudeSaveFailedNames.Add(Pkg->GetName() + FString::Printf(TEXT(" (result %d)"), (int32)R.Result));
 				if (bExisted) { FM.Move(*Filename, *Aside, true, true, true, true); }
 				UE_LOG(LogTemp, Warning, TEXT("[RUDE] save FAILED %s -> %s (result %d%s)"), *Pkg->GetName(), *Filename,
 					(int32)R.Result, bExisted ? TEXT(", existing file restored") : TEXT(""));
@@ -2748,10 +2785,30 @@ FString URudeToolset::SaveAssets()
 	// Content packages only (bSaveMapPackages=false) - an agent persisting its imports must not
 	// silently commit the operator's level edits.
 	const bool bOk = RudeSaveDirty(/*bMaps*/ false, /*bContent*/ true);
-	return FString::Printf(TEXT("{\"ok\":%s,\"saved\":%d,\"saveFailed\":%d,\"headless\":%s,\"unattended\":%s}"),
+	// ⭐ WHAT IT WROTE, NOT JUST HOW MANY (maintainer lane `product_debt`). The headless leg saves
+	// each package by name, so it can name them; the interactive leg goes through
+	// FEditorFileUtils::SaveDirtyPackages, which reports one overall bool and no names at all -
+	// that is reported as namesKnown:false rather than as an empty list, because an empty list and
+	// "this path cannot tell you" are different facts and only one of them is a pass.
+	const bool bNames = !FSlateApplication::IsInitialized();
+	FString WroteJson, FailedJson;
+	for (int32 Ni = 0; Ni < GRudeSaveWroteNames.Num() && Ni < 40; ++Ni)
+	{
+		WroteJson += FString::Printf(TEXT("%s\"%s\""), WroteJson.IsEmpty() ? TEXT("") : TEXT(","),
+			*RudeJsonEscape(GRudeSaveWroteNames[Ni]));
+	}
+	for (int32 Ni = 0; Ni < GRudeSaveFailedNames.Num() && Ni < 40; ++Ni)
+	{
+		FailedJson += FString::Printf(TEXT("%s\"%s\""), FailedJson.IsEmpty() ? TEXT("") : TEXT(","),
+			*RudeJsonEscape(GRudeSaveFailedNames[Ni]));
+	}
+	return FString::Printf(TEXT(
+		"{\"ok\":%s,\"saved\":%d,\"saveFailed\":%d,\"headless\":%s,\"unattended\":%s,")
+		TEXT("\"namesKnown\":%s,\"wrote\":[%s],\"couldNotWrite\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"), GRudeLastSaved, GRudeLastSaveFailed,
 		FSlateApplication::IsInitialized() ? TEXT("false") : TEXT("true"),
-		FApp::IsUnattended() ? TEXT("true") : TEXT("false"));
+		FApp::IsUnattended() ? TEXT("true") : TEXT("false"),
+		bNames ? TEXT("true") : TEXT("false"), *WroteJson, *FailedJson);
 }
 
 FString URudeToolset::SetWorldHour(const FString& Hour)
@@ -3532,4 +3589,668 @@ FString URudeToolset::ImportScene(const FString& ManifestPath, const FString& Me
 		MalformedEntities, NumInstances, NumProxies,
 		UniqueMeshes, UniqueMeshLookups, Missing.Num(), *TopMissing,
 		bActors ? TEXT("ACTORS") : TEXT("ISM"), NumActors, LodLinks, LodUnresolved, LodPartial);
+}
+
+// ============================================================================================
+// PRODUCT DEBT (maintainer lane `product_debt`): the fxmanifest merge, the area catalog
+// generator, and the environment doctor. Appended to the map/area lane because every one of
+// them already needs what this translation unit includes - the corpus reader, the plugin
+// manager, the asset registry - and a NEW .cpp is not compiled until the module's file list is
+// invalidated, whose only symptom is a link error.
+// ============================================================================================
+
+// ⛔ WHY THIS EXISTS - `ExportYmap` OVERWROTE `fxmanifest.lua` UNCONDITIONALLY (AGENTS §9).
+// A FiveM resource folder belongs to a person, not to a tool: the moment someone adds
+// `client_script 'main.lua'` or a `files { }` block beside the exported ymap, the next export
+// deleted it with no prompt and no record. Merging is the only honest write - keep the file's
+// bytes verbatim, append only the directives it does not already declare, and COUNT what was
+// preserved so a caller reads it in the verdict instead of taking it on trust.
+//
+// "Already declares" is tested on the DIRECTIVE KEY (the first token of the line), never on the
+// whole line: `this_is_a_map "yes"` in double quotes is the same directive as ours, and appending
+// a second copy would silently override the person's value (an fxmanifest is last-wins). Their
+// spelling stands; only what is absent gets added.
+//
+// A blank or `--` line in RequiredLines is DECORATION that rides with the next directive - it is
+// emitted only when that directive is. So a second export over an already-complete manifest adds
+// nothing, writes nothing, and leaves the file byte-identical.
+bool RudeMergeManifest(const FString& Path, const TArray<FString>& RequiredLines,
+                       int32& OutPreserved, int32& OutAlready, int32& OutAdded, FString& OutError)
+{
+	OutPreserved = 0;
+	OutAlready = 0;
+	OutAdded = 0;
+	OutError.Empty();
+
+	auto KeyOf = [](const FString& Line) -> FString
+	{
+		const FString T = Line.TrimStartAndEnd();
+		if (T.IsEmpty() || T.StartsWith(TEXT("--"))) { return FString(); }
+		int32 Cut = INDEX_NONE;
+		for (int32 Ci = 0; Ci < T.Len(); ++Ci)
+		{
+			const TCHAR C = T[Ci];
+			if (FChar::IsWhitespace(C) || C == TEXT('(') || C == TEXT('{') || C == TEXT('\'')
+				|| C == TEXT('"'))
+			{
+				Cut = Ci;
+				break;
+			}
+		}
+		return (Cut == INDEX_NONE ? T : T.Left(Cut)).ToLower();
+	};
+
+	FString Existing;
+	const bool bHad = FFileHelper::LoadFileToString(Existing, *Path);
+	TSet<FString> Present;
+	if (bHad)
+	{
+		TArray<FString> Lines;
+		Existing.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
+		OutPreserved = Lines.Num();
+		for (const FString& L : Lines)
+		{
+			const FString K = KeyOf(L);
+			if (!K.IsEmpty()) { Present.Add(K); }
+		}
+	}
+
+	FString Additions;
+	FString PendingDecoration;
+	for (const FString& Req : RequiredLines)
+	{
+		const FString K = KeyOf(Req);
+		if (K.IsEmpty())
+		{
+			PendingDecoration += Req + TEXT("\n");
+			continue;
+		}
+		if (Present.Contains(K))
+		{
+			++OutAlready;
+			PendingDecoration.Empty();
+			continue;
+		}
+		Additions += PendingDecoration + Req + TEXT("\n");
+		PendingDecoration.Empty();
+		Present.Add(K);
+		++OutAdded;
+	}
+	// Nothing missing and the file is already there: do not touch it. This is what makes a second
+	// export byte-identical to the first, which is the gate this merge is measured by.
+	if (OutAdded == 0 && bHad) { return true; }
+
+	FString Out = bHad ? Existing : FString();
+	if (!Out.IsEmpty() && !Out.EndsWith(TEXT("\n"))) { Out += TEXT("\n"); }
+	Out += Additions;
+	if (!FFileHelper::SaveStringToFile(Out, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		OutError = FString::Printf(TEXT("cannot write %s"), *Path);
+		return false;
+	}
+	return true;
+}
+
+// ---- BuildAreaCatalog (agent) ---------------------------------------------------------------
+// One popzone row: an axis-aligned box and the region word the game files under it.
+struct FRudeAreaZoneBox
+{
+	FString Region;
+	double MinX = 0.0, MinY = 0.0, MinZ = 0.0, MaxX = 0.0, MaxY = 0.0, MaxZ = 0.0;
+	double FootprintArea() const { return (MaxX - MinX) * (MaxY - MinY); }
+};
+
+// One ymap prefix family, accumulated over the ymaps that belong to it.
+struct FRudeAreaFamily
+{
+	int32 Ymaps = 0, Entities = 0, WithExtents = 0;
+	bool bHasExtent = false;
+	double MinX = 0.0, MinY = 0.0, MinZ = 0.0, MaxX = 0.0, MaxY = 0.0, MaxZ = 0.0;
+	TMap<FString, int32> Zones;   // region word -> ymaps whose centre landed in it
+};
+
+// THE FAMILY RULE, stated so it can be argued with: the first underscore-separated token of the
+// ymap's name, and the first TWO when that token is shorter than three characters (`v_michael`,
+// `id2_28` - a one- or two-letter head is a namespace letter, not a district). Measured over the
+// corpus in maintainer lane `product_debt` (`LAWS.md`); it is a NAMING rule, not a spatial one,
+// which is exactly why the catalog also carries a zone-named entry derived from the game's data.
+static FString RudeAreaFamilyOf(const FString& Name)
+{
+	TArray<FString> Toks;
+	Name.ParseIntoArray(Toks, TEXT("_"), /*bCullEmpty*/ false);
+	if (Toks.Num() >= 2 && Toks[0].Len() < 3) { return Toks[0] + TEXT("_") + Toks[1]; }
+	return Toks.Num() > 0 ? Toks[0] : Name;
+}
+
+// Read `<Tag ... x="" y="" z="" />` out of an XML document. Deliberately a token scan and not
+// FXmlFile: a 29 GB corpus of ymaps must not be DOM-parsed to read six numbers off the header.
+static bool RudeAreaReadVec(const FString& Doc, const TCHAR* Tag, double& OutX, double& OutY, double& OutZ)
+{
+	const int32 At = Doc.Find(Tag, ESearchCase::CaseSensitive, ESearchDir::FromStart, 0);
+	if (At == INDEX_NONE) { return false; }
+	const int32 Close = Doc.Find(TEXT("/>"), ESearchCase::CaseSensitive, ESearchDir::FromStart, At);
+	if (Close == INDEX_NONE) { return false; }
+	const FString Seg = Doc.Mid(At, Close - At);
+	auto Attr = [&Seg](const TCHAR* Key, double& Out) -> bool
+	{
+		const int32 K = Seg.Find(Key, ESearchCase::CaseSensitive, ESearchDir::FromStart, 0);
+		if (K == INDEX_NONE) { return false; }
+		const int32 Q1 = Seg.Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, K);
+		if (Q1 == INDEX_NONE) { return false; }
+		const int32 Q2 = Seg.Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, Q1 + 1);
+		if (Q2 == INDEX_NONE) { return false; }
+		Out = FCString::Atod(*Seg.Mid(Q1 + 1, Q2 - Q1 - 1));
+		return true;
+	};
+	return Attr(TEXT("x=\""), OutX) && Attr(TEXT("y=\""), OutY) && Attr(TEXT("z=\""), OutZ);
+}
+
+static FString RudeAreaVecJson(bool bHas, double X, double Y, double Z)
+{
+	if (!bHas) { return TEXT("null"); }
+	return FString::Printf(TEXT("[%.6f,%.6f,%.6f]"), X, Y, Z);
+}
+
+FString URudeToolset::BuildAreaCatalog(const FString& CorpusRoot, const FString& OutJsonPath)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	const FString Root = CorpusRoot.TrimStartAndEnd();
+	if (Root.IsEmpty()) { return Fail(TEXT("CorpusRoot is empty")); }
+
+	FString OpenError;
+	const TSharedPtr<FRudeCorpus> Corpus = FRudeCorpus::Open(Root, OpenError);
+	if (!Corpus.IsValid()) { return Fail(OpenError); }
+
+	// ---- 1) the game's own region data: popzone.ipl -----------------------------------------
+	// `zone` section, one comma-separated row per zone:
+	//     id, minX, minY, minZ, maxX, maxY, maxZ, regionWord, flag
+	// The region word is the game's OWN name for the district, which is the whole reason the
+	// catalog can carry a human alias at all. Absent (a corpus exported without common.rpf), the
+	// catalog still builds - every entry is then a prefix entry, marked as such.
+	TArray<FRudeAreaZoneBox> Zones;
+	FString ZonePath;
+	if (const FRudeCorpusEntry* ZoneEntry = Corpus->Effective(TEXT("ipl"), TEXT("popzone")))
+	{
+		ZonePath = Corpus->PathOf(*ZoneEntry);
+		TArray<FString> ZoneLines;
+		FFileHelper::LoadFileToStringArray(ZoneLines, *ZonePath);
+		for (const FString& RawLine : ZoneLines)
+		{
+			const FString L = RawLine.TrimStartAndEnd();
+			if (L.IsEmpty() || L.StartsWith(TEXT("#"))) { continue; }
+			TArray<FString> Fields;
+			L.ParseIntoArray(Fields, TEXT(","), /*bCullEmpty*/ false);
+			if (Fields.Num() < 8) { continue; }
+			double V[6] = { 0, 0, 0, 0, 0, 0 };
+			bool bNumeric = true;
+			for (int32 Fi = 0; Fi < 6; ++Fi)
+			{
+				const FString S = Fields[Fi + 1].TrimStartAndEnd();
+				// ⛔ NOT FString::IsNumeric(): it takes a sign, digits and at most one '.' and has NO
+				// exponent branch - and popzone.ipl spells four of its OWN z values as exponents (FrW47
+				// 2.19345e-005, FrW42 -2.28882e-005, ZVCan7 -1.52588e-005, FrW117 2.28882e-005). Replaying
+				// that predicate over the file parses 1,317 of 1,321 rows and drops four named regions -
+				// Paleto, Mount Chiliad, Vespucci Canals, Braddock Pass - on the floor, silently.
+				// LexTryParseString routes to FCString::Atod, so it takes the exponent, and it still
+				// refuses a non-numeric token (replayed over the real file in compare_product_debt.py).
+				if (S.IsEmpty() || !LexTryParseString(V[Fi], *S)) { bNumeric = false; break; }
+				V[Fi] = FCString::Atod(*S);
+			}
+			if (!bNumeric) { continue; }
+			FRudeAreaZoneBox Box;
+			Box.Region = Fields[7].TrimStartAndEnd();
+			Box.MinX = V[0]; Box.MinY = V[1]; Box.MinZ = V[2];
+			Box.MaxX = V[3]; Box.MaxY = V[4]; Box.MaxZ = V[5];
+			if (Box.Region.IsEmpty()) { continue; }
+			Zones.Add(Box);
+		}
+	}
+
+	// ---- 2) every ymap the game would load, once ---------------------------------------------
+	TArray<const FRudeCorpusEntry*> Ymaps;
+	Corpus->ByPrefix(TEXT("ymap"), FString(), Ymaps);
+	if (Ymaps.Num() == 0) { return Fail(TEXT("the corpus ledger lists no ymap rows")); }
+
+	TMap<FString, FRudeAreaFamily> Families;
+	int32 Read = 0, Missing = 0, NoExtents = 0, Degenerate = 0, Zoned = 0, Unzoned = 0;
+	int64 TotalEntities = 0, TotalBytes = 0;
+	for (const FRudeCorpusEntry* E : Ymaps)
+	{
+		const FString Path = Corpus->PathOf(*E);
+		FString Doc;
+		if (!FFileHelper::LoadFileToString(Doc, *Path)) { ++Missing; continue; }
+		++Read;
+		// The FILE's byte length, not Doc.Len(): LoadFileToString DECODES, so Doc.Len() is a TCHAR
+		// count that equals the byte count only while every ymap is pure ASCII. The Python twin's
+		// denominator (measure_product_debt.py) is raw bytes, and a field named `bytes` must mean bytes.
+		const int64 OnDisk = IFileManager::Get().FileSize(*Path);
+		if (OnDisk > 0) { TotalBytes += OnDisk; }
+
+		int32 Ents = 0;
+		int32 Hit = Doc.Find(TEXT("type=\"CEntityDef\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, 0);
+		while (Hit != INDEX_NONE)
+		{
+			++Ents;
+			Hit = Doc.Find(TEXT("type=\"CEntityDef\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, Hit + 1);
+		}
+		TotalEntities += Ents;
+
+		FRudeAreaFamily& Fam = Families.FindOrAdd(RudeAreaFamilyOf(E->Name));
+		++Fam.Ymaps;
+		Fam.Entities += Ents;
+
+		double Ax = 0, Ay = 0, Az = 0, Bx = 0, By = 0, Bz = 0;
+		if (!RudeAreaReadVec(Doc, TEXT("<entitiesExtentsMin"), Ax, Ay, Az)
+			|| !RudeAreaReadVec(Doc, TEXT("<entitiesExtentsMax"), Bx, By, Bz))
+		{
+			++NoExtents;
+			continue;
+		}
+		// The game's own "this ymap places nothing" sentinel: an inverted box. Folding it into a
+		// family's extent would drag the family to the float limits, so it is COUNTED, not used.
+		if (Bx < Ax || By < Ay || Bz < Az) { ++Degenerate; continue; }
+		++Fam.WithExtents;
+		if (!Fam.bHasExtent)
+		{
+			Fam.bHasExtent = true;
+			Fam.MinX = Ax; Fam.MinY = Ay; Fam.MinZ = Az;
+			Fam.MaxX = Bx; Fam.MaxY = By; Fam.MaxZ = Bz;
+		}
+		else
+		{
+			Fam.MinX = FMath::Min(Fam.MinX, Ax); Fam.MinY = FMath::Min(Fam.MinY, Ay); Fam.MinZ = FMath::Min(Fam.MinZ, Az);
+			Fam.MaxX = FMath::Max(Fam.MaxX, Bx); Fam.MaxY = FMath::Max(Fam.MaxY, By); Fam.MaxZ = FMath::Max(Fam.MaxZ, Bz);
+		}
+		// Smallest containing box wins: popzone nests a district inside a larger catch-all, and the
+		// tighter box is the more specific name.
+		const double Cx = (Ax + Bx) * 0.5, Cy = (Ay + By) * 0.5, Cz = (Az + Bz) * 0.5;
+		const FRudeAreaZoneBox* Best = nullptr;
+		for (const FRudeAreaZoneBox& Box : Zones)
+		{
+			if (Cx < Box.MinX || Cx > Box.MaxX || Cy < Box.MinY || Cy > Box.MaxY) { continue; }
+			if (Cz < Box.MinZ - 1.0 || Cz > Box.MaxZ + 1.0) { continue; }
+			if (!Best || Box.FootprintArea() < Best->FootprintArea()) { Best = &Box; }
+		}
+		if (Best) { ++Fam.Zones.FindOrAdd(Best->Region); ++Zoned; }
+		else { ++Unzoned; }
+	}
+
+	// ---- 3) the catalog ----------------------------------------------------------------------
+	// TWO kinds of entry, both in the schema `ImportArea` already reads ({alias, prefixes[],
+	// exact[]}); every other field it ignores, so the catalog can carry its own provenance.
+	//   prefix entry - one per ymap family, alias = the prefix. ALWAYS resolvable, never a guess.
+	//   zone entry   - one per popzone region word, prefixes = every family whose ymaps mostly
+	//                  land in it. This is the human name, and it comes from the game's data.
+	TArray<FString> FamilyNames;
+	Families.GetKeys(FamilyNames);
+	FamilyNames.Sort();
+
+	auto TopZoneOf = [](const FRudeAreaFamily& F, int32& OutCount) -> FString
+	{
+		FString BestName;
+		OutCount = 0;
+		TArray<FString> Keys;
+		F.Zones.GetKeys(Keys);
+		Keys.Sort();                                   // deterministic on a tie
+		for (const FString& K : Keys)
+		{
+			const int32 C = F.Zones[K];
+			if (C > OutCount) { OutCount = C; BestName = K; }
+		}
+		return BestName;
+	};
+
+	FString Json = TEXT("[\n");
+	int32 PrefixEntries = 0, ZoneEntries = 0, FamiliesWithZone = 0, AliasCollisions = 0;
+	TSet<FString> AllAliasLower;
+	for (const FString& FN : FamilyNames)
+	{
+		const FRudeAreaFamily& F = Families[FN];
+		int32 ZCount = 0;
+		const FString Zone = TopZoneOf(F, ZCount);
+		if (!Zone.IsEmpty()) { ++FamiliesWithZone; }
+		// ⛔ `ImportArea` REPLACES '_' WITH ' ' IN THE QUERY BEFORE IT MATCHES, on every surface -
+		// so an alias that CONTAINS an underscore can never be matched, exactly or by substring.
+		// Measured 2026-09-07: 170 of 375 entries would have been unreachable by name. The alias is
+		// spelled with spaces; `prefixes` keeps the real prefix, which is what ImportMapArea eats.
+		FString Alias = FN.Replace(TEXT("_"), TEXT(" "));
+		// The FALLBACKS keep the space-substituted form too. Using the raw family name here would put
+		// the '_' straight back into an alias and make it unmatchable again (law 9) - latent, not live:
+		// 0 prefix-vs-prefix collisions in the 375-entry catalog, so it fires only on another corpus,
+		// which is exactly when nobody is watching.
+		if (AllAliasLower.Contains(Alias.ToLower())) { Alias += TEXT(" (prefix)"); ++AliasCollisions; }
+		for (int32 Bump = 2; AllAliasLower.Contains(Alias.ToLower()); ++Bump)
+		{
+			Alias = FString::Printf(TEXT("%s (prefix %d)"), *FN.Replace(TEXT("_"), TEXT(" ")), Bump);
+		}
+		Json += FString::Printf(TEXT(
+			" {\"alias\":\"%s\",\"prefixes\":[\"%s\"],\"source\":\"prefix\",\"named\":false,")
+			TEXT("\"ymaps\":%d,\"entities\":%d,\"ymapsWithExtents\":%d,\"zone\":\"%s\",\"zoneYmaps\":%d,")
+			TEXT("\"extentMin\":%s,\"extentMax\":%s,\"note\":\"%s\"},\n"),
+			*RudeJsonEscape(Alias), *RudeJsonEscape(FN), F.Ymaps, F.Entities, F.WithExtents,
+			*RudeJsonEscape(Zone), ZCount,
+			*RudeAreaVecJson(F.bHasExtent, F.MinX, F.MinY, F.MinZ),
+			*RudeAreaVecJson(F.bHasExtent, F.MaxX, F.MaxY, F.MaxZ),
+			Zone.IsEmpty()
+				? TEXT("no human name derivable from the game's region data - the ymap prefix IS the alias")
+				: TEXT(""));
+		AllAliasLower.Add(Alias.ToLower());
+		++PrefixEntries;
+	}
+
+	TMap<FString, TArray<FString>> ByZone;
+	for (const FString& FN : FamilyNames)
+	{
+		int32 ZCount = 0;
+		const FString Zone = TopZoneOf(Families[FN], ZCount);
+		if (!Zone.IsEmpty()) { ByZone.FindOrAdd(Zone).Add(FN); }
+	}
+	TArray<FString> ZoneNames;
+	ByZone.GetKeys(ZoneNames);
+	ZoneNames.Sort();
+	for (const FString& ZN : ZoneNames)
+	{
+		TArray<FString>& Pre = ByZone[ZN];
+		Pre.Sort();
+		int32 ZY = 0, ZE = 0, ZW = 0, ZHits = 0;
+		bool bHasExt = false;
+		double MnX = 0, MnY = 0, MnZ = 0, MxX = 0, MxY = 0, MxZ = 0;
+		FString PreJson;
+		for (const FString& P : Pre)
+		{
+			const FRudeAreaFamily& F = Families[P];
+			ZY += F.Ymaps; ZE += F.Entities; ZW += F.WithExtents;
+			if (const int32* Hits = F.Zones.Find(ZN)) { ZHits += *Hits; }
+			if (F.bHasExtent)
+			{
+				if (!bHasExt)
+				{
+					bHasExt = true;
+					MnX = F.MinX; MnY = F.MinY; MnZ = F.MinZ;
+					MxX = F.MaxX; MxY = F.MaxY; MxZ = F.MaxZ;
+				}
+				else
+				{
+					MnX = FMath::Min(MnX, F.MinX); MnY = FMath::Min(MnY, F.MinY); MnZ = FMath::Min(MnZ, F.MinZ);
+					MxX = FMath::Max(MxX, F.MaxX); MxY = FMath::Max(MxY, F.MaxY); MxZ = FMath::Max(MxZ, F.MaxZ);
+				}
+			}
+			PreJson += FString::Printf(TEXT("%s\"%s\""), PreJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(P));
+		}
+		// ⛔ ALIAS COLLISION. `ImportArea` matches an alias EXACTLY first and breaks on the first
+		// hit, so two entries sharing a name case-insensitively make the second unreachable by
+		// name - silently. Measured 2026-09-07: 1 collision in 375 entries (a `oceana` ymap family
+		// under an `Oceana` popzone region). The prefix entry keeps the bare name (it is the exact
+		// thing the game calls that family); the zone entry is suffixed so BOTH stay reachable.
+		FString ZoneAlias = ZN.Replace(TEXT("_"), TEXT(" "));
+		if (AllAliasLower.Contains(ZoneAlias.ToLower()))
+		{
+			ZoneAlias = ZN.Replace(TEXT("_"), TEXT(" ")) + TEXT(" (zone)");
+			++AliasCollisions;
+		}
+		for (int32 Bump = 2; AllAliasLower.Contains(ZoneAlias.ToLower()); ++Bump)
+		{
+			ZoneAlias = FString::Printf(TEXT("%s (zone %d)"), *ZN.Replace(TEXT("_"), TEXT(" ")), Bump);
+		}
+		AllAliasLower.Add(ZoneAlias.ToLower());
+		Json += FString::Printf(TEXT(
+			" {\"alias\":\"%s\",\"prefixes\":[%s],\"source\":\"zone\",\"named\":true,")
+			TEXT("\"ymaps\":%d,\"entities\":%d,\"ymapsWithExtents\":%d,\"zone\":\"%s\",\"zoneYmaps\":%d,")
+			TEXT("\"extentMin\":%s,\"extentMax\":%s,\"note\":\"named from the game's own popzone region field\"},\n"),
+			*RudeJsonEscape(ZoneAlias), *PreJson, ZY, ZE, ZW, *RudeJsonEscape(ZN), ZHits,
+			*RudeAreaVecJson(bHasExt, MnX, MnY, MnZ), *RudeAreaVecJson(bHasExt, MxX, MxY, MxZ));
+		++ZoneEntries;
+	}
+	if (Json.EndsWith(TEXT(",\n"))) { Json.LeftChopInline(2); Json += TEXT("\n"); }
+	Json += TEXT("]\n");
+
+	// ---- 4) write it where ImportArea looks ---------------------------------------------------
+	FString Out = OutJsonPath.TrimStartAndEnd();
+	if (Out.IsEmpty())
+	{
+		const TSharedPtr<IPlugin> Self = IPluginManager::Get().FindPlugin(TEXT("RUDE"));
+		if (!Self.IsValid()) { return Fail(TEXT("OutJsonPath is empty and the RUDE plugin is not mounted")); }
+		Out = Self->GetBaseDir() / TEXT("Catalogs") / TEXT("area_aliases.json");
+	}
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Out), true);
+	const bool bWrote = FFileHelper::SaveStringToFile(Json, *Out, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	const bool bOk = bWrote && (PrefixEntries + ZoneEntries) > 0;
+	return FString::Printf(TEXT(
+		"{\"ok\":%s,\"outPath\":\"%s\",\"wrote\":%s,\"entries\":%d,\"prefixEntries\":%d,\"zoneEntries\":%d,")
+		TEXT("\"aliasCollisionsSuffixed\":%d,")
+		TEXT("\"families\":%d,\"familiesWithZone\":%d,\"familiesWithoutZone\":%d,")
+		TEXT("\"zonesParsed\":%d,\"popzone\":\"%s\",\"ymapsListed\":%d,\"ymapsRead\":%d,\"ymapsMissing\":%d,")
+		TEXT("\"ymapsNoExtents\":%d,\"ymapsDegenerateExtents\":%d,\"ymapsZoned\":%d,\"ymapsUnzoned\":%d,")
+		TEXT("\"entities\":%lld,\"xmlBytesRead\":%lld}"),
+		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Out), bWrote ? TEXT("true") : TEXT("false"),
+		PrefixEntries + ZoneEntries, PrefixEntries, ZoneEntries, AliasCollisions,
+		FamilyNames.Num(), FamiliesWithZone, FamilyNames.Num() - FamiliesWithZone,
+		Zones.Num(), *RudeJsonEscape(ZonePath), Ymaps.Num(), Read, Missing,
+		NoExtents, Degenerate, Zoned, Unzoned, TotalEntities, TotalBytes);
+}
+
+// ---- RudeDoctor (agent) ----------------------------------------------------------------------
+FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
+{
+	TArray<FString> Problems;
+	auto Note = [&Problems](const FString& S) { Problems.Add(S); };
+
+	// ---- engine ------------------------------------------------------------------------------
+	const FEngineVersion& Ver = FEngineVersion::Current();
+	const FString EngineText = Ver.ToString(EVersionComponent::Patch);
+	const bool bEngineExpected = (Ver.GetMajor() == 5 && Ver.GetMinor() == 8);
+	if (!bEngineExpected)
+	{
+		Note(FString::Printf(TEXT("engine is %s - RUDE is developed and measured against 5.8; other versions are untested"), *EngineText));
+	}
+
+	// ---- plugins -----------------------------------------------------------------------------
+	// REQUIRED: RUDE itself, and ToolsetRegistry - what makes the tools reachable at all. Without
+	// it there is no tool surface and nothing in this plugin can be called.
+	// OPTIONAL: ModelContextProtocol is ONE of the four surfaces (AGENTS §2) - the one an AGENT
+	// drives RUDE through. A person working in the Slate panel or from the CLI has a completely
+	// healthy install without it, and RUDE.uplugin does not depend on it. It is REPORTED with
+	// present/enabled and is deliberately NOT a problem: a doctor that cries wolf on its headline
+	// signal teaches people to ignore the headline.
+	IPluginManager& PM = IPluginManager::Get();
+	struct FRudeWantedPlugin { const TCHAR* Name; bool bRequired; };
+	const FRudeWantedPlugin Wanted[] = {
+		{ TEXT("RUDE"), true }, { TEXT("ToolsetRegistry"), true }, { TEXT("ModelContextProtocol"), false } };
+	FString PluginJson;
+	for (const FRudeWantedPlugin& W : Wanted)
+	{
+		const TSharedPtr<IPlugin> P = PM.FindPlugin(W.Name);
+		const bool bFound = P.IsValid();
+		const bool bOn = bFound && P->IsEnabled();
+		PluginJson += FString::Printf(TEXT("%s{\"name\":\"%s\",\"required\":%s,\"present\":%s,\"enabled\":%s}"),
+			PluginJson.IsEmpty() ? TEXT("") : TEXT(","), W.Name, W.bRequired ? TEXT("true") : TEXT("false"),
+			bFound ? TEXT("true") : TEXT("false"), bOn ? TEXT("true") : TEXT("false"));
+		if (!bOn && W.bRequired)
+		{
+			Note(FString::Printf(TEXT("plugin %s is %s - enable it in the project's plugin settings and restart"),
+				W.Name, bFound ? TEXT("present but disabled") : TEXT("not installed")));
+		}
+	}
+	const int32 EnabledPlugins = PM.GetEnabledPlugins().Num();
+
+	// ---- the plugin's own content ------------------------------------------------------------
+	// A clone whose Content never mounted fails deep inside an import with a material error; say it
+	// here instead.
+	const bool bMastersMounted = FPackageName::DoesPackageExist(TEXT("/RUDE/Masters/M_RUDE_Opaque"));
+	if (!bMastersMounted)
+	{
+		Note(TEXT("/RUDE/Masters is not mounted - the plugin's Content folder is missing from this build, and every import will fail to find a master material"));
+	}
+
+	// Masters: count what is on disk and ASK the staleness rule - RudeGeneratedMasterHealth, the
+	// one the generator itself calls (RudeToolset.cpp). The doctor deliberately does not restate
+	// the rule: the restated copy said only 'bucket-1 without OpacityScale' and would have gone on
+	// reporting every tint master healthy from the day the tint condition was added. Read-only:
+	// nothing is regenerated here.
+	FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+	ARM.Get().ScanPathsSynchronous({ TEXT("/RUDE/Masters") }, true);
+	TArray<FAssetData> MasterAssets;
+	ARM.Get().GetAssetsByPath(FName(TEXT("/RUDE/Masters")), MasterAssets, /*bRecursive*/ true);
+	int32 MastersTotal = 0, MastersGen = 0, MastersStale = 0, MastersUnparsed = 0;
+	int32 StaleNamedCount = 0;        // the NAMED masters, which RegenerateMasters does NOT cover
+	FString StaleNamed;
+	FString StaleNames;
+	for (const FAssetData& AD : MasterAssets)
+	{
+		const FString AssetName = AD.AssetName.ToString();
+		if (!AssetName.StartsWith(TEXT("M_RUDE_"))) { continue; }
+		++MastersTotal;
+		const bool bGen = AD.PackageName.ToString().Contains(TEXT("/Masters/Gen/"));
+		if (bGen) { ++MastersGen; }
+		// The generated masters, plus the TWO named masters whose generators also upgrade them in
+		// place (M_RUDE_Detail, M_RUDE_Cutout). The other four named masters have no upgrade rule at
+		// all, so they are counted and deliberately not judged - inventing a condition for them would
+		// be the second definition this lane just removed.
+		const bool bNamedWithRule = (AssetName == TEXT("M_RUDE_Detail") || AssetName == TEXT("M_RUDE_Cutout"));
+		if (!bGen && !bNamedWithRule) { continue; }
+		UMaterial* M = Cast<UMaterial>(AD.GetAsset());
+		FString Why;
+		const ERudeMasterHealth Health = RudeGeneratedMasterHealth(M, AssetName, Why);
+		if (Health == ERudeMasterHealth::Unreadable) { ++MastersUnparsed; continue; }
+		if (Health != ERudeMasterHealth::Stale) { continue; }
+		++MastersStale;
+		if (!bGen)
+		{
+			++StaleNamedCount;
+			StaleNamed += FString::Printf(TEXT("%s%s"), StaleNamed.IsEmpty() ? TEXT("") : TEXT(", "), *AssetName);
+		}
+		StaleNames += FString::Printf(TEXT("%s\"%s (%s)\""), StaleNames.IsEmpty() ? TEXT("") : TEXT(","),
+			*RudeJsonEscape(AssetName), *RudeJsonEscape(Why));
+	}
+	const int32 StaleGenMasters = MastersStale - StaleNamedCount;
+	if (StaleGenMasters > 0)
+	{
+		Note(FString::Printf(TEXT("%d generated master(s) under /RUDE/Masters/Gen are stale by the generator's own rule - run RegenerateMasters"), StaleGenMasters));
+	}
+	if (!StaleNamed.IsEmpty())
+	{
+		// Said separately because RegenerateMasters walks /RUDE/Masters/Gen ONLY and never touches the
+		// named masters: pointing a user at that tool for this fault would be advice that cannot work.
+		Note(FString::Printf(TEXT("named master(s) %s are stale by the generator's own rule - RegenerateMasters does NOT cover them (it walks /RUDE/Masters/Gen only); the next import that needs one regenerates it in place"), *StaleNamed));
+	}
+
+	// ---- the area catalog --------------------------------------------------------------------
+	const TSharedPtr<IPlugin> Self = PM.FindPlugin(TEXT("RUDE"));
+	FString CatalogPath;
+	int32 CatalogEntries = 0;
+	bool bCatalog = false;
+	if (Self.IsValid())
+	{
+		CatalogPath = Self->GetBaseDir() / TEXT("Catalogs") / TEXT("area_aliases.json");
+		FString Raw;
+		if (FFileHelper::LoadFileToString(Raw, *CatalogPath))
+		{
+			TArray<TSharedPtr<FJsonValue>> Arr;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Raw);
+			if (FJsonSerializer::Deserialize(Reader, Arr))
+			{
+				bCatalog = true;
+				CatalogEntries = Arr.Num();
+			}
+			else
+			{
+				Note(FString::Printf(TEXT("the area catalog at %s is not a JSON array - ImportArea will refuse it"), *CatalogPath));
+			}
+		}
+		else
+		{
+			Note(FString::Printf(TEXT("no area catalog at %s - ImportArea cannot resolve a district name until BuildAreaCatalog writes one"), *CatalogPath));
+		}
+	}
+
+	// ---- the corpus --------------------------------------------------------------------------
+	// The single most common new-user mistake: pointing CorpusRoot at a folder of loose XML instead
+	// of a ledgered filebase. Both are folders; only one has the manifest every lookup goes through.
+	const FString Root = CorpusRoot.TrimStartAndEnd();
+	FString CorpusJson = TEXT("{\"checked\":false}");
+	if (!Root.IsEmpty())
+	{
+		const bool bDir = FPaths::DirectoryExists(Root);
+		const bool bLedgered = bDir && FRudeCorpus::LooksLikeCorpus(Root);
+		if (!bDir)
+		{
+			Note(FString::Printf(TEXT("CorpusRoot %s does not exist"), *Root));
+			CorpusJson = FString::Printf(TEXT("{\"checked\":true,\"exists\":false,\"ledgered\":false,\"root\":\"%s\"}"), *RudeJsonEscape(Root));
+		}
+		else if (!bLedgered)
+		{
+			// Count what IS there, so the message can say what the folder looks like instead of
+			// only what it is not.
+			TArray<FString> Xml;
+			IFileManager::Get().FindFilesRecursive(Xml, *Root, TEXT("*.xml"), true, false, false);
+			Note(FString::Printf(TEXT("CorpusRoot %s is a FLAT folder, not a ledgered filebase (no _FILEBASE.json / _PROVENANCE.jsonl): the single-file tools work, the corpus tools (ImportMapArea, ImportArea, ImportMlo, BuildAreaCatalog) do not"), *Root));
+			CorpusJson = FString::Printf(TEXT("{\"checked\":true,\"exists\":true,\"ledgered\":false,\"root\":\"%s\",\"xmlFiles\":%d}"),
+				*RudeJsonEscape(Root), Xml.Num());
+		}
+		else
+		{
+			FString OpenError;
+			const TSharedPtr<FRudeCorpus> Corpus = FRudeCorpus::Open(Root, OpenError);
+			if (!Corpus.IsValid())
+			{
+				Note(FString::Printf(TEXT("CorpusRoot %s has the ledgers but will not open: %s"), *Root, *OpenError));
+				CorpusJson = FString::Printf(TEXT("{\"checked\":true,\"exists\":true,\"ledgered\":true,\"opened\":false,\"root\":\"%s\",\"error\":\"%s\"}"),
+					*RudeJsonEscape(Root), *RudeJsonEscape(OpenError));
+			}
+			else
+			{
+				TMap<FString, int32> ByType;
+				Corpus->CountByType(ByType);
+				const TCHAR* Lanes[] = { TEXT("ymap"), TEXT("ytyp"), TEXT("ydr"), TEXT("ydd"), TEXT("yft"), TEXT("ytd"), TEXT("ybn") };
+				FString LaneJson;
+				for (const TCHAR* Lane : Lanes)
+				{
+					const int32* N = ByType.Find(FString(Lane));
+					LaneJson += FString::Printf(TEXT("%s\"%s\":%d"), LaneJson.IsEmpty() ? TEXT("") : TEXT(","), Lane, N ? *N : 0);
+					if (!N || *N == 0)
+					{
+						Note(FString::Printf(TEXT("the corpus ledger has no %s rows - that lane's tools have nothing to read"), Lane));
+					}
+				}
+				CorpusJson = FString::Printf(TEXT(
+					"{\"checked\":true,\"exists\":true,\"ledgered\":true,\"opened\":true,\"root\":\"%s\",")
+					TEXT("\"title\":\"%s\",\"routVersion\":%d,\"rows\":%d,\"lanes\":{%s}}"),
+					*RudeJsonEscape(Root), *RudeJsonEscape(Corpus->GetTitle()), Corpus->GetRoutVersion(),
+					Corpus->Num(), *LaneJson);
+			}
+		}
+	}
+
+	// ---- headless / world state --------------------------------------------------------------
+	const bool bSlate = FSlateApplication::IsInitialized();
+	const bool bWorld = (GEditor && GEditor->GetEditorWorldContext().World() != nullptr);
+	if (!bWorld)
+	{
+		Note(TEXT("there is no editor world - the tools that spawn actors need one (open or create a level first; the CLI opens one with NewLevel)"));
+	}
+
+	FString ProblemJson;
+	for (const FString& P : Problems)
+	{
+		ProblemJson += FString::Printf(TEXT("%s\"%s\""), ProblemJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(P));
+	}
+	return FString::Printf(TEXT(
+		"{\"ok\":%s,\"problems\":%d,\"problemList\":[%s],")
+		TEXT("\"engine\":\"%s\",\"engineExpected\":\"5.8\",\"engineMatches\":%s,")
+		TEXT("\"plugins\":[%s],\"pluginsEnabled\":%d,")
+		TEXT("\"mastersMounted\":%s,\"masters\":%d,\"generatedMasters\":%d,\"staleMasters\":%d,")
+		TEXT("\"unparsedMasters\":%d,\"staleMasterNames\":[%s],")
+		TEXT("\"catalogPath\":\"%s\",\"catalogPresent\":%s,\"catalogEntries\":%d,")
+		TEXT("\"corpus\":%s,\"headless\":%s,\"unattended\":%s,\"editorWorld\":%s}"),
+		Problems.Num() == 0 ? TEXT("true") : TEXT("false"), Problems.Num(), *ProblemJson,
+		*RudeJsonEscape(EngineText), bEngineExpected ? TEXT("true") : TEXT("false"),
+		*PluginJson, EnabledPlugins,
+		bMastersMounted ? TEXT("true") : TEXT("false"), MastersTotal, MastersGen, MastersStale,
+		MastersUnparsed, *StaleNames,
+		*RudeJsonEscape(CatalogPath), bCatalog ? TEXT("true") : TEXT("false"), CatalogEntries,
+		*CorpusJson, bSlate ? TEXT("false") : TEXT("true"),
+		FApp::IsUnattended() ? TEXT("true") : TEXT("false"), bWorld ? TEXT("true") : TEXT("false"));
 }

@@ -114,6 +114,7 @@ that has never been confirmed in the running game says so with a ❓.
 | Tool | Parameters (in order) | What it does | Audience |
 |---|---|---|---|
 | `BuildArchetypePalette` | `CorpusRoot, ManifestPath, DestFolder, MeshFolder` | One `URudeArchetype` asset per archetype the manifest's placements refer to (empty manifest = every archetype): 13 edit-native + 2 as-spelled fields, time mask, extensions/MLO subtrees verbatim, mesh link, provenance, the item's own XML as a raw slice of the source bytes. Downtown: 3,200 assets from 73 ytyps. Re-running refills existing assets (loaded first, then filled) | human |
+| `BuildAreaCatalog` | `CorpusRoot, OutJsonPath` | Derive the area catalog `ImportArea` asks for **from the corpus itself** — every ymap family, its extent from the placements the ymaps declare, its ymap and entity counts — and name each one from the game's own `popzone` region data. Two entry kinds: `prefix` (the ymap family, always resolvable) and `zone` (the human name, the game's own word). A family the region data cannot place keeps the prefix as its alias and says so in `note` — no name is invented. Empty `OutJsonPath` writes `<plugin>/Catalogs/area_aliases.json`, exactly where `ImportArea` looks. ⛔ The catalog is **generated on your machine and never shipped with RUDE** — it is derived from the game's own files, and no game data lives in this repository. ⚠ Reads every effective ymap in full: maintainer lane `product_debt` measured 11,086 files / 9,956,359,597 bytes; once per corpus, not once per session. ❓ Not yet run in the editor | agent |
 | `BuildDistrictLevel` | `LevelPath, ManifestPath, MeshFolder, Filter` | The district as a World Partition level: one Runtime Data Layer per ymap (toggle a ymap like a layer), one actor per entity with its `URudeEntityComponent` on its ymap's layer, saved headless (map + `<Level>_Layers/DL_<ymap>` assets + external actors). Downtown: 148 layers, 14,248 actors; export from it 148/148 byte-identical | human |
 | `CaptureView` | `CamSpec, OutPng, ViewMode, SettleSeconds` | Aim the perspective viewport (`"x,y,z,pitch,yaw"` in UE cm/degrees; `;` also accepted) and write a PNG — the agent-vision primitive. Blocks on `FinishAllCompilation` first, then the shot lands on the NEXT draw: poll for the file. `ViewMode` UNLIT answers "did the textures bind?" (a Lit shot multiplies albedo by scene lighting); `SettleSeconds` = minimum quiet time before the deferred shot fires (default 25) | agent |
 | `CreateFilebase` | `FilebaseRoot, GameRoot, Options` | Seed the **filebase**: a load-order-aware folder tree the user exports their own game files into (`00_base` < `10_update` < `20_dlc/NNN_name`, higher wins). Enumerates the install's directory names only — **no archive is opened or decrypted**. `Options` = `CORE` (default) or `ALL` | human |
@@ -209,6 +210,7 @@ that has never been confirmed in the running game says so with a ❓.
 | `ProbeYddBinary` | `BinPath` | Read a binary `.ydd` back: entry count/hash order/name-hash match, per-entry geometries, vertices, triangles, skinned vertices with weight sum 255, blend indices inside the bone-id table, shared blocks, declaration rejections, bounds problems. The measure for `ExportYddBinary` (with `compare_ydd.py` against the corpus XML) | agent |
 | `XmlShapeRoundTrip` | `ListPath, OutDir` | Parse a game XML with `FXmlFile`, re-spell it, re-parse, compare shape (paths/attributes/leaf text). Proves the WRITER, not bytes: `FXmlFile` joins multi-line text with spaces, which is why exporters splice source bytes instead of re-spelling | agent |
 | `RegenerateMasters` | | Walk `/RUDE/Masters/Gen` and run every generated master through the generator; a stale one (a bucket-1 glass master without `OpacityScale`) is regenerated in place so its instances update | agent |
+| `RudeDoctor` | `CorpusRoot` | One call that answers "why doesn't this work on my machine": engine version against the 5.8 RUDE is measured on, whether RUDE / ToolsetRegistry are present **and enabled** (ModelContextProtocol is reported too, but its absence is **not** a fault — the panel and the CLI are whole surfaces without it), whether `/RUDE/Masters` mounted, how many masters exist and whether any is stale — by calling `RudeGeneratedMasterHealth`, the one rule the generators themselves call, so the doctor cannot drift from it — whether an area catalog has been generated on this machine and parses, and whether `CorpusRoot` is a **ledgered filebase or a flat folder of XML** — both are folders, only one has the manifest every corpus lookup goes through. Pure diagnosis: reads only, regenerates nothing. `ok` is `problems == 0`, and every fault is one plain sentence in `problemList`. ❓ Not yet run in the editor | human |
 | `SaveAssets` | *(none)* | Save every dirty **content** package — never the level, which stays the operator's call. Exists so an agent-run import chain can persist its own work. Calls `FinishAllCompilation` first | agent |
 | `SaveLevel` | `LevelPath` | Save the open level to a content path (an untitled level needs one). Headless-safe: `SaveMap`, then the direct map save if no `.umap` landed | agent |
 | `SetArchetypeField` | `PaletteFolder, ArchetypeName, Field, Value` | Set one property on a palette archetype by name (reflection, value as text). The scriptable palette edit the export gate uses | agent |
@@ -415,18 +417,40 @@ Source/RudeEditor/Private/
 
 Honest state, so nobody re-derives these the hard way:
 
-- **`SaveAssets` persists NOTHING under `-unattended`** (measured 2026-07-31): in a commandlet /
-  `-unattended` run, `FEditorFileUtils::SaveDirtyPackages` returns `false` and writes no packages —
-  the tool reports `ok:false` and no `.uasset` lands on disk. So a CLI-driven import chain that ends
-  with `SaveAssets` (the documented pattern in §3) silently loses all its work. Current operating
-  model: building happens with the editor OPEN (agent via MCP, or a human); but the CLI is listed as
-  a first-class surface in §2, so headless persistence is an open product question tracked on the
-  maintainer's register — not a wontfix.
-- **`ImportArea` needs an area-catalog JSON that this repository does not ship** (checked 2026-07-28:
-  no such file is tracked). Without one, use `ImportMapArea` with an explicit prefix list.
-- **`ExportYmap` overwrites `fxmanifest.lua` unconditionally** — no existence check, and the write
-  result is not tested. Exporting twice into a resource that has hand-added `client_script` or
-  `files` entries destroys them. It should merge.
+- **`SaveAssets` under `-unattended` — CLOSED, and the history matters.** It persisted NOTHING
+  (measured 2026-07-31): `FEditorFileUtils::SaveDirtyPackages` returned `false` and wrote no
+  packages, so a CLI import chain that ended with `SaveAssets` silently lost all its work. Two
+  causes, both now handled in `RudeSaveDirty`: `-unattended` sets `FApp::IsUnattended()` but not
+  `GIsRunningUnattendedScript`, so the save fell into the engine's *cancelled* branch; and in a
+  commandlet there is no Slate at all, which the notification path asserts on. Headless now saves
+  every dirty content package directly through `UPackage::Save`, and since 2026-09-07 `SaveAssets`
+  **reports every package it wrote BY NAME** and every one it could not (`wrote`, `couldNotWrite`,
+  first 40 each; `wrote` names the FILE the save targeted, `couldNotWrite` names the PACKAGE, so the
+  two lists are different namespaces and are not meant to be diffed against each other). The
+  interactive leg cannot name anything — `SaveDirtyPackages` returns one bool —
+  so it answers `namesKnown:false` rather than an empty list. ⛔ Still true: it saves CONTENT only,
+  never the level.
+- **`ImportArea`'s area catalog is GENERATED on the user's machine and is NEVER shipped here.**
+  `BuildAreaCatalog` derives one from the corpus itself — every ymap family, its extent from the
+  placements, its ymap and entity counts — and names each area from the game's own `popzone` region
+  data, marking any family that region data cannot place. An empty `CatalogPath` reads
+  `<plugin>/Catalogs/area_aliases.json`, which is where `BuildAreaCatalog` writes with an empty
+  `OutJsonPath`. ⛔ The generated file is **not committed here and never will be**: it carries the
+  game's own district words, family names, entity counts and world-space extents, which is exactly
+  what §7 and the README's promise forbid. Until a user runs the generator `ImportArea` refuses and
+  names it; `ImportMapArea` with an explicit prefix list is the no-catalog path. ❓ Neither the
+  generator nor the refusal has been run in the editor (written 2026-09-07).
+- **`ExportYmap` MERGES `fxmanifest.lua`** (2026-09-07; it used to overwrite it unconditionally,
+  destroying hand-added `client_script` / `files` entries, and did not even test the write). It keeps
+  every byte the file already has and appends only the directives the file does not already declare —
+  matched on the DIRECTIVE KEY, so `this_is_a_map "yes"` in the user's own spelling counts as present
+  and is not duplicated. A second export over a complete manifest writes nothing at all. The verdict
+  carries `manifestLinesPreserved` / `manifestDirectivesAlreadyPresent` / `manifestDirectivesAdded`,
+  and `ok` is computed over BOTH writes. ⚠ Only `ExportYmap` was converted: `fxmanifest.lua` is
+  written at **10 call sites across 8 files**, so **nine remain** (in 7 other files) and should move
+  to `RudeMergeManifest` — counted and named in the lane's NOTES. Six of those nine ignore the write
+  result; three (`RudePeds.cpp` ×2, `RudeScenario.cpp`) do test it. ❓ The merge has not been run in
+  the editor: the gate row that proves the second export adds nothing has not been executed.
 - **The panel is a generic tool driver, not an authoring workflow.** Every parameter is a free-text
   field: no file pickers, no area menu, no browse buttons.
 - **`ImportMlo` spawns at the world origin,** not at its ymap world transform (`PlaceInterior`

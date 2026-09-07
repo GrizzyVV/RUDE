@@ -210,15 +210,11 @@ static UMaterialInterface* EnsureCutoutMaster()
 	UMaterial* M = LoadObject<UMaterial>(nullptr, FullPath);
 	if (M)
 	{
-		TArray<FMaterialParameterInfo> Infos;
-		TArray<FGuid> Ids;
-		M->GetAllTextureParameterInfo(Infos, Ids);
-		for (const FMaterialParameterInfo& I : Infos)
-		{
-			if (I.Name == FName(TEXT("Normal"))) { return M; }   // already the good version
-		}
-		// Poorer legacy asset: wipe its graph and rebuild, rather than bolting expressions onto
-		// an unknown one. This is OUR asset and fully regenerable.
+		// The same ONE rule (RudeGeneratedMasterHealth): this master's condition is a Normal TEXTURE
+		// parameter. A poorer legacy asset has its graph wiped and rebuilt rather than having
+		// expressions bolted onto an unknown one - this is OUR asset and fully regenerable.
+		FString StaleWhy;
+		if (RudeGeneratedMasterHealth(M, TEXT("M_RUDE_Cutout"), StaleWhy) != ERudeMasterHealth::Stale) { return M; }
 		M->GetExpressionCollection().Empty();
 	}
 	else
@@ -317,6 +313,80 @@ struct FRudeMasterSpec
 	}
 };
 
+// ---- THE definition of "this master RUDE generates is stale" ----------------------------------
+// ONE rule, in ONE place, because there were three and they disagreed: each generator below kept
+// its own condition, and RudeDoctor RESTATED one of them in order to report it - so when the tint
+// condition was added on 2026-09-07 the doctor kept reporting every tint master healthy. All three
+// generators with an upgrade rule now ask this function, and so does the doctor.
+// `AssetName` is exactly what FRudeMasterSpec::Key() spells for a generated master, so the decode
+// here is that function's inverse - which is why the doctor can start from an asset on disk and
+// get the same answer the generator would.
+// Unreadable (NOT Healthy) when the material will not load or the name is not one this rule
+// covers: a master we did not check is never reported as one that passed. The other four named
+// masters (DecalGeo, Foliage, Terrain, Water) have no upgrade rule at all - their generators
+// return any existing asset - so they are deliberately Unreadable here rather than given a
+// condition this lane invented.
+ERudeMasterHealth RudeGeneratedMasterHealth(UMaterial* M, const FString& AssetName, FString& OutWhy)
+{
+	OutWhy.Reset();
+	if (!M) { return ERudeMasterHealth::Unreadable; }
+
+	TArray<FMaterialParameterInfo> ScalarInfos, TextureInfos;
+	TArray<FGuid> ScalarIds, TextureIds;
+	M->GetAllScalarParameterInfo(ScalarInfos, ScalarIds);
+	M->GetAllTextureParameterInfo(TextureInfos, TextureIds);
+	auto Has = [](const TArray<FMaterialParameterInfo>& Infos, const TCHAR* Param)
+	{
+		for (const FMaterialParameterInfo& I : Infos) { if (I.Name == FName(Param)) { return true; } }
+		return false;
+	};
+
+	// The two NAMED masters the generators also upgrade in place.
+	if (AssetName == TEXT("M_RUDE_Detail"))
+	{
+		if (Has(ScalarInfos, TEXT("DetailAmount"))) { return ERudeMasterHealth::Healthy; }
+		OutWhy = TEXT("detail master with no DetailAmount");
+		return ERudeMasterHealth::Stale;
+	}
+	if (AssetName == TEXT("M_RUDE_Cutout"))
+	{
+		if (Has(TextureInfos, TEXT("Normal"))) { return ERudeMasterHealth::Healthy; }
+		OutWhy = TEXT("cutout master with no Normal texture parameter");
+		return ERudeMasterHealth::Stale;
+	}
+
+	// Everything else this rule judges is M_RUDE_<letters>_b<bucket>.
+	FString Sig, BucketText;
+	if (!AssetName.StartsWith(TEXT("M_RUDE_"), ESearchCase::CaseSensitive)
+		|| !AssetName.Mid(7).Split(TEXT("_b"), &Sig, &BucketText) || !BucketText.IsNumeric())
+	{
+		return ERudeMasterHealth::Unreadable;
+	}
+	const int32 Bucket = FCString::Atoi(*BucketText);
+
+	// RULE 1 (2026-09-05). Bucket-1 (glass, alpha-blended) masters generated before that date used
+	// UE's default volumetric translucency with no surface lighting: glass drew as a flat colour
+	// slab (the blue tower). The new graph carries OpacityScale.
+	if (Bucket == 1 && !Has(ScalarInfos, TEXT("OpacityScale")))
+	{
+		OutWhy = TEXT("bucket-1 glass master with no OpacityScale");
+		return ERudeMasterHealth::Stale;
+	}
+
+	// RULE 2 (2026-09-07). A TINT master generated before that date exposed TintPalette and a
+	// selector and wired NEITHER - the palette was bound and never sampled. The probe is
+	// TintAmount, which only the new graph declares. 'T' is the tint letter, and "Dt" (detail)
+	// also contains a t, so the detail pair is removed first - CASE-SENSITIVELY, because
+	// FString::Replace and FString::Contains both default to IgnoreCase.
+	const FString TintLetters = Sig.Replace(TEXT("Dt"), TEXT(""), ESearchCase::CaseSensitive);
+	if (TintLetters.Contains(TEXT("T"), ESearchCase::CaseSensitive) && !Has(ScalarInfos, TEXT("TintAmount")))
+	{
+		OutWhy = TEXT("tint master with no TintAmount");
+		return ERudeMasterHealth::Stale;
+	}
+	return ERudeMasterHealth::Healthy;
+}
+
 static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 {
 	const FString Name = Spec.Key();
@@ -325,36 +395,17 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 	UMaterial* M = nullptr;
 	if (UMaterialInterface* Existing = LoadObject<UMaterialInterface>(nullptr, *Full))
 	{
-		// Bucket-1 (glass, alpha-blended) masters generated before 2026-09-05 used UE's default
-		// volumetric translucency with no surface lighting: glass drew as a flat colour slab (the
-		// blue tower). The new version carries an OpacityScale parameter; an old one is regenerated
-		// IN PLACE so every material instance parented to it updates without a re-import.
+		// THE staleness rule lives in ONE function - RudeGeneratedMasterHealth, just above - and the
+		// reporter (RudeDoctor) calls the same one. It used to be restated there, which is how the
+		// doctor went on calling every tint master healthy on the day the tint rule was added here.
+		// A stale master is regenerated IN PLACE so every material instance parented to it updates
+		// without a re-import.
 		UMaterial* Old = Cast<UMaterial>(Existing);
-		bool bStale = false;
-		if (Old && Spec.Bucket == 1)
-		{
-			TArray<FMaterialParameterInfo> Infos;
-			TArray<FGuid> Ids;
-			Old->GetAllScalarParameterInfo(Infos, Ids);
-			bStale = true;
-			for (const FMaterialParameterInfo& I : Infos) { if (I.Name == FName(TEXT("OpacityScale"))) { bStale = false; break; } }
-		}
-		// A TINT master generated before 2026-09-07 exposed TintPalette and a selector and wired NEITHER:
-		// the palette was bound and never sampled. Regenerate it IN PLACE, on the same rule and for the
-		// same reason as the glass master above - every material instance parented to it then updates
-		// without a re-import. The probe is TintAmount, which only the new graph declares.
-		if (Old && !bStale && Spec.bTint)
-		{
-			TArray<FMaterialParameterInfo> TintInfos;
-			TArray<FGuid> TintIds;
-			Old->GetAllScalarParameterInfo(TintInfos, TintIds);
-			bStale = true;
-			for (const FMaterialParameterInfo& I : TintInfos) { if (I.Name == FName(TEXT("TintAmount"))) { bStale = false; break; } }
-		}
-		if (!bStale) { return Existing; }
+		FString StaleWhy;
+		if (RudeGeneratedMasterHealth(Old, Name, StaleWhy) != ERudeMasterHealth::Stale) { return Existing; }
 		M = Old;
 		M->GetExpressionCollection().Empty();
-		UE_LOG(LogTemp, Display, TEXT("[RUDE] regenerating stale master %s"), *Name);
+		UE_LOG(LogTemp, Display, TEXT("[RUDE] regenerating stale master %s (%s)"), *Name, *StaleWhy);
 	}
 	if (!M)
 	{
@@ -674,13 +725,10 @@ static UMaterialInterface* EnsureDetailMaster()
 	UMaterial* M = LoadObject<UMaterial>(nullptr, FullPath);
 	if (M)
 	{
-		TArray<FMaterialParameterInfo> Infos;
-		TArray<FGuid> Ids;
-		M->GetAllScalarParameterInfo(Infos, Ids);
-		for (const FMaterialParameterInfo& I : Infos)
-		{
-			if (I.Name == FName(TEXT("DetailAmount"))) { return M; }
-		}
+		// The same ONE rule (RudeGeneratedMasterHealth): this master's condition is DetailAmount.
+		// It is stated there and nowhere else, so the doctor can report it without restating it.
+		FString StaleWhy;
+		if (RudeGeneratedMasterHealth(M, TEXT("M_RUDE_Detail"), StaleWhy) != ERudeMasterHealth::Stale) { return M; }
 		M->GetExpressionCollection().Empty();   // ours, regenerable
 	}
 	else
