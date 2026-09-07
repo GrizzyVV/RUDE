@@ -14,7 +14,8 @@
 //     exceed 105. Hair binds 100% to index 80 = SKEL_Head; trousers reach 28 = SKEL_Spine1.
 //   * BlendWeights are 0..255 bytes; the sum is 255 on 27,808/27,808 vertices; 0 vertices are unweighted.
 //   * Every model has HasSkin=1 and BoneIndex=0 (24/24); every entry carries High/Medium/Low groups (8/8).
-//     Like every other RUDE lane this one imports DrawableModelsHigh only.
+//     Since WP12 (RUDE_PEDLOD) ALL of them are imported: High -> LOD0, Medium -> LOD1, Low -> LOD2
+//     (823/1,152 corpus entries carry three groups, 182 two, 147 one; 0 carry a VeryLow group).
 //   * Bone <Scale> is unit 106/106; exactly one root (SKEL_ROOT); parents precede children 106/106.
 //   * The ydd's shader binds texture letter a (8/8 DiffuseSampler names end _a_<race>); letters b/c swap
 //     the diffuse only, normal/spec are per drawable.
@@ -26,7 +27,8 @@
 // produces a static twin under <ped>/_static/ - its material instances go through the existing preset /
 // RenderBucket / texture-scope path - and the skeletal mesh borrows the twin's material per slot name.
 //
-// NOT in v1: Medium/Low LOD groups, cloth, the heads' own <Skeleton>, expressions,
+// NOT in v1: cloth, the heads' own <Skeleton>, expressions,
+// (Medium/Low LOD groups ARE in since WP12 - RUDE_PEDLOD regions below; laws in maintainer lane `ped_lods` (`LAWS.md`))
 // (pedprops <ped>_p.ydd ARE in since WP11 - RUDE_PEDPROPS regions below; laws in maintainer lane `pedprops` (`LAWS.md`))
 // the peds.ymt row (movement sets, audio). Every one of those is a counted absence, not a silent one.
 #include "RudeToolset.h"
@@ -401,6 +403,59 @@ namespace RudePeds
 	struct FVarDrawable { int32 PropMask = 0; int32 NumAlt = 0; TArray<FVarTex> Tex; };
 	struct FVarComp { int32 NumAvailTex = 0; TArray<FVarDrawable> Drawables; };
 
+	// RUDE_PEDLOD_BEGIN helpers
+	// ---- the LOD groups (WP12, maintainer lane `ped_lods` (`LAWS.md`)) ----
+	// A component ped ships up to THREE groups per entry: High + Medium + Low on 823/1,152 corpus entries and
+	// 1,570/2,125 game binary entries, High + Medium on 182 / 383, High alone on 147 / 172. NO measured entry
+	// carries a VeryLow group (0/1,152 and 0/2,125), so RUDE reads three and writes three.
+	static const TCHAR* kPedLodGroupTag[3] = { TEXT("DrawableModelsHigh"), TEXT("DrawableModelsMedium"), TEXT("DrawableModelsLow") };
+
+	// UE screen sizes for LOD0/1/2. INFERRED, and tagged as such wherever it is quoted: the ydd's four lodDist
+	// floats are a CONSTANT 9998 on 2,119/2,125 game entries and 1,148/1,152 corpus entries (law 2), so the file
+	// stores no switch distance to convert. These are fitted to the measured vertex ratios (Medium/High mean
+	// 0.358, Low/High mean 0.083 over 1,953 / 1,570 entries) and are an EDITOR PREVIEW setting only - nothing in
+	// the exported .ydd depends on them.
+	static const float kPedLodScreenSize[3] = { 1.0f, 0.4f, 0.15f };
+
+	// One LOD group's geometries out of a dictionary entry. Returns how many were DROPPED (each with a reason);
+	// a missing group is simply an absent group, not a failure.
+	static int32 ParseLodGroup(const FXmlNode* Item, int32 GroupIdx, int32 NumBones, TArray<FSkinGeo>& Out,
+	                           TArray<FString>& Problems, const FString& MeshName)
+	{
+		int32 Dropped = 0;
+		const FXmlNode* Grp = Item->FindChildNode(kPedLodGroupTag[GroupIdx]);
+		if (!Grp) { return 0; }
+		for (const FXmlNode* ModelItem : Grp->GetChildrenNodes())
+		{
+			const FXmlNode* Geometries = ModelItem->FindChildNode(TEXT("Geometries"));
+			if (!Geometries) { continue; }
+			for (const FXmlNode* GeoItem : Geometries->GetChildrenNodes())
+			{
+				FSkinGeo G;
+				FString Err;
+				if (ParseSkinnedGeometry(GeoItem, NumBones, G, Err)) { Out.Add(MoveTemp(G)); }
+				else { ++Dropped; Problems.Add(FString::Printf(TEXT("%s: %s geometry dropped - %s"), *MeshName, kPedLodGroupTag[GroupIdx], *Err)); }
+			}
+		}
+		return Dropped;
+	}
+
+	// The four <LodDist*> floats AS SPELLED (law 2.3: carried, never computed; 9998 when the entry omits one).
+	static void ReadLodDist(const FXmlNode* Item, float Out[4])
+	{
+		static const TCHAR* Tags[4] = { TEXT("LodDistHigh"), TEXT("LodDistMed"), TEXT("LodDistLow"), TEXT("LodDistVlow") };
+		for (int32 k = 0; k < 4; ++k)
+		{
+			Out[k] = 9998.f;
+			if (const FXmlNode* N = Item->FindChildNode(Tags[k]))
+			{
+				const FString V = N->GetAttribute(TEXT("value"));
+				if (!V.IsEmpty()) { Out[k] = FCString::Atof(*V); }
+			}
+		}
+	}
+	// RUDE_PEDLOD_END helpers
+
 	struct FImported
 	{
 		FString EntryName, ResolvedName, Comp, Class;
@@ -409,6 +464,15 @@ namespace RudePeds
 		FString AssetPath;
 		int32 Verts = 0, Tris = 0, Unweighted = 0, OutOfRange = 0, TrisOutOfRange = 0, Geos = 0, GeosDropped = 0;
 		int32 TexBound = -1, TexMissing = -1;   // the twin's material binding, surfaced per mesh (2026-09-06)
+		// RUDE_PEDLOD: the LOD groups the entry shipped, index 0 = High. EVERY counter that existed before this
+		// change stays HIGH-only - Verts, Tris, Geos, GeosDropped, Unweighted, OutOfRange and TrisOutOfRange all
+		// still measure the High group alone, so a caller reading them (and the file-level totals they feed) gets
+		// the same quantity it got before. What the Medium / Low groups add is counted in the Lod* twins below.
+		int32 LodGroups = 1, LodSlotsClamped = 0, LodGroupRenumbered = 0;
+		int32 LodVerts[3] = { 0, 0, 0 }, LodTris[3] = { 0, 0, 0 }, LodGeoCount[3] = { 0, 0, 0 };
+		int32 LodUeIndex[3] = { 0, -1, -1 };   // the UE LOD each SOURCE group landed on (-1 = the group was absent)
+		int32 LodGeosDropped = 0, LodUnweighted = 0, LodOutOfRange = 0, LodTrisOutOfRange = 0;
+		float LodDist[4] = { 9998.f, 9998.f, 9998.f, 9998.f };
 		bool bOwnSkeleton = false;
 	};
 	// RUDE_PEDPROPS_BEGIN helpers
@@ -738,23 +802,15 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 			? LoadObject<UStaticMesh>(nullptr, *(StaticFolder / TwinName + TEXT(".") + TwinName)) : nullptr;
 		if (!Twin) { Problems.Add(FString::Printf(TEXT("%s: static twin (materials) failed: %s"), *MeshName, *TwinVerdict.Left(160))); }
 
-		// b) the skinned geometry (High group only, like every RUDE lane)
-		TArray<FSkinGeo> Geos;
-		if (const FXmlNode* High = Item->FindChildNode(TEXT("DrawableModelsHigh")))
-		{
-			for (const FXmlNode* ModelItem : High->GetChildrenNodes())
-			{
-				const FXmlNode* Geometries = ModelItem->FindChildNode(TEXT("Geometries"));
-				if (!Geometries) { continue; }
-				for (const FXmlNode* GeoItem : Geometries->GetChildrenNodes())
-				{
-					FSkinGeo G;
-					FString Err;
-					if (ParseSkinnedGeometry(GeoItem, Bones.Num(), G, Err)) { Geos.Add(MoveTemp(G)); }
-					else { ++E.GeosDropped; Problems.Add(FString::Printf(TEXT("%s: geometry dropped - %s"), *MeshName, *Err)); }
-				}
-			}
-		}
+		// b) the skinned geometry, ONE LOD PER GROUP (RUDE_PEDLOD): DrawableModelsHigh -> LOD0,
+		// DrawableModelsMedium -> LOD1, DrawableModelsLow -> LOD2 (maintainer lane `ped_lods` (`LAWS.md`) law 9.3).
+		// An absent group is skipped WITHOUT renumbering, which is a shape the game itself ships (High+Medium on
+		// 383/2,125 game entries). VeryLow is never read: 0/1,152 corpus and 0/2,125 game entries carry one.
+		TArray<FSkinGeo> LodGeos[3];
+		E.GeosDropped += ParseLodGroup(Item, 0, Bones.Num(), LodGeos[0], Problems, MeshName);   // HIGH-only, as before
+		for (int32 lg = 1; lg < 3; ++lg) { E.LodGeosDropped += ParseLodGroup(Item, lg, Bones.Num(), LodGeos[lg], Problems, MeshName); }
+		ReadLodDist(Item, E.LodDist);
+		TArray<FSkinGeo>& Geos = LodGeos[0];
 		if (Geos.Num() == 0)
 		{
 			Problems.Add(FString::Printf(TEXT("%s: no geometry survived in DrawableModelsHigh (%d dropped)"), *MeshName, E.GeosDropped));
@@ -863,6 +919,113 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 		E.Geos = Geos.Num();
 		SK->SetMaterials(Mats);
 		SK->CommitMeshDescription(0);
+		// RUDE_PEDLOD: LOD1 / LOD2 from the Medium / Low groups. The skinning, the layout and the bone semantics
+		// are IDENTICAL to High in the game's own files (maintainer lane `ped_lods` (`LAWS.md`) laws 5.1-5.5), so
+		// this is the same fill against a different geometry list. A LOD geometry re-uses the High group's
+		// material slot BY ORDINAL (law 9.4: the counts match on 1,665/1,953 measured Medium groups); a surplus
+		// LOD geometry clamps onto the last slot and is COUNTED, never silently dropped.
+		E.LodVerts[0] = E.Verts; E.LodTris[0] = E.Tris; E.LodGeoCount[0] = Geos.Num();
+		if (FSkeletalMeshLODInfo* Lod0 = SK->GetLODInfo(0)) { Lod0->ScreenSize.Default = kPedLodScreenSize[0]; }
+		for (int32 lg = 1; lg < 3; ++lg)
+		{
+			if (LodGeos[lg].Num() == 0) { continue; }
+			// The UE LOD index is the next free slot, so an ABSENT lower group does not leave a hole. The counts
+			// below stay indexed by SOURCE group (that is what the corpus comparison reads), and the UE slot each
+			// group landed on is reported beside them - a divergence (only possible for a High+Low entry, a shape
+			// the corpus never ships: 0/1,152 and 0/2,125) is COUNTED and named, never silent, because on export
+			// UE LOD1 becomes DrawableModelsMedium (law 9.3).
+			const int32 LodIdx = SK->GetLODNum();
+			E.LodUeIndex[lg] = LodIdx;
+			if (LodIdx != lg)
+			{
+				++E.LodGroupRenumbered;
+				Problems.Add(FString::Printf(TEXT("%s: %s has no lower group before it, so it becomes UE LOD%d and would export as %s"),
+					*MeshName, kPedLodGroupTag[lg], LodIdx, kPedLodGroupTag[LodIdx]));
+			}
+			FSkeletalMeshLODInfo& LodInfo = SK->AddLODInfo();
+			// the LOD model slot must exist before the description is committed (the same law LOD0 rests on)
+			SK->GetImportedModel()->LODModels.Add(new FSkeletalMeshLODModel());
+			LodInfo.BuildSettings.bRecomputeNormals = false;
+			LodInfo.BuildSettings.bRecomputeTangents = true;
+			LodInfo.BuildSettings.bUseMikkTSpace = true;
+			LodInfo.LODHysteresis = 0.02f;
+			LodInfo.ScreenSize.Default = kPedLodScreenSize[lg];   // INFERRED (law 9.2), editor preview only
+			FMeshDescription* LodMD = SK->CreateMeshDescription(LodIdx);
+			if (!LodMD)
+			{
+				Problems.Add(FString::Printf(TEXT("%s: CreateMeshDescription(%d) failed - %s not built"), *MeshName, LodIdx, kPedLodGroupTag[lg]));
+				break;
+			}
+			FSkeletalMeshAttributes LodA(*LodMD);
+			LodA.Register();
+			LodA.GetVertexInstanceUVs().SetNumChannels(2);
+			for (int32 b = 0; b < Bones.Num(); ++b)
+			{
+				const FBoneID LodBID = LodA.CreateBone();
+				LodA.GetBoneNames()[LodBID] = FName(*Bones[b].Name);
+				LodA.GetBoneParentIndices()[LodBID] = Bones[b].Parent;
+				LodA.GetBonePoses()[LodBID] = GtaToUe(Bones[b].LocalGta);
+			}
+			TVertexAttributesRef<FVector3f> LodPositions = LodA.GetVertexPositions();
+			TVertexInstanceAttributesRef<FVector3f> LodNormals = LodA.GetVertexInstanceNormals();
+			TVertexInstanceAttributesRef<FVector2f> LodUVs = LodA.GetVertexInstanceUVs();
+			TVertexInstanceAttributesRef<FVector4f> LodColors = LodA.GetVertexInstanceColors();
+			TPolygonGroupAttributesRef<FName> LodSlotNames = LodA.GetPolygonGroupMaterialSlotNames();
+			FSkinWeightsVertexAttributesRef LodSkin = LodA.GetVertexSkinWeights();
+			int32 LodV = 0, LodT = 0;
+			for (int32 lgi = 0; lgi < LodGeos[lg].Num(); ++lgi)
+			{
+				const FSkinGeo& LG = LodGeos[lg][lgi];
+				if (lgi >= Mats.Num()) { ++E.LodSlotsClamped; }
+				const int32 LodSlotIdx = FMath::Clamp(lgi, 0, FMath::Max(0, Mats.Num() - 1));
+				const FName LodSlotName = Mats.IsValidIndex(LodSlotIdx) ? Mats[LodSlotIdx].MaterialSlotName : FName(TEXT("default__0"));
+				const FPolygonGroupID LodGID = LodMD->CreatePolygonGroup();
+				LodSlotNames[LodGID] = LodSlotName;
+				TArray<FVertexID> LodVIDs;
+				LodVIDs.Reserve(LG.Verts.Num());
+				for (const FSkinVert& LV : LG.Verts)
+				{
+					const FVertexID LodVID = LodMD->CreateVertex();
+					LodPositions[LodVID] = LV.P;
+					if (LV.NumW > 0)
+					{
+						LodSkin.Set(LodVID, UE::AnimationCore::FBoneWeights::Create(LV.Bone, LV.W, LV.NumW));
+					}
+					else
+					{
+						const uint16 LodRootBone = 0; const float LodOne = 1.f;
+						LodSkin.Set(LodVID, UE::AnimationCore::FBoneWeights::Create(&LodRootBone, &LodOne, 1));
+					}
+					LodVIDs.Add(LodVID);
+				}
+				for (int32 lt = 0; lt + 2 < LG.Indices.Num(); lt += 3)
+				{
+					const int32 J0 = LG.Indices[lt], J1 = LG.Indices[lt + 1], J2 = LG.Indices[lt + 2];
+					if (!LodVIDs.IsValidIndex(J0) || !LodVIDs.IsValidIndex(J1) || !LodVIDs.IsValidIndex(J2)) { ++E.LodTrisOutOfRange; continue; }
+					if (J0 == J1 || J1 == J2 || J0 == J2) { continue; }
+					TArray<FVertexInstanceID> LodInst;
+					const int32 LodCorner[3] = { J0, J1, J2 };
+					for (int32 c = 0; c < 3; ++c)
+					{
+						const FSkinVert& LV = LG.Verts[LodCorner[c]];
+						const FVertexInstanceID LodIID = LodMD->CreateVertexInstance(LodVIDs[LodCorner[c]]);
+						LodNormals[LodIID] = LV.N;
+						LodUVs.Set(LodIID, 0, LV.UV0);
+						LodUVs.Set(LodIID, 1, LV.UV1);
+						LodColors[LodIID] = LV.Col;
+						LodInst.Add(LodIID);
+					}
+					LodMD->CreateTriangle(LodGID, LodInst);
+					++LodT;
+				}
+				LodV += LG.Verts.Num();
+				E.LodUnweighted += LG.Unweighted;             // RUDE_PEDLOD: NOT E.Unweighted - that stays HIGH-only
+				E.LodOutOfRange += LG.InfluencesOutOfRange;   // (the outfit's VerticesWithoutWeights and the file totals read it)
+			}
+			SK->CommitMeshDescription(LodIdx);
+			E.LodVerts[lg] = LodV; E.LodTris[lg] = LodT; E.LodGeoCount[lg] = LodGeos[lg].Num();
+			++E.LodGroups;
+		}
 		SK->CalculateInvRefMatrices();
 		SK->SetSkeleton(Skeleton);
 		if (!Skeleton->MergeAllBonesToBoneTree(SK, false)) { Problems.Add(FString::Printf(TEXT("%s: the skeleton refused to merge this mesh's bones"), *MeshName)); }
@@ -1001,6 +1164,12 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 	{
 		D.Name = E.ResolvedName; D.Class = E.Class; D.Mesh = E.Mesh;
 		D.Vertices = E.Verts; D.Triangles = E.Tris; D.VerticesWithoutWeights = E.Unweighted;
+		// RUDE_PEDLOD: the entry's LOD groups and its four lodDist floats, so ExportYddBinary re-emits the
+		// entry's OWN values instead of the modal 9998 (maintainer lane `ped_lods` (`LAWS.md`) law 2.3).
+		D.LodGroups = E.LodGroups;
+		D.LodDist.Empty(); D.LodVertices.Empty(); D.LodTriangles.Empty();
+		for (int32 k = 0; k < 4; ++k) { D.LodDist.Add(E.LodDist[k]); }
+		for (int32 k = 0; k < 3; ++k) { D.LodVertices.Add(E.LodVerts[k]); D.LodTriangles.Add(E.LodTris[k]); }
 	};
 	int32 DrawablesInMatrix = 0, DrawablesResolved = 0, TexturesInMatrix = 0, TexturesResolved = 0;
 	if (bYmtRead)
@@ -1219,9 +1388,19 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 	}
 	for (const FImported& E : Entries)
 	{
-		MeshesJson += FString::Printf(TEXT("%s{\"entry\":\"%s\",\"name\":\"%s\",\"comp\":\"%s\",\"index\":%d,\"class\":\"%s\",\"asset\":\"%s\",\"geometries\":%d,\"geometriesDropped\":%d,\"vertices\":%d,\"triangles\":%d,\"unweighted\":%d,\"influencesOutOfRange\":%d,\"texturesBound\":%d,\"texturesMissing\":%d,\"ownSkeleton\":%s}"),
+		MeshesJson += FString::Printf(
+			TEXT("%s{\"entry\":\"%s\",\"name\":\"%s\",\"comp\":\"%s\",\"index\":%d,\"class\":\"%s\",\"asset\":\"%s\",\"geometries\":%d,\"geometriesDropped\":%d,\"vertices\":%d,\"triangles\":%d,\"unweighted\":%d,\"influencesOutOfRange\":%d,\"texturesBound\":%d,\"texturesMissing\":%d,\"ownSkeleton\":%s,")
+			// RUDE_PEDLOD: `vertices` / `triangles` / `geometries` above stay the HIGH group's; the LOD groups
+			// are reported beside them, index 0 = High (maintainer lane `ped_lods` (`LAWS.md`)).
+			TEXT("\"lodGroups\":%d,\"lodVertices\":[%d,%d,%d],\"lodTriangles\":[%d,%d,%d],\"lodGeometries\":[%d,%d,%d],\"lodSlotsClamped\":%d,\"lodDist\":[%g,%g,%g,%g],")
+			// the LOD groups' OWN problem counters - the four above them (geometriesDropped / unweighted /
+			// influencesOutOfRange, and the file-level totals) keep counting the HIGH group alone
+			TEXT("\"lodGeometriesDropped\":%d,\"lodUnweighted\":%d,\"lodInfluencesOutOfRange\":%d,\"lodTrianglesOutOfRange\":%d,\"lodUeIndex\":[%d,%d,%d],\"lodGroupRenumbered\":%d}"),
 			MeshesJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(E.EntryName), *RudeJsonEscape(E.ResolvedName), *E.Comp, E.Index, *E.Class,
-			*RudeJsonEscape(E.AssetPath), E.Geos, E.GeosDropped, E.Verts, E.Tris, E.Unweighted, E.OutOfRange, E.TexBound, E.TexMissing, E.bOwnSkeleton ? TEXT("true") : TEXT("false"));
+			*RudeJsonEscape(E.AssetPath), E.Geos, E.GeosDropped, E.Verts, E.Tris, E.Unweighted, E.OutOfRange, E.TexBound, E.TexMissing, E.bOwnSkeleton ? TEXT("true") : TEXT("false"),
+			E.LodGroups, E.LodVerts[0], E.LodVerts[1], E.LodVerts[2], E.LodTris[0], E.LodTris[1], E.LodTris[2],
+			E.LodGeoCount[0], E.LodGeoCount[1], E.LodGeoCount[2], E.LodSlotsClamped, E.LodDist[0], E.LodDist[1], E.LodDist[2], E.LodDist[3],
+			E.LodGeosDropped, E.LodUnweighted, E.LodOutOfRange, E.LodTrisOutOfRange, E.LodUeIndex[0], E.LodUeIndex[1], E.LodUeIndex[2], E.LodGroupRenumbered);
 	}
 	for (const FString& P : Problems) { ProblemsJson += FString::Printf(TEXT("%s\"%s\""), ProblemsJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(P)); }
 	return FString::Printf(
@@ -1452,7 +1631,9 @@ FString URudeToolset::SetPedProp(const FString& ActorLabel, const FString& Ancho
 // Every drawable the outfit knows (all slots, all indices, the High mesh) goes into stream/<ped>.ydd under
 // the game's own entry names (joaat(<comp>_<ddd>_<class>) = the game's hash), every texture imported from
 // the ped's dictionary goes into stream/<ped>.ytd under its own name, plus fxmanifest.lua. Streamed, the
-// pair shadows the game's files by name - edit one part in UE, export, the ped wears it. Rough: High only.
+// pair shadows the game's files by name - edit one part in UE, export, the ped wears it. Since WP12
+// (RUDE_PEDLOD) every LOD group the meshes carry is written, and each drawable's four lodDist floats ride
+// through to the writer as LODDIST= (maintainer lane `ped_lods` (`LAWS.md`) law 2.3).
 FString URudeToolset::ExportPedReplace(const FString& OutfitAssetPath, const FString& OutDir, const FString& Options)
 {
 	using namespace RudePeds;
@@ -1471,7 +1652,13 @@ FString URudeToolset::ExportPedReplace(const FString& OutfitAssetPath, const FSt
 	// 1) the dictionary: every drawable with a mesh, under the game's own entry name
 	TArray<FString> Problems;
 	FString Paths, Names;
-	int32 Drawables = 0, DrawablesWithoutMesh = 0;
+	// RUDE_PEDLOD: the four <LodDist*> floats each drawable shipped, in the SAME order as Paths / Names, handed to
+	// ExportYddBinary as `LODDIST=a/b/c/d,...`. ImportPed read them off the entry (maintainer lane `ped_lods`
+	// (`LAWS.md`) law 2.3) and the outfit carried them; this is the last leg, so the exported entry re-emits its
+	// OWN values. A drawable the outfit has no floats for contributes an EMPTY group and the writer falls back to
+	// the measured modal 9998 x4 - which is what 1,148/1,152 corpus entries spell anyway.
+	FString LodSpec;
+	int32 Drawables = 0, DrawablesWithoutMesh = 0, DrawablesWithLodDist = 0;
 	for (const FRudePedComponent& C : Outfit->Components)
 	{
 		for (const FRudePedDrawable& D : C.Drawables)
@@ -1480,12 +1667,23 @@ FString URudeToolset::ExportPedReplace(const FString& OutfitAssetPath, const FSt
 			if (MeshPath.IsEmpty() || D.Name.IsEmpty() || D.Name.EndsWith(TEXT("_?"))) { ++DrawablesWithoutMesh; continue; }
 			Paths += (Paths.IsEmpty() ? TEXT("") : TEXT(",")) + MeshPath;
 			Names += (Names.IsEmpty() ? TEXT("") : TEXT(",")) + D.Name;
+			LodSpec += Drawables ? TEXT(",") : TEXT("");
+			if (D.LodDist.Num() == 4)
+			{
+				LodSpec += FString::Printf(TEXT("%g/%g/%g/%g"), (double)D.LodDist[0], (double)D.LodDist[1], (double)D.LodDist[2], (double)D.LodDist[3]);
+				++DrawablesWithLodDist;
+			}
 			++Drawables;
 		}
 	}
 	if (Drawables == 0) { return Bad(TEXT("the outfit names no drawable with a mesh")); }
 	const FString YddPath = StreamDir / (Ped + TEXT(".ydd"));
-	const FString YddVerdict = ExportYddBinary(Paths, Names, YddPath, Options);
+	// RUDE_PEDLOD: the caller's Options are kept verbatim and the lodDist token is APPENDED for the component
+	// dictionary only - the prop dictionary below is rigid, always one group, and passes the untouched Options,
+	// so its bytes are unchanged.
+	FString YddOptions = Options.TrimStartAndEnd();
+	if (DrawablesWithLodDist > 0) { YddOptions += (YddOptions.IsEmpty() ? TEXT("") : TEXT(";")) + FString(TEXT("LODDIST=")) + LodSpec; }
+	const FString YddVerdict = ExportYddBinary(Paths, Names, YddPath, YddOptions);
 	const bool bYddOk = YddVerdict.Contains(TEXT("\"ok\":true"));
 	if (!bYddOk) { Problems.Add(TEXT("ydd: ") + YddVerdict.Left(300)); }
 	// RUDE_PEDPROPS_BEGIN export
@@ -1573,20 +1771,22 @@ FString URudeToolset::ExportPedReplace(const FString& OutfitAssetPath, const FSt
 			"-- Ped REPLACE resource for '%s': stream/%s.ydd and stream/%s.ytd carry the game's own file names,\n"
 			"-- so they shadow the vanilla files - no variation table (ymt) is needed. Every drawable the ped's\n"
 			"-- table lists is inside the dictionary under its vanilla entry name (joaat of <comp>_<ddd>_<class>).\n"
-			"-- High detail only (the game's own dictionaries carry three LOD groups); if a part vanishes at\n"
-			"-- distance, that is why. Textures are every name the vanilla dictionary held, re-encoded.\n"
+			"-- Every LOD group the meshes carry is written (High / Medium / Low). The game's own dictionaries\n"
+			"-- carry up to three: 823 of 1,152 measured entries carry all three, 182 two, 147 one. A part\n"
+			"-- exported from a mesh with a single LOD ships one group, which is a shape the game itself ships.\n"
+			"-- Textures are every name the vanilla dictionary held, re-encoded.\n"
 			"-- Props (hats / glasses / earpieces / watches): stream/%s_p.ydd + stream/%s_p.ytd when the ped has any.\n"),
 			*Ped, *Ped, *Ped, *Ped, *Ped);
 		ManifestState = FFileHelper::SaveStringToFile(Manifest, *ManifestPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM) ? TEXT("written") : TEXT("writeFailed");
 	}
 	FString ProblemsJson;
 	for (const FString& P : Problems) { ProblemsJson += (ProblemsJson.IsEmpty() ? TEXT("") : TEXT(",")) + FString::Printf(TEXT("\"%s\""), *RudeJsonEscape(P)); }
-	return FString::Printf(TEXT("{\"ok\":%s,\"ped\":\"%s\",\"outDir\":\"%s\",\"yddPath\":\"%s\",\"drawables\":%d,\"drawablesWithoutMesh\":%d,\"yddEntries\":%d,\"yddBytes\":%d,")
+	return FString::Printf(TEXT("{\"ok\":%s,\"ped\":\"%s\",\"outDir\":\"%s\",\"yddPath\":\"%s\",\"drawables\":%d,\"drawablesWithoutMesh\":%d,\"drawablesWithLodDist\":%d,\"yddEntries\":%d,\"yddBytes\":%d,")   // RUDE_PEDLOD
 		TEXT("\"ytdPath\":\"%s\",\"textures\":%d,\"ytdBytes\":%d,")
 		TEXT("\"props\":%d,\"propsExported\":%d,\"propsWithoutMesh\":%d,\"propYddPath\":\"%s\",\"propYddEntries\":%d,\"propYddBytes\":%d,\"propTextures\":%d,\"propYtdPath\":\"%s\",\"propYtdBytes\":%d,")
 		TEXT("\"manifest\":\"%s\",\"problems\":[%s]}"),
 		(bYddOk && (Textures == 0 || bYtdOk) && bPropYddOk && bPropYtdOk) ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Ped), *RudeJsonEscape(OutDir), *RudeJsonEscape(YddPath),   // RUDE_PEDPROPS: ok folds the prop verdicts in
-		Drawables, DrawablesWithoutMesh, JsonInt(YddVerdict, TEXT("entries"), -1), JsonInt(YddVerdict, TEXT("bytes"), -1),
+		Drawables, DrawablesWithoutMesh, DrawablesWithLodDist, JsonInt(YddVerdict, TEXT("entries"), -1), JsonInt(YddVerdict, TEXT("bytes"), -1),   // RUDE_PEDLOD
 		*RudeJsonEscape(YtdPath), Textures, JsonInt(YtdVerdict, TEXT("bytes"), -1),
 		Outfit->Props.Num(), Props, PropsWithoutMesh, *RudeJsonEscape(PropYddPath), JsonInt(PropYddVerdict, TEXT("entries"), -1), JsonInt(PropYddVerdict, TEXT("bytes"), -1), PropTextures, *RudeJsonEscape(PropYtdPath), JsonInt(PropYtdVerdict, TEXT("bytes"), -1),
 		*ManifestState, *ProblemsJson);

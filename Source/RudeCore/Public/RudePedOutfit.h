@@ -76,6 +76,28 @@ struct FRudePedDrawable
 
 	UPROPERTY(VisibleAnywhere, Category = "RUDE|Ped")
 	int32 VerticesWithoutWeights = 0;
+	// RUDE_PEDLOD_BEGIN drawable
+	// The entry's four <LodDist*> floats AS SPELLED (+0x70..0x7C). MEASURED a constant 9998,9998,9998,9998 on
+	// 2,119/2,125 game binary entries and 1,148/1,152 corpus entries: the ped's LOD switch distance is NOT
+	// stored here (maintainer lane `ped_lods` (`LAWS.md`) law 2). ExportPedReplace hands these four values to
+	// ExportYddBinary (`LODDIST=` in Options), which writes them at +0x70..0x7C - so an entry that deviates
+	// (4 corpus entries do, e.g. a three-group `uppr_000_u` reading 100/9998/9998/9998) re-exports its OWN
+	// values. Empty = never imported from a ped; the writer then uses the modal 9998 x4.
+	UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "RUDE|Ped")
+	TArray<float> LodDist;
+
+	// LOD groups the entry shipped and the import built: 1 (High only), 2 (+Medium), 3 (+Low). Measured over
+	// 1,152 corpus entries: 823 carry three, 182 two, 147 one; none carries a VeryLow group.
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Ped")
+	int32 LodGroups = 1;
+
+	// Per-LOD vertex / triangle counts of the imported mesh, index 0 = High (= Vertices / Triangles above).
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Ped")
+	TArray<int32> LodVertices;
+
+	UPROPERTY(VisibleAnywhere, Category = "RUDE|Ped")
+	TArray<int32> LodTriangles;
+	// RUDE_PEDLOD_END drawable
 };
 
 // One component slot of the ped (availComp position) with its drawables in ymt order.

@@ -376,6 +376,18 @@ public:
 	// texture letters), each prop a HIDDEN component on its anchor bone of the preview actor (SetPedProp shows one).
 	// Counts: props, propsImported, propsInMatrix/Resolved, propsSkinnedRefused, propTextures, anchorsUnmapped,
 	// propsAttached. Laws: maintainer lane `pedprops` (`LAWS.md.`) A streamed ped's per-prop folder layout is counted, not read.
+	// LOD GROUPS (WP12, RUDE_PEDLOD): a component ped ships each part with up to three LOD groups, and every
+	// one of them is imported - `DrawableModelsHigh` -> LOD0, `Medium` -> LOD1, `Low` -> LOD2 (823/1,152 corpus
+	// entries carry all three, 182 carry two, 147 carry one; none carries a VeryLow group). A LOD geometry
+	// re-uses the High group's material slot by ordinal and a surplus one is counted (`lodSlotsClamped`). The
+	// entry's four lodDist floats ride on the outfit (`FRudePedDrawable::LodDist`) and `ExportPedReplace` hands
+	// them to `ExportYddBinary` as `LODDIST=`, so the export re-emits the entry's own values. `FSkeletalMeshLODInfo`
+	// ScreenSize is INFERRED (1.0 / 0.4 / 0.15, fitted to the measured vertex ratios) and editor-only: no
+	// exported byte depends on it. Per mesh the verdict adds lodGroups / lodVertices / lodTriangles /
+	// lodGeometries / lodUeIndex (index 0 = High). ⚠ EVERY counter that existed before stays HIGH-only -
+	// vertices, triangles, geometries, geometriesDropped, unweighted, influencesOutOfRange - so the file-level
+	// totals keep the meaning they had; what the LOD groups add is counted beside them in lodGeometriesDropped /
+	// lodUnweighted / lodInfluencesOutOfRange / lodTrianglesOutOfRange. Laws: maintainer lane `ped_lods` (`LAWS.md`).
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V character (ped) into Unreal: its skeleton, every clothing piece as a skinned mesh, and its outfit variations."))
 	static FString ImportPed(const FString& CorpusRoot, const FString& PedName, const FString& DestFolder);
 
@@ -546,6 +558,33 @@ public:
 	// Position Normal Colour0 Colour1 TexCoord0 TexCoord1 Tangent, 2,674/2,677 prop geometries), `ped` or `ped_alpha`
 	// (bucket 1, 12 params, registers 0/2/5/6) by the slot's preset, entry +0x80 = 0xFF00 | OR(1<<bucket) (1,763/1,763).
 	// Mixed lists are fine (a rig is required only when a skinned mesh is present). maintainer lane `pedprops` (`LAWS.md.`)
+	// LOD GROUPS (WP12, RUDE_PEDLOD): every LOD the skeletal mesh carries is written, up to three groups -
+	// LOD0 -> `DrawableModelsHigh` (+0x50), LOD1 -> `Medium` (+0x58), LOD2 -> `Low` (+0x60); an absent group
+	// leaves its pointer AND its flag word raw zero (172/172 absent Medium and 555/555 absent Low words read 0x0
+	// in the game's files), and a VeryLow group is never written (0/2,125). Each present group owns its own
+	// geometry blocks, geoBounds, shader map, geometry array, model and 0x10 header - the game never shares one
+	// (the three header offsets ascend High < Medium < Low on 2,125/2,125 entries). A Medium/Low geometry is the
+	// SAME skinned form as High (mask 0x7F stride 48 on 1,980/1,984 and 1,573/1,579 geometries; model words
+	// (1,0,255,1); identity bone-id table over the same rig; weight bytes summing to 255 on 14,058/14,058 and
+	// 2,459/2,459 measured vertices). One shader per geometry across the groups in group order, so every LOD
+	// shader index is strictly greater than every High one (1,899/1,953 Medium, 1,525/1,570 Low); the game names
+	// its LOD shader `ped_default`, whose parameter table is UNMEASURED, so the High template is written and the
+	// difference is COUNTED (`lodShaderSubstituted`). `+0x80/84/88` = 0xFF00 | OR(1<<bucket) over THAT group's
+	// shaders (High 0xFF08 with Medium 0xFF01 on 257 entries). `Options` gains `LODDIST=a/b/c/d,a/b/c/d,...` -
+	// one four-float group per entry in the same order as the asset list, empty for an entry that has none;
+	// `ExportPedReplace` fills it from the outfit, so an entry re-emits the four floats the game spelled, and
+	// without the token the writer uses the measured modal 9998 x4 (2,119/2,125). `+0x98` (meaning UNKNOWN) is
+	// written from the GROUP COUNT - the modal over the 4,327-entry binary draw: 1 group 0x00120000 (1,038/2,374),
+	// 2 groups 0x003E0000 (276/383), 3 groups 0x005D0000 (1,140/1,570) - and the word written is reported per
+	// drawable (`u98`, `u98Basis`). ⚠ Over the SKINNED one-group subset alone the mode is 0x00220000 (62/172);
+	// RUDE writes the population modal, which is also the value an in-game-proven static drawable carried. The
+	// record's box / sphere (+0x20..0x4c) span EVERY present group - the better-attested of the two candidates
+	// (box size 280 vs 14, sphere radius 115 vs 6, where High-only and the union disagree). A mesh with ONE LOD
+	// produces exactly the bytes the single-group writer produced. Verdict adds lodGroups / lodVertices /
+	// lodTriangles / lodGeometries / lodShaderSubstituted / lodsSkipped / lodDist / lodDistCarried / u98 per
+	// drawable and geometriesAllLods / verticesAllLods / trianglesAllLods / lodDistCarried at the top;
+	// `vertices` / `triangles` / `geometries` stay the HIGH group's.
+	// Laws + denominators: maintainer lane `ped_lods` (`LAWS.md`).
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save clothing pieces (skinned meshes on a ped skeleton) as a finished GTA V clothing file the game loads directly."))
 	static FString ExportYddBinary(const FString& SkeletalMeshAssetPaths, const FString& DrawableNames,
 	                               const FString& OutYddPath, const FString& Options);
@@ -555,6 +594,13 @@ public:
 	// max blend index, indices inside the bone-id table, bone-id table size and identity), skeleton / bound
 	// presence, and the single-ownership audit (advisory on game files - an embedded texdict may share).
 	// Reads untrusted files: every access bounds-checked; malformed input returns ok:false.
+	// LOD GROUPS (WP12, RUDE_PEDLOD): per entry `lodGroups`, the four `lodDist` floats and four `lodFlags` words
+	// as stored, and a `groups` row per present group (models, geometries, vertices, triangles, its bone count
+	// at grmModel+0x28, its flag word, its lodDist), plus the entry's `+0x98` word as stored (`u98`) - the only
+	// field besides the LOD slots and flag words that moves with the group count, so a written file can be held
+	// against the game's. The entry-level and file-level totals stay HIGH-only so
+	// every number that existed before keeps its meaning; the all-group figures are reported beside them as
+	// geometriesAllLods / verticesAllLods / trianglesAllLods. maintainer lane `ped_lods` (`LAWS.md`).
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Inspect a GTA V clothing file and report its internals as raw JSON, without importing.", RudeAudience="agent"))
 	static FString ProbeYddBinary(const FString& BinPath);
 
@@ -755,6 +801,22 @@ public:
 	// `compare_ycd.py` (maintainer lane `ycd_export`). Returns JSON; ok is COMPUTED from the laws above.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Check an animation dictionary file RUDE wrote: that it is shaped and spelled the way the game's own files are.", RudeAudience="agent"))
 	static FString ProbeYcdXml(const FString& XmlPath);
+
+	// RUDE_PEDLOD_BEGIN header
+	// What LOD groups an imported ped part actually carries, and what the ydd writer would do with them.
+	// LOD0/1/2 map to the game's `DrawableModelsHigh` / `Medium` / `Low`; a 4th+ LOD is not exported (no
+	// measured component-ped entry carries a VeryLow group: 0/1,152 corpus entries, 0/2,125 game binary
+	// entries). Per LOD: vertices, triangles, polygon groups, material slots that do NOT resolve to a slot on
+	// the mesh (a LOD geometry re-uses the High group's slot by ordinal - a surplus one clamps and is counted),
+	// the editor ScreenSize and whether the export writes it. `ok` is COMPUTED: true when the mesh has at least
+	// one LOD and every polygon group's slot resolves. ⚠ ScreenSize is INFERRED and editor-only, and no exported
+	// byte reads it: the ydd's four lodDist floats travel a different road entirely - the outfit carries them
+	// from the source entry and `ExportPedReplace` hands them to `ExportYddBinary` as `LODDIST=`. They are never
+	// derived from ScreenSize, and ScreenSize is never derived from them (the game stores 9998 on 2,119/2,125
+	// entries, so the file holds no switch distance to convert). maintainer lane `ped_lods` (`LAWS.md`).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show how many distance versions a clothing piece has, and how big each one is.", RudeAudience="agent"))
+	static FString InspectPedLods(const FString& SkeletalMeshAssetPath);
+	// RUDE_PEDLOD_END header
 
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
