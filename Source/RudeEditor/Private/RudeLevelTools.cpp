@@ -3048,7 +3048,7 @@ FString URudeToolset::InspectMesh(const FString& AssetPath)
 	FString MatsJson;
 	for (const FStaticMaterial& SM : Mesh->GetStaticMaterials())
 	{
-		FString Diffuse = TEXT("unbound"), MatPath = TEXT("null");
+		FString Diffuse = TEXT("unbound"), MatPath = TEXT("null"), Master = TEXT("null"), Params;
 		if (SM.MaterialInterface)
 		{
 			MatPath = SM.MaterialInterface->GetPathName();
@@ -3056,10 +3056,29 @@ FString URudeToolset::InspectMesh(const FString& AssetPath)
 			{
 				UTexture* T = nullptr;
 				if (MI->GetTextureParameterValue(FMaterialParameterInfo(TEXT("Diffuse")), T) && T && !T->GetPathName().StartsWith(TEXT("/Engine/"))) { Diffuse = T->GetName(); }
+				// EVERY texture parameter the master exposes, and what this instance actually put in it
+				// (2026-09-06): reporting only Diffuse could not tell an unbound slot from an engine
+				// default, which is exactly the question a checkered surface asks. "engine:<name>" means
+				// the master's own default is showing - nothing of the game's went in.
+				if (UMaterialInterface* Par = MI->Parent)
+				{
+					Master = Par->GetName();
+					TArray<FMaterialParameterInfo> Infos; TArray<FGuid> Ids;
+					Par->GetAllTextureParameterInfo(Infos, Ids);
+					for (const FMaterialParameterInfo& I : Infos)
+					{
+						UTexture* PT = nullptr;
+						const bool bGot = MI->GetTextureParameterValue(I, PT) && PT;
+						const FString Val = !bGot ? FString(TEXT("none"))
+							: (PT->GetPathName().StartsWith(TEXT("/Engine/")) ? TEXT("engine:") + PT->GetName() : PT->GetName());
+						Params += FString::Printf(TEXT("%s{\"param\":\"%s\",\"texture\":\"%s\"}"), Params.IsEmpty() ? TEXT("") : TEXT(","),
+							*RudeJsonEscape(I.Name.ToString()), *RudeJsonEscape(Val));
+					}
+				}
 			}
 		}
-		MatsJson += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"diffuse\":\"%s\"}"), MatsJson.IsEmpty() ? TEXT("") : TEXT(","),
-			*RudeJsonEscape(SM.MaterialSlotName.ToString()), *RudeJsonEscape(MatPath), *RudeJsonEscape(Diffuse));
+		MatsJson += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"master\":\"%s\",\"diffuse\":\"%s\",\"textureParams\":[%s]}"), MatsJson.IsEmpty() ? TEXT("") : TEXT(","),
+			*RudeJsonEscape(SM.MaterialSlotName.ToString()), *RudeJsonEscape(MatPath), *RudeJsonEscape(Master), *RudeJsonEscape(Diffuse), *Params);
 	}
 	return FString::Printf(TEXT("{\"ok\":true,\"mesh\":\"%s\",\"renderBoundsM\":\"%.1fx%.1fx%.1f\",\"boundsCenterM\":\"%.1f,%.1f,%.1f\",")
 		TEXT("\"lod0Verts\":%d,\"lod0Tris\":%d,\"vertexMinM\":\"%.1f,%.1f,%.1f\",\"vertexMaxM\":\"%.1f,%.1f,%.1f\",")
