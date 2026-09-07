@@ -24,3 +24,9 @@ Thumbs.db
 *.ymt*
 *.dds
 *.rpf
+
+# Generated on the user's machine from their own game files - NEVER committed.
+# RUDE's front page promises this repository carries no game data (README, the limits table),
+# and a district catalog is derived from the game's own ymap families and extents.
+# BuildAreaCatalog writes it; ImportArea reads it; git must never see it.
+Catalogs/
