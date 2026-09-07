@@ -453,7 +453,10 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 		UMaterialExpressionTextureSampleParameter2D* Liv = MakeTex(TEXT("Diffuse2"), DefWhite, SAMPLERTYPE_Color, -700);
 		UMaterialExpressionScalarParameter* LivAmt = MakeScalar(TEXT("LiveryAmount"), 0.f, -760);
 		UMaterialExpressionMultiply* Mask = NewObject<UMaterialExpressionMultiply>(M);
-		Mask->A.Expression = Liv; Mask->A.OutputIndex = 4;   // the alpha output of the sample
+		// Connect(), not a raw assignment - see the tint branch below: an OutputIndex without its MASK
+		// reads the whole output instead of the alpha, so the livery would blend by colour rather than by
+		// its mask. Same defect, same fix, found together 2026-09-07.
+		Mask->A.Connect(4, Liv);   // the alpha output of the sample, with its mask
 		Mask->B.Expression = LivAmt; Add(Mask, -420, -700);
 		UMaterialExpressionLinearInterpolate* Lerp = NewObject<UMaterialExpressionLinearInterpolate>(M);
 		Lerp->A.Expression = BaseColor; Lerp->B.Expression = Liv; Lerp->Alpha.Expression = Mask; Add(Lerp, -170, -640);
@@ -506,7 +509,12 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 		UMaterialExpressionMultiply* RowV = NewObject<UMaterialExpressionMultiply>(M);
 		RowV->A.Expression = SelCentre; RowV->B.Expression = RowScale; Add(RowV, -1090, 860);
 		UMaterialExpressionAppendVector* PalUV = NewObject<UMaterialExpressionAppendVector>(M);
-		PalUV->A.Expression = DiffuseTex; PalUV->A.OutputIndex = 4;   // the ALPHA output of the diffuse sample
+		// ⛔ Connect(), NOT a raw assignment. Setting Expression and OutputIndex alone leaves the input's
+		// MASK at its default, and the compiler masks by the INPUT, so the alpha pin was selected by index
+		// and then read as the whole output - the zone index collapsed and every weapon sampled one column
+		// of the palette, which is why a tint changed nothing on screen. ConnectExpression copies
+		// Mask/MaskR/G/B/A off the output (MaterialExpressions.cpp:2093), which is the whole difference.
+		PalUV->A.Connect(4, DiffuseTex);   // the ALPHA output of the diffuse sample, with its mask
 		PalUV->B.Expression = RowV; Add(PalUV, -960, 860);
 		UMaterialExpressionTextureSampleParameter2D* PalTex =
 			MakeTex(TEXT("TintPalette"), DefWhite, SAMPLERTYPE_Color, 1020);
