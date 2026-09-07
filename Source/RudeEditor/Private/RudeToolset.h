@@ -818,6 +818,125 @@ public:
 	static FString InspectPedLods(const FString& SkeletalMeshAssetPath);
 	// RUDE_PEDLOD_END header
 
+	// ---- MLO AUTHORING: a NEW interior, made in Unreal (GDD Tier 1 interiors: import-AUTHOR-export) ----
+	// The third leg beside ImportMlo (bring one in) and ExportMloYtyp (write an EDITED one back into its own
+	// file). Here nothing came from the game: the rooms, the portals, the entity list, the CMloArchetypeDef
+	// and its ymap instance are all authored, and ExportNewMlo writes the two files FiveM loads.
+	//
+	// THE SURFACE IS WORKFLOW-FREE. There is no interior mode and no registry to keep in step:
+	//   * a ROOM is an ARudeMloRoomVolume box you place and scale; it carries the room's own CMloRoomDef
+	//     fields (name, flags, blend, the two timecycle names, floorId, exteriorVisibiltyDepth - the game's
+	//     own misspelling, kept). Its BOX is the room's bounds; portalCount is DERIVED, never authored.
+	//   * a PORTAL is a thin ARudeMloPortalVolume box across a doorway. The room volumes it touches give
+	//     roomFrom/roomTo; the mid-plane of its thinnest axis gives the four corners.
+	//   * an ENTITY is ANY static-mesh actor standing inside a room volume whose mesh resolves to an
+	//     archetype - through its URudeMloEntityComponent, its URudeEntityComponent, the palette
+	//     (AddMloProp reads a URudeArchetype), or failing those the mesh's own asset name.
+	// Drag a prop into another room and it changes rooms. Delete a volume and the interior loses a room.
+	//
+	// Measured on the corpus 2026-09-06 over 424 MLO ytyps / 541 CMloArchetypeDef / 2,143 rooms / 3,466
+	// portals / 67,440 entities and the 1,745 ymaps that carry a CMloInstanceDef - maintainer lane
+	// `mlo_author` (`LAWS.md`). The laws that shape the tools below:
+	//   * the archetype's 22 children are ONE order in 541/541, and flags / specialAttribute /
+	//     hdTextureDist / assetType / the three dictionaries / extensions are fixed in 541/541 (law 1).
+	//   * bbMin/bbMax/bsCentre/bsRadius are ZERO in 541/541, so the corpus cannot teach the rule; RUDE
+	//     writes the union of the rooms and props and says so (law 2 - the lane's one deviation, NOTES.md).
+	//   * room 0 is `limbo` in 541/541, with flags 96 / blend 1 / an EMPTY timecycle / depth -1 (law 3).
+	//   * portalCount == the portals naming that room in 2,143/2,143 - DERIVED (law 4).
+	//   * membership is the attachedObjects ORDINAL list, not geometry: an entity sits inside its own
+	//     room's box in only 30,779/66,332, so containment is an authoring convenience (law 6).
+	//   * a portal is 4 coplanar corners spelled "x, y, z, NaN" (13,864/13,864) with roomFrom NEVER limbo
+	//     (0/3,466); the L H H L corner order is the plurality (1,762/3,206) and the winding relative to
+	//     the room pair is NOT recoverable (towards roomFrom 1,855 / towards roomTo 1,609 / degenerate 2
+	//     of 3,466). RUDE winds towards roomTo - the 1,609 MINORITY half, chosen for determinism, not
+	//     because the game leans that way (laws 8, 9).
+	//   * one CMloInstanceDef per ymap (1,745/1,745), 22 fields in one order, numExitPortals = the portals
+	//     touching limbo, contentFlags bit 0x40 <-> a non-empty <physicsDictionaries> (1,745/1,745) (law 10).
+
+	// Spawn the interior's ROOT actor (tags RUDE_MLO:<name>, RUDE_MLO_ROOT, RUDE_MLO_AUTHORED - and
+	// deliberately NO RUDE_MLO_Ytyp, so ExportMloYtyp never tries to splice a source file this interior does
+	// not have). Its transform is where the interior stands in the world: everything else is written
+	// MLO-local, so moving the root re-places the whole interior and changes nothing inside it.
+	// InteriorName is the archetype name, the ytyp file name and a joaat key, so it must be lower-case
+	// a-z / 0-9 / _ (540/541 corpus MLO names are). LocationCm = "x,y,z" UE centimetres (default 0,0,0).
+	// Re-running on an existing interior returns {created:false} and leaves the level alone.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Start a brand-new interior in the level: give it a name and where it stands.", RudeAudience="agent"))
+	static FString NewMloInterior(const FString& InteriorName, const FString& LocationCm);
+
+	// Add one ROOM to an authored interior: an ARudeMloRoomVolume box, centred at CenterCm relative to the
+	// interior root, with ExtentCm as its HALF sizes (all three positive - 1,589/1,591 finite corpus room
+	// boxes are non-degenerate). Fields is "key=value;key=value" over
+	// limbo | flags | blend | timecycle | secondaryTimecycle | floorId | exteriorDepth; an unknown key is
+	// REFUSED rather than ignored, so a typo can never silently do nothing. Defaults are the corpus modes:
+	// flags 96 (685/1,602), blend 1 (1,598/1,602), floorId 0 (1,183/1,602), exteriorDepth -1 (1,602/1,602),
+	// timecycle EMPTY (the game names one in 1,599/1,602 but every name is an unrecoverable joaat hash).
+	// A room named `limbo` (or limbo=true) is THE limbo room - index 0, and FOUR of its fields are forced,
+	// here and again at export: flags 96, blend 1, an EMPTY timecycleName and exteriorVisibiltyDepth -1
+	// (541/541 each, law 3). `floorId` is NOT forced - room 0's floorId was never binned, and an unmeasured
+	// field stays the author's. Leave limbo out and ExportNewMlo synthesizes it from the union of the rooms.
+	// A RoomName or timecycle name carrying whitespace or an XML special (< > & " ' tab newline) is REFUSED
+	// here AND re-checked at export, because both land in element TEXT with no escaping and a volume can
+	// also be placed by hand and retyped in the details panel without this tool ever running.
+	// Returns {ok, interior, room, limbo, actor, flags, floorId}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Add a room to an interior you are building: a box, with the room's own name and settings.", RudeAudience="agent"))
+	static FString AddMloRoom(const FString& InteriorName, const FString& RoomName,
+	                          const FString& CenterCm, const FString& ExtentCm, const FString& Fields);
+
+	// Add one PORTAL: a thin ARudeMloPortalVolume box across a doorway. ExtentCm are HALF sizes and the
+	// SMALLEST of the three picks the portal plane, so a portal is a slab, not a cube. roomFrom / roomTo come
+	// from the room volumes the slab overlaps - two rooms give both sides, ONE room gives an exit to limbo
+	// (roomTo 0; the game spells 2,116/3,466 portals that way and roomFrom is limbo in 0/3,466). Fields is
+	// "key=value;..." over flags | mirrorPriority | opacity | audioOcclusion | roomFrom | roomTo, the last two
+	// being the escape hatch when a slab overlaps three rooms and the graph is genuinely ambiguous. Supplying
+	// only ONE of them is fine: the other still comes from the volumes the slab touches when exactly two are
+	// touched, so a half-overridden internal doorway is never quietly turned into an exit to limbo.
+	// Returns {ok, interior, actor, flags, thinAxisExtentCm}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Add a doorway between two rooms of an interior you are building (or out of the interior), as a thin box.", RudeAudience="agent"))
+	static FString AddMloPortal(const FString& InteriorName, const FString& CenterCm,
+	                            const FString& ExtentCm, const FString& Fields);
+
+	// Place one PROP inside an authored interior: a static-mesh actor at LocationCm / RotationDeg relative to
+	// the interior root, carrying a URudeMloEntityComponent that names the archetype. PaletteFolder is where
+	// BuildArchetypePalette put its URudeArchetype assets - the archetype's mesh is used when the palette has
+	// it, and /Engine/BasicShapes/Cube stands in (tag RUDE_PROXY) when it does not, so an interior can be
+	// blocked out before a single drawable is imported. The room the prop ends up in is NOT stored: it is
+	// resolved from the room volume containing it at export, which is what makes dragging a prop between
+	// rooms work. Returns {ok, interior, archetype, actor, palette, mesh}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Put a prop inside an interior you are building, by archetype name.", RudeAudience="agent"))
+	static FString AddMloProp(const FString& InteriorName, const FString& ArchetypeName,
+	                          const FString& LocationCm, const FString& RotationDeg, const FString& PaletteFolder);
+
+	// WRITE the authored interior as a FiveM resource: <OutDir>/stream/<name>.ytyp (a complete new
+	// CMloArchetypeDef - the 22 children in the 541/541 order, bounds from the rooms and props, room bounds
+	// from the volumes, attachedObjects from containment, portal corners in MLO-LOCAL space, floats spelled
+	// the way the game's own writer spells them), <OutDir>/stream/<name>.ymap (ONE CMloInstanceDef at the
+	// interior root's transform, the 22 fields in the 1,745/1,745 order) and fxmanifest.lua. UTF-8 without a
+	// BOM and LF: 0/2,765 corpus ytyps and 0/19,387 ymaps carry a BOM, and every MLO-bearing file is LF
+	// (0/424 ytyps, 0/1,745 ymaps; corpus-wide 6 ytyps and 4 ymaps are CRLF and none of them carries an MLO).
+	// Entity ordinals are assigned by (room, archetype, actor name) so two runs of the same level produce the
+	// same file. CorpusRoot is optional and only reports whether each archetype resolves to a drawable there:
+	// a LOWER BOUND (a drawable can live in a ydd or yft the ledger names differently), so it never fails the
+	// export.
+	// Returns JSON: {ok, written, interior, ytyp, ymap, rooms, portals, entities, entitiesUnmapped,
+	// portalsWithoutTwoRooms, portalsAmbiguousPlane, bounds[6], bsRadius, limboSynthesized, limboFieldsForced,
+	// limboAttached, attachedTotal, numExitPortals, roomsWithoutPortals, adoptedUntagged, nonUniformScaleXY,
+	// hiddenIncluded, alsoYmapEntity, orphanVolumes, archetypesInCorpus, archetypesNotInCorpus, refused[]}.
+	// ok is COMPUTED and an INVALID GRAPH refuses: no room, two rooms sharing a name, a degenerate box, a
+	// room or timecycle name carrying whitespace or an XML special, a prop whose mesh names no archetype, or
+	// a portal that does not touch exactly one or two rooms (roomFrom/roomTo are not guessable from a
+	// three-way overlap, and up to 10 portals in one interior share a room pair, so uniqueness cannot break
+	// the tie either).
+	// THE REFUSAL SET IS COMPUTED BEFORE ANYTHING IS WRITTEN: a refused interior leaves the file system
+	// untouched (`written:false`), so a broken .ytyp never sits in a stream/ folder beside an fxmanifest.lua
+	// telling the game to load it. `ytyp` / `ymap` are the paths the interior WOULD occupy; a refusal does
+	// not delete an earlier good export of the same name. `limboFieldsForced` counts how many of limbo's
+	// five 541/541 values (the name plus those four fields) the author's volume disagreed with, so the
+	// forcing is never invisible;
+	// `orphanVolumes` counts volumes that name no interior in a level holding several - a dropped room is
+	// exactly the failure nothing downstream can see.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Write the interior you built in Unreal out as a FiveM resource the game loads - its definition file and the map that places it."))
+	static FString ExportNewMlo(const FString& InteriorName, const FString& OutDir, const FString& CorpusRoot);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

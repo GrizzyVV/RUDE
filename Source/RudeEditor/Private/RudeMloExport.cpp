@@ -119,7 +119,9 @@ static bool RudeMloFindIntList(const FString& Text, const FString& Indent, const
 
 // The same element re-rendered the way the game's writer spells it (law 8: 926/926 short lists inline,
 // 1,193/1,193 long attachedObjects and 472/472 long locations lists in full lines of ten at Indent+1).
-static FString RudeMloIntList(const FString& Indent, const TCHAR* Tag, const TArray<int32>& V)
+// Not static since 2026-09-06: the MLO AUTHORING lane (RudeMloAuthor.cpp) spells a room's
+// <attachedObjects> with the SAME renderer, so the two lanes cannot drift apart.
+FString RudeMloIntList(const FString& Indent, const TCHAR* Tag, const TArray<int32>& V)
 {
 	if (V.Num() == 0) { return FString::Printf(TEXT("%s<%s />\n"), *Indent, Tag); }
 	FString O;
@@ -368,7 +370,7 @@ FString URudeToolset::ExportMloYtyp(const FString& OutDir, const FString& MloArc
 	const FString ImportFile = RudeMloTagValue(Root, TEXT("RUDE_MLO_YtypFile:"));
 	if (YtypAsset.IsEmpty())
 	{
-		return Fail(FString::Printf(TEXT("interior '%s' was built before the export lane (no RUDE_MLO_Ytyp tag) - re-run ImportMlo"), *Name));
+		return Fail(FString::Printf(TEXT("interior '%s' has no source ytyp (no RUDE_MLO_Ytyp tag). An interior AUTHORED in RUDE has no file to splice - write it with ExportNewMlo instead; one that came from the game predates this lane - re-run ImportMlo"), *Name));
 	}
 	const FRudeCorpusEntry* Entry = Corpus->Effective(TEXT("ytyp"), YtypAsset);
 	if (!Entry) { return Fail(FString::Printf(TEXT("no ytyp '%s' in the corpus"), *YtypAsset)); }
