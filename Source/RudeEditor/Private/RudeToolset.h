@@ -1250,6 +1250,80 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Print an imported animation network's states and transitions as plain text.", RudeAudience="agent"))
 	static FString PrintMoveNetwork(const FString& NetworkAssetPath, const FString& MaxLines);
 
+	// ---- WP13 cutscene_export lane (RudeCutsceneExport.cpp) ----
+	// The container's own structure, read straight from the game's file - the measurement ImportCutscene and
+	// ExportCutscene both rest on, available without importing anything. Reports the six top-level lists
+	// (pCutsceneObjects, pCutsceneLoadEventList, pCutsceneEventList, pCutsceneEventArgsList, concatDataList,
+	// discardFrameList), whether each cuts into <Item> slices that concatenate back to the block's own bytes
+	// (the splice model's precondition), the event/argument/camera-cut counts, how many events carry no
+	// arguments (iEventArgsIndex -1), whether the events are in time order, and how many numbers
+	// <cameraCutList> holds. `ok` is COMPUTED from the slice exactness and from the document surviving the
+	// editor's text loader byte-for-byte - it is not a liveness ping.
+	// Measured over the maintainer's filebase (maintainer lane `cutscene_export` (`LAWS.md`), 2026-09-07):
+	// 816 cutscenes / 201,718,385 bytes / 226,559 events; CRLF in 816/816; every one of the six lists slices
+	// exactly in 816/816; <cameraCutList> holds 8,066 numbers across the corpus and its count matches the
+	// file's camera-cut event count in only 53 of 816 files - which is why nothing derives one from the other.
+	// CorpusRoot: filebase root (ledger type "cut") or a folder holding <name>.cut.pso.xml; CutName: e.g. ah_1_int.
+	// When the corpus holds several copies of a cut name it opens the EFFECTIVE one (the game's own override
+	// order) - 33 of 781 cut names in the maintainer's filebase have more than one copy and 32 of those differ.
+	// ⛔ DRAFT (2026-09-07): never compiled and never run in the editor.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Look inside a GTA V cutscene file and report what it contains, without importing it.", RudeAudience="agent"))
+	static FString ProbeCutsceneSource(const FString& CorpusRoot, const FString& CutName);
+
+	// Move one cutscene event in time, on the sidecar ImportCutscene wrote (URudeCutsceneEvents). The sidecar is
+	// the truth for an event's time; ExportCutscene splices that one line back into the source document, so this
+	// is the scriptable edit the export gate uses.
+	// EventsAssetPath: /Game/RUDE/Cutscenes/<cut>/DA_<cut>_events.
+	// EventSelector: the event's ordinal in the sidecar's Events array (load list first, then the event list, in
+	// file order), or "CAMERACUT:<k>" for the k-th camera-cut event, counting from 0.
+	// NewTimeSeconds: seconds from the start of the cutscene; negative is refused.
+	// ⛔ It does NOT move the matching camera-cut section in the Level Sequence. ExportCutscene compares the two
+	// and, when both moved a cut to different times, refuses by name rather than picking a winner.
+	// Returns JSON: {ok, asset, cut, index, list, eventId, argsType, from, to}.
+	// ⛔ DRAFT (2026-09-07): never compiled and never run in the editor.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Move one event of an imported cutscene to a new time, in seconds.", RudeAudience="agent"))
+	static FString SetCutsceneEventTime(const FString& EventsAssetPath, const FString& EventSelector, const FString& NewTimeSeconds);
+
+	// Write an edited cutscene back out as a .cut.pso.xml by SPLICING the source document's own bytes: with no
+	// edit the splice is a no-op, so the document written IS the source document, and an edited time rewrites
+	// nothing but that event's own <fTime> digits. The read half is ImportCutscene; this is its write half.
+	// ⛔ DRAFT (2026-09-07): never compiled, and no gate row has been run in the editor - the sentences below
+	//    describe the CODE, not a run. ❓ No exported .cut has ever been loaded by the game; this lane's whole
+	//    measure is byte identity against the source file, which is weaker than "the game accepts it".
+	// What it reads as an edit:
+	//   * the sidecar's Events[i].Time, written by SetCutsceneEventTime. The sidecar's fields are
+	//     VisibleAnywhere, so the asset editor SHOWS them and cannot change them - there is no hand-edit
+	//     path today, and the scriptable call is the only writer;
+	//   * a camera-cut section moved in the Level Sequence's camera cut track - paired to the cutscene's
+	//     rage__cutfCameraCutEventArgs events in file order (ImportCutscene's synthetic cut at 0, added when the
+	//     first real cut is later, stands for no event and is allowed to be one extra section).
+	//   * When both moved the SAME cut to different times it refuses by name rather than picking a winner.
+	// REFUSES BY NAME, never writing a guess: an added or removed event / object / argument record (a new event
+	// type lands here), an event whose type, id, argument index or list changed, an event whose <fTime> line does
+	// not have the measured shape, a camera cut added to or removed from the Level Sequence, and an edit that
+	// moves an event past its neighbour - the file stores its events in time order (816 of 816 measured files,
+	// both lists), so that is a REORDER, which no splice can express.
+	// What it never touches: <cameraCutList> (a DIFFERENT list - its count matches the file's camera-cut event
+	// count in only 53 of 816 measured files, so RUDE never derives one from the other and says so in the
+	// verdict), the argument records (11,929 of 125,684 are shared between events, so an event-shaped edit to one
+	// would silently move another event's arguments), the concat rows, the discard frames, and the schema tail.
+	// Everything the sidecar carried rides back out as the source file's own bytes, verbatim.
+	// LevelSequenceAssetPath: /Game/RUDE/Cutscenes/<cut>/LS_<cut>; its DA_<cut>_events sidecar must sit beside it.
+	// OutPath: a path ending .xml, or a folder to drop <cut>.cut.pso.xml into.
+	// CorpusRoot: filebase root (ledger type "cut") or a folder; empty = the source file the sidecar recorded.
+	// Options: DRYRUN (compute the splice and the verdict, write nothing), STRICTCUTLIST (refuse a camera-cut
+	// time change instead of leaving <cameraCutList> as the file spells it).
+	// Returns JSON: {ok, cut, levelSequence, eventsAsset, source, resolvedBy, out, written, sourceBytes,
+	// bytesIdentical, events, eventsUnchanged, eventsEdited, cameraCutEdits, editsFromSequence, cameraCutSections,
+	// cameraCutEvents, cutsPaired, objectIdMismatches, objects, eventArgs, concatRows, discardRows, lineEndings,
+	// cameraCutListUntouched, edits[{event,list,cameraCut,editor,from,to}], refusals[], note}.
+	// cameraCutListUntouched is COMPUTED
+	// from the two documents; bytesIdentical describes the document RUDE would write, so on a refusal it reads
+	// true while written reads false - read written and refusals[] for the outcome.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Write an edited cutscene back out as a .cut.pso.xml file, by splicing the source file's own bytes - nothing is rewritten but an edited event's time digits. DRAFT: never run yet."))
+	static FString ExportCutscene(const FString& LevelSequenceAssetPath, const FString& OutPath,
+	                              const FString& CorpusRoot, const FString& Options);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

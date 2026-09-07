@@ -66,3 +66,4 @@ public class RudeEditor : ModuleRules
 		});
 	}
 }
+// WP13 cutscene_export: RudeCutsceneExport.cpp (ExportCutscene / SetCutsceneEventTime / ProbeCutsceneSource).
