@@ -59,6 +59,10 @@ public class RudeEditor : ModuleRules
 			"LevelSequence",
 			"MovieScene",
 			"MovieSceneTracks",
+			// WP13 vfx_move lane (RudeVfxMove.cpp): ypt effect dictionaries and mrf MoVE networks,
+			// both READ-ONLY. It needs no module the list above does not already carry - this note is
+			// here because touching Build.cs is what invalidates the module file list, and a NEW .cpp
+			// that the list has not been rebuilt for fails at LINK with no other symptom (AGENTS 5).
 		});
 	}
 }

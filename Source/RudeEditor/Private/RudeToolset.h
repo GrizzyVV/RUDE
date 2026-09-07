@@ -1171,6 +1171,85 @@ public:
 	static FString AddPedDrawable(const FString& OutfitAssetPath, const FString& Slot, const FString& MeshAssetPath, const FString& TextureAssetPaths);
 	// RUDE_PEDVAR_END header
 
+	// ---- WP13 vfx_move lane (RudeVfxMove.cpp): the two GDD Tier 3 formats, both READ-ONLY ----
+	// One .ypt's effect rules as URudeParticleEffect DataAssets, one asset per EFFECT RULE, under
+	// <DestFolder>/<ypt>/. EffectName is "<ypt>" for every rule in that dictionary or "<ypt>/<rule>"
+	// for one; both halves are needed to name an effect, because 2,549 distinct effect-rule names occur
+	// 10,268 times across the corpus's 1,240 ypt files and a rule name alone is ambiguous.
+	// READS (measured over 10,268 effect rules, maintainer lane `vfx_move` (`LAWS.md`)): the 43 fields
+	// every effect rule carries, plus EvolutionList on 8,441 of them; the rule's EventEmitters (27,676
+	// corpus-wide) with the emitter and particle rule each names - 27,676/27,676 of those references
+	// resolve inside the SAME file's dictionaries, so the lane never needs a cross-file lookup; and a
+	// shallow read of each referenced emitter rule (creation/target domain shape - Cylinder 1,619 /
+	// Sphere 1,413 / Box 1,114 over the base slot's 4,146) and particle rule (ShaderFile: ptfx_sprite
+	// 21,074 / ptfx_trail 763 of 21,837, technique, draw type, behaviour list). Distances and offsets
+	// become UE centimetres with the house Y mirror; everything else is carried as spelled, and EVERY
+	// leaf field of every record is also kept in a raw field map so an unread field is visible, not
+	// dropped.
+	// ⛔ PREVIEW TIER and NOT a conversion: no Niagara system, no curve evaluated (40,055 of the
+	// corpus's 51,340 effect-rule keyframe props carry zero keys), no particle material, no drawable or
+	// texture imported, and NO WRITER - nothing in RUDE emits a .ypt. Full authoring is a later epic.
+	// Returns JSON: {ok, ypt, slot, file, sha1, effectRules, matched, created, refilled, eventEmitters,
+	// rulesRead, rulesUnresolved, keyframeProps, keyframePropsWithKeys, drawablesNotImported,
+	// texturesNotImported, invalidNames, destFolder, tier, note, sample[]}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Read a particle-effect file's effects into the editor so you can look at what each one is made of. It is a read-only preview: nothing is turned into a working effect and nothing is written back."))
+	static FString ImportParticleEffects(const FString& CorpusRoot, const FString& EffectName, const FString& DestFolder);
+
+	// A placement stand-in for one imported effect: an ARudeParticlePreview with a wireframe sphere at
+	// the effect's own culling radius and a text label. It spawns at LocationCm ("x,y,z" in
+	// centimetres) PLUS the effect's ViewportCullingSphereOffset, so the marker is centred on the
+	// culling volume, not on the point passed in; the verdict's locationCm says where it went.
+	// ⛔ An APPROXIMATION of WHERE the effect sits and roughly how far it reaches - it does not
+	// simulate, emit or render the effect and it is not a conversion of one. The marker is a SPHERE
+	// whatever the emitter's creation domain says; the domain is recorded on the actor, not drawn.
+	// Neutral by default: radius = ViewportCullingSphereRadius, else DistanceCullingCullDist, else
+	// 100 cm, and radiusSource says which was used.
+	// Returns JSON: {ok, effect, ypt, actor, locationCm, radiusCm, radiusSource, creationDomain,
+	// approximation}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Drop a marker in the level showing where a particle effect would sit and roughly how far it reaches. The marker is centred on the effect's own culling sphere, so it can sit a little off the point you give. It is a stand-in, not the effect itself."))
+	static FString PlaceParticlePreview(const FString& EffectAssetPath, const FString& LocationCm);
+
+	// Re-read one ypt out of the corpus and count the lane's structural laws on it without creating a
+	// single asset: the four dictionaries' sizes, the event-emitter count and how many of its
+	// emitter/particle references resolve in-file, how many keyframe props carry keys, the shader-file
+	// and creation-domain census, and the first effect rule's field-tag count. The instrument a gate
+	// runs when it wants numbers rather than assets. `ok` is COMPUTED: true only when the file parses,
+	// its root is <ParticleEffectsList>, and every reference resolves in-file (27,676/27,676
+	// corpus-wide, so an unresolved one is news).
+	// Returns JSON: {ok, ypt, slot, file, bytes, effectRules, emitterRules, particleRules, drawables,
+	// textures, unreferencedStrings, eventEmitters, refsResolved, refsUnresolved, keyframeProps,
+	// keyframePropsWithKeys, firstEffectFieldTags, shaderFiles{}, creationDomains{}}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Count what is inside one particle-effect file without importing anything.", RudeAudience="agent"))
+	static FString ProbeYptXml(const FString& CorpusRoot, const FString& YptName);
+
+	// One .mrf (a MoVE animation network) as a URudeMoveNetwork DataAsset: the node tree flattened
+	// (index, parent, depth, type, name, clip reference, every leaf field verbatim), every transition
+	// with its conditions, and the trigger and flag bit tables.
+	// Measured over the corpus's 162 .mrf files (maintainer lane `vfx_move` (`LAWS.md`)): 42,772 typed
+	// elements in 35 kinds, of which 9,136 are transition CONDITIONS - leaving 33,636 graph nodes in 23
+	// kinds, the two sets disjoint; 8,000 transitions ALL carrying the same 18 fields (plus SynchronizerTagFlags
+	// on the 493 whose SynchronizerType is Tag), 9,136 conditions in 12 kinds, 1,050 triggers and 945
+	// flags; 124 networks root in a StateMachine and 38 in a bare State.
+	// ⛔ READ-ONLY TIER: no AnimBlueprint, no AnimGraph, no UE state machine is generated, and NO
+	// WRITER - nothing in RUDE emits a .mrf. A full AnimBlueprint projection is a later epic, and two
+	// measured facts say why the graph alone is the honest deliverable: 25,908 of the 26,565 non-empty
+	// node names are hash_XXXXXXXX (the file does not spell its own identifiers), and 5,046 of the
+	// 5,264 clip records name a clip SET rather than a clip, whose contents live outside the .mrf.
+	// Returns JSON: {ok, network, slot, file, sha1, nodes, states, stateMachines, clips, transitions,
+	// transitionsResolved, transitionsUnresolved, conditions, triggers, flags, hashedNames, plainNames,
+	// rootType, created, refilled, asset, tier, note, nodeTypes{}}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Read one animation network into the editor so its states and transitions can be looked at. It is a read-only view: no animation blueprint is built and nothing is written back."))
+	static FString ImportMoveNetwork(const FString& CorpusRoot, const FString& NetworkName, const FString& DestFolder);
+
+	// The graph of an imported URudeMoveNetwork as indented text, so it can be READ headlessly - the
+	// point of the read-only tier. Each node prints as "<indent>[i] <type> <name> <role>" with its clip
+	// reference when it has one; each transition as "-> <target> <duration>s <blend> <sync> if
+	// <conditions>". MaxLines caps the output (default 200, "0" = all) and the verdict says whether it
+	// truncated. The text also goes to the log, so a -script= run shows it without a viewer.
+	// Returns JSON: {ok, network, nodes, transitions, lines, printed, truncated, text}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Print an imported animation network's states and transitions as plain text.", RudeAudience="agent"))
+	static FString PrintMoveNetwork(const FString& NetworkAssetPath, const FString& MaxLines);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);
