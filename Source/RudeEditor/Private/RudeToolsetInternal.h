@@ -109,5 +109,11 @@ struct FRudeMloRaw
 // when the file does not have the measured shape (CRLF, a leftover byte between items, a set without <locations>):
 // the caller refuses, never guesses.
 bool RudeMloSliceRaw(const FString& Doc, const FString& MloName, FRudeMloRaw& Out, FString& OutError);
+// The scalar-list rendering the game's writer uses, shared with the MLO AUTHORING lane (RudeMloAuthor.cpp):
+// empty -> "<Tag />", 1..10 values inline on one line, 11+ wrapped ten per line one indent deeper
+// (maintainer lane `mlo_export` (`LAWS.md`) law 8: 926/926 short lists inline, 1,193/1,193 long
+// attachedObjects and 472/472 long locations lists in full lines of ten). A room's <attachedObjects> is
+// spelled by this function whether the list came from a splice or from an authored interior.
+FString RudeMloIntList(const FString& Indent, const TCHAR* Tag, const TArray<int32>& V);
 // RudeNum (RudeLevelTools.cpp, file-local) for other translation units: a float32 as the game's files spell it.
 FString RudeNumText(double V);
