@@ -47,7 +47,7 @@ Being straight about this is more useful than a feature list.
 | 🟡 **The extractor is a separate, public tool.** | The maintainer's own extractor, [ROUT](https://github.com/GrizzyVV/ROUT---RAGE-Exporter-App), writes exactly the filebase RUDE reads (see [the folder contract](#the-folder-contract)). Any other tool that produces that shape works too; RUDE never asks which one wrote it. Getting the assets out is still the longest part of day one. |
 | 🔴 **`ImportArea "Downtown"` needs a district catalog that is not in this repo yet.** | The named-district lane reads a JSON catalog of ymap prefixes. It is not published. Use `ImportMapArea` with a raw filename prefix in the meantime — same code path underneath. |
 | ❓ **Everything newer than the map lane is measured, not yet played.** | Interiors, scenarios, paths, vehicles, peds, clothing, props, animations, cutscenes, timecycles, text and audio all import; their exports are checked byte-for-byte or field-by-field against the game's own files, and some XML-form outputs (`.ymt`, `.ynd`, `.ytyp` interiors) have **not** yet been streamed by FiveM to prove the game accepts that form. The tables below mark every such row ❓. |
-| 🔴 **No fragment (`.yft`) writer, no ped-variation table writer, no navmesh, water or particle lanes.** | Vehicles import and drive in the editor sandbox but cannot be written back as new vehicles; new clothing goes into the game by *replacing* a ped's own dictionary, not by adding a variation row. |
+| 🔴 **No fragment (`.yft`) writer, no ped-variation table writer, no navmesh, water or particle lanes.** | Vehicles and weapons import and can be posed, fitted and reskinned, but cannot be written back as NEW vehicles or weapons; new clothing goes into the game by *replacing* a ped's own dictionary, not by adding a variation row. |
 | ◑ **Game audio: only plain PCM tracks import.** | `ImportAwc` imports PCM tracks and counts ADPCM and encrypted ones honestly; the game's own banks are encrypted per chunk, so no game sound has been imported yet. Your **own** sounds export to the game's format. |
 | ⛔ **`.ysc` compiled game scripts are permanently out of scope.** | Not a gap. A decision. |
 | ⛔ **RUDE will never ship Rockstar assets.** | It is machinery. Everything it converts comes from *your* legally-owned GTA V install, on *your* machine, and goes back into GTA V via FiveM. There is no game data in this repository and there never will be. |
@@ -233,12 +233,14 @@ surface is `RudeToolset.h`.
 | Texture dictionary (`.ytd`) → `Texture2D` with normal/spec/sRGB handling | `ImportYtd`, `ImportYtdBatch` | ✅ needs pixels beside the XML (DDS or PNG) |
 | A whole map area: archetypes → placements → models → **one editable actor per entity**, LOD lineage, lights, time-of-day flags, script-controlled maps | `ImportMapArea`, `ImportArea`, `ImportScene` | ✅ Downtown: 158 ymaps, 14,248 entities |
 | Interior (MLO): rooms, every prop as its own actor, entity sets, lights (portal data carried, not spawned) | `ImportMlo`, `SetEntitySet` | ✅ in editor · ❓ sets in-game |
+| **A NEW interior authored in Unreal**: rooms as box volumes, portals as slabs that find their two rooms, any prop inside a room joins it | `NewMloInterior`, `AddMloRoom`, `AddMloPortal`, `AddMloProp` | ✅ in editor · ❓ never streamed |
 | Car generators (parking spawns) as markers | `ImportCarGenerators`, `MoveCarGenerator` | ❓ |
 | Scenario regions (ambient life) as editable points | `ImportScenarioRegion` | ❓ |
 | Vehicle and footpath node graphs (`.ynd`) | `ImportPaths`, `MovePathNode` | ❓ |
 | Vehicles as composites: 5 LODs, every part at its bone, handling and colours joined by the game's own tables, liveries, shared interior textures | `ImportVehicleComposite`, `SetVehicleLivery` | ✅ in editor · ❓ never driven in-game |
 | A drivable version of an imported vehicle (Chaos) for the editor sandbox | `BuildDriveable` | ❓ built, never played |
-| Peds: skeleton, skinned parts, the variation matrix, outfits, props (hats, glasses) | `ImportPed`, `SetPedOutfit`, `SetPedProp` | ✅ in editor · ❓ prop attach frame |
+| Weapons as composites: the fragment plus every component the meta lists, fitted to its socket, defaults on and alternates hidden | `ImportWeapon`, `SetWeaponComponent` | ✅ in editor, seen on screen · ❓ never held in-game |
+| Peds: skeleton, skinned parts (all three detail groups), the variation matrix, outfits, props (hats, glasses) | `ImportPed`, `SetPedOutfit`, `SetPedProp`, `InspectPedLods` | ✅ in editor · ❓ prop attach frame |
 | Animations (`.ycd`) → `AnimSequence`, cutscenes → Level Sequence | `ImportClipDictionary`, `ImportCutscene` | ❓ axis conventions |
 | Timecycles, game text (`.gxt2`), blip catalog | `ImportTimecycles`, `ImportText`, `BuildBlipCatalog` | ❓ |
 | Seed / fill a filebase by hand | `CreateFilebase`, `IngestExport` | ✅ directory names only |
@@ -260,12 +262,14 @@ surface is `RudeToolset.h`.
 | **The map you edited, back into the game's own ymaps** — untouched entities byte-identical, moved ones re-spelled, LOD lineage, lights and car generators written back | `ExportLevelYmaps` | ✅ byte-identical on 148/148 untouched · ❓ an edited district ymap has not yet been streamed in-game |
 | Rebuilt LOD models and distant-light bakes | `MakeLodArchetype`, `RebuildLodChunk`, `RebakeLodLights` | ❓ |
 | Interior (MLO) you edited → its `.ytyp` (byte-safe splice) | `ExportMloYtyp` | ❓ XML-form ytyp acceptance |
+| **A NEW interior → its own `.ytyp` + the `.ymap` that places it**, as a streamable resource; a refusal writes nothing | `ExportNewMlo` | ❓ 257 structural checks pass, 5 refusal gates refuse; never streamed |
 | Scenario region / path cell you edited → `.ymt` / `.ynd` (byte-safe) | `ExportScenarioRegion`, `ExportPaths` | ❓ XML-form acceptance |
 | Skinned clothing → binary `.ydd`; a ped's whole outfit + props + textures as a replace resource | `ExportYddBinary`, `ExportPedReplace` | ❓ never loaded in-game |
 | A texture dictionary → replace resource | `ExportTxdReplace` | ❓ |
+| An animation edited in Unreal → a clip dictionary, written against the game's own file as the template | `ExportClipDictionary`, `ProbeYcdXml` | ❓ **text form only** - an untouched dictionary comes back byte-identical, but nothing packs the text back into a loadable binary today, in RUDE or anywhere else |
 | Timecycles / text / your own sounds | `ExportTimecycles`, `ExportText`, `ExportAwc` | ❓ registration in-game |
 | Model / collision → the editable XML form; texture → PNG | `ExportYdr`, `ExportYbn`, `ExportTexture` | ✅ interchange and inspection output (the XML form itself is not game-loadable) |
-| Fragment (`.yft`) — a new vehicle or breakable | — | 🔴 |
+| Fragment (`.yft`) — a new vehicle, weapon or breakable | — | 🔴 no writer. Editing an existing fragment is reachable through a round-trip writer; authoring one that has no original needs a constructive writer that does not exist yet |
 | FiveM **Enhanced** | — | ◑ export Legacy, then convert with Cfx Alchemist. Enhanced never loads XML-form assets. |
 
 ### Conventions worth knowing before you drive anything

@@ -16,7 +16,7 @@ looked at it. Anything marked **measured** carries the number it was measured at
 ## [Unreleased]
 
 Everything after the 0.2.0 draft, 2026-07-31 → 2026-09-06. The tool surface went from **24
-tools to 94**; the authoritative per-tool list with each gate's numbers is `AGENTS.md` §3.
+tools to 100**; the authoritative per-tool list with each gate's numbers is `AGENTS.md` §3.
 Nothing below is **proven in-game** unless it says so; **measured** means checked against the
 game's own files (byte-identical where a writer exists, field-by-field otherwise) on the
 maintainer's filebase and never yet loaded by the running game.
@@ -50,6 +50,21 @@ maintainer's filebase and never yet loaded by the running game.
   `ImportTimecycles` / `ExportTimecycles`, `ImportText` / `ExportText`, `BuildBlipCatalog`,
   `ImportAwc` (counts the game's encrypted banks honestly) / `ExportAwc` (your own sounds),
   `CatalogLane` (passthrough catalogs of the game's remaining file types), `DebugDrawNavmesh` (view-only).
+- **Weapons as a system:** `ImportWeapon` brings in a weapon's fragment plus every component its
+  meta lists, each fitted to the composed frame of its socket bone, defaults shown and alternates
+  hidden; `SetWeaponComponent` fits or clears one. The join is measured, not assumed: the weapon
+  carries the socket bone, the component carries the matching one, no drawable carries both, and in
+  all 516 component drawables that bone is first with identity rotation and zero translation, so a
+  component drops onto its socket with no correction. Weapon rows live in 89 distinct meta file
+  names, so the lookup spans the whole weapon meta prefix rather than one file.
+- **A new interior authored in Unreal:** `NewMloInterior`, `AddMloRoom`, `AddMloPortal`, `AddMloProp`
+  and `ExportNewMlo` write an archetype and the placement that streams it. Rooms are box volumes,
+  portals are slabs that find their two rooms by touch, and a prop inside a room joins that room.
+  A refusal writes nothing at all.
+- **Ped detail groups:** each part now imports its Medium and Low groups as skeletal LODs and
+  `ExportYddBinary` writes every group the mesh carries with the entry's own distance values, so a
+  ped shipped as a replace resource keeps its parts at range. `InspectPedLods` reports what a part
+  actually carries.
 - **Animation write direction:** `ExportClipDictionary` writes UAnimSequence tracks back out as a
   clip dictionary XML over a REQUIRED template from the game (the template's bytes are copied and
   only the channel number lines being authored are replaced, so an untouched dictionary is
