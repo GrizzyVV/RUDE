@@ -1234,10 +1234,6 @@ FString URudeToolset::ExportYftClone(const FString& SourceName, const FString& M
 			{
 				return Fail(FString::Printf(TEXT("model %d geometry %d of '%s' has a one-line <Data> element with no interior to replace"), Mi, Gi, *Name));
 			}
-			if (TG.bHasIndexData && TG.IndexDataSpan.LastLine <= TG.IndexDataSpan.FirstLine)
-			{
-				return Fail(FString::Printf(TEXT("model %d geometry %d of '%s' has a one-line index <Data> element with no interior to replace"), Mi, Gi, *Name));
-			}
 
 			// (a) the vertex <Data> payload, in the TEMPLATE's own column order, spelled the way the
 			//     corpus spells it: an 8-space indent (1,298,225 of 1,298,225 measured vertex rows)
@@ -1290,22 +1286,48 @@ FString URudeToolset::ExportYftClone(const FString& SourceName, const FString& M
 			//     (`measure_yft2.json`). The separator inside an index row is a single space.
 			if (TG.bHasIndexData)
 			{
-				FString Rows;
-				for (int32 i = 0; i < AG.Indices.Num(); i += 24)
+				// THE COUNT DECIDES THE FORM, NOT THE TEMPLATE. Measured 2026-09-07 over 1,200 fragments: an
+				// index block of 24 indices or fewer is written on ONE line (counts 3/6/9/12/15/18/21/24, 791
+				// blocks, not one of them multi-line) and 27 or more is written in rows of exactly 24 (793,622
+				// full rows, every one 24 wide) with the remainder last - a clean threshold, one-line max 24
+				// against multi-line min 27. So the WHOLE <Data> element is rebuilt rather than its interior
+				// spliced: a one-line template can take a large replacement and a large template a small one.
+				// Before this the one-line form refused, and EVERY small fragment this lane can author writes
+				// its indices on one line, so the replacement half could not run at all.
+				const int32 Ind = IndentOf(Blob, Lines[TG.IndexDataSpan.FirstLine]);
+				FString Pad;
+				for (int32 sp = 0; sp < Ind; ++sp) { Pad += TEXT(" "); }
+				FString Text;
+				if (AG.Indices.Num() <= 24)
 				{
-					FString Row = TEXT("        ");
-					const int32 Stop = FMath::Min(i + 24, AG.Indices.Num());
-					for (int32 k = i; k < Stop; ++k)
+					FString Inline;
+					for (int32 k = 0; k < AG.Indices.Num(); ++k)
 					{
-						if (k > i) { Row += TEXT(" "); }
-						Row += FString::FromInt(AG.Indices[k]);
+						if (k > 0) { Inline += TEXT(" "); }
+						Inline += FString::FromInt(AG.Indices[k]);
 					}
-					Rows += Row + TEXT("\n");
+					Text = Pad + TEXT("<Data>") + Inline + TEXT("</Data>\n");
+				}
+				else
+				{
+					FString Rows;
+					for (int32 i = 0; i < AG.Indices.Num(); i += 24)
+					{
+						FString Row = Pad + TEXT("  ");
+						const int32 Stop = FMath::Min(i + 24, AG.Indices.Num());
+						for (int32 k = i; k < Stop; ++k)
+						{
+							if (k > i) { Row += TEXT(" "); }
+							Row += FString::FromInt(AG.Indices[k]);
+						}
+						Rows += Row + TEXT("\n");
+					}
+					Text = Pad + TEXT("<Data>\n") + Rows + Pad + TEXT("</Data>\n");
 				}
 				FYftEdit E;
-				E.Start = Lines[TG.IndexDataSpan.FirstLine].Y;
-				E.End = Lines[TG.IndexDataSpan.LastLine].X;
-				E.Text = Rows;
+				E.Start = Lines[TG.IndexDataSpan.FirstLine].X;
+				E.End = Lines[TG.IndexDataSpan.LastLine].Y;
+				E.Text = Text;
 				Edits.Add(E);
 			}
 
