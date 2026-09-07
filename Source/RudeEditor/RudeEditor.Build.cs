@@ -45,6 +45,10 @@ public class RudeEditor : ModuleRules
 			// WP10 audio lane: USoundFactory is the engine's own WAV importer (ImportAwc).
 			"AudioEditor",
 			"RudeCore",
+			// WP13 ycd_pack: RudeYcdPack.cpp joins the module. Named here on purpose - a NEW .cpp is
+			// not compiled until the module's file list is invalidated, and the only symptom is a
+			// link error against a symbol whose source is sitting right there. Editing this file is
+			// what invalidates it; no new dependency is needed (FCompression is in Core).
 			// WP11 BuildDriveable: FChaosWheelSetup / the wheel classes (ChaosVehicles), UBodySetupCore fields (PhysicsCore).
 			"ChaosVehicles",
 			"ChaosVehiclesCore",

@@ -16,7 +16,7 @@ looked at it. Anything marked **measured** carries the number it was measured at
 ## [Unreleased]
 
 Everything after the 0.2.0 draft, 2026-07-31 → 2026-09-06. The tool surface went from **24
-tools to 100**; the authoritative per-tool list with each gate's numbers is `AGENTS.md` §3.
+tools to 106**; the authoritative per-tool list with each gate's numbers is `AGENTS.md` §3.
 Nothing below is **proven in-game** unless it says so; **measured** means checked against the
 game's own files (byte-identical where a writer exists, field-by-field otherwise) on the
 maintainer's filebase and never yet loaded by the running game.
@@ -72,8 +72,28 @@ maintainer's filebase and never yet loaded by the running game.
   structural laws on it. Measured, not assumed: preserving the donor channel's `Quantum`/`Offset`
   and re-deriving only the raws reproduced 1,382,180/1,382,180 frame values and 1,089,954/1,089,954
   rotation labels through Unreal's centimetres, and the corpus float spelling was reproduced on
-  1,414,618/1,414,618 floats. XML only - nothing here packs a `.ycd` binary, and neither tool has
-  been run in the editor or loaded by the game yet.
+  1,414,618/1,414,618 floats. XML only - `PackYcdBinary` (below) packs that XML into the binary the
+  game loads, by donor repack; nothing in RUDE builds a `.ycd` container from scratch. Neither tool
+  has been run in the editor or loaded by the game yet.
+- **Animation binary packer:** `PackYcdBinary` turns that XML into the `.ycd` the game actually
+  loads, by donor repack - a sequence block is self-contained, so a size-preserving channel edit
+  is applied in place in the donor's inflated image and the donor's own header re-wraps it. A pack
+  whose patched image differs from the donor in zero bytes copies the donor's file bytes verbatim,
+  so byte identity never depends on a compressor; an edited pack attributes every byte that moved
+  to a declared extent and fails if one moved anywhere else. `ProbeYcdBinary` reads a packed file
+  and self-checks the container (every count table pinned uniquely 20/20, every packed block
+  surviving a decode and write-back 20/20, zero padding bits 1,341/1,341 frames), and
+  `CompareYcdBinary` diffs two packed files on the inflated segment and names the channels that
+  differ. What it can and cannot do, plainly: it edits a `.ycd` binary you give it and cannot build
+  one from nothing - no part of RUDE, and no part of the maintainer's own exporter in either
+  language, packs a clip-dictionary XML into a container from scratch. A refusal is atomic: every
+  channel is validated before any byte is committed, so one refused channel writes no file at all
+  and the verdict says so. Denominator, stated: the corpus holds 24,844 `.ycd` as XML and **zero** as binaries, so
+  every container law was measured over the 10 `.ycd` binaries on the authoring machine, all of
+  them produced files. Structure changes of any kind are refused - they need a container assembler
+  that is not built. The gate packs the untouched export with `expect=identical` and a one-channel
+  edit with `expect=edited`, so a pack that silently changed nothing turns it red. None of the three
+  has been compiled, run in the editor, or loaded by the game.
 - **Editor sandbox (PIE):** `SandboxSetup`, a walkable pawn, `Rude.Native` console words that
   mirror FiveM natives (map toggles, clock, interiors, cutscenes, entering a vehicle).
 - **Corpus:** RUDE reads a ledgered filebase (load-order slots + `_FILEBASE.json` /

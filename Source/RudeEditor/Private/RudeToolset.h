@@ -1033,6 +1033,94 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Check this machine and say what is wrong: engine version, plugins, materials, the district list, and whether your game folder is the kind RUDE can read."))
 	static FString RudeDoctor(const FString& CorpusRoot);
 
+	// ---- WP13 ycd_pack lane (RudeYcdPack.cpp) ----
+	// Pack a clip-dictionary XML into a loadable binary .ycd, by DONOR REPACK. This is the block that
+	// stood between ExportClipDictionary's XML and the game: measured (maintainer lane `ycd_export`,
+	// LAWS.md H), the maintainer's own exporter has NO xml->ycd packer in either language, so the XML
+	// had nowhere to go. Container laws: maintainer lane `ycd_pack` (`LAWS.md` + `measure_bin.json`).
+	// DENOMINATOR FIRST, because it limits everything: the corpus holds 24,844 .ycd as XML and 0 as
+	// binaries, so every container law here was measured over the 10 .ycd binaries that exist on the
+	// authoring machine - all of them PRODUCED files, none shipped by the game. 10/10 RSC7 v46,
+	// 20 animations, 20 sequences, 751 BoneIds rows, 1,417 QuantizeFloat channels, 1,341 frames.
+	// HOW IT PACKS: a sequence block is self-contained (reached by arithmetic, no internal pointers),
+	// so a SIZE-PRESERVING channel edit is applied in place in the donor's inflated image and the
+	// donor's own header re-wraps it - no page plan, no atMap rebuild, no pointer relocation. Two
+	// edits are built: the 12-byte descriptor (u32 numBits, f32 Quantum, f32 Offset - Quantum/Offset
+	// are an 8-byte overwrite, 1,417/1,417 descriptors tiled with no hole), and the raws in the
+	// frame-major LSB-first bit block (decode-and-write-back reproduced the block byte-identically on
+	// 20/20 sequences, with zero padding bits after the last channel on 1,341/1,341 frames).
+	// WHAT THIS CAN AND CANNOT DO, plainly: it EDITS a .ycd binary you hand it; it cannot BUILD one.
+	// Nothing in RUDE, and nothing in the maintainer's own exporter in either language, turns a
+	// clip-dictionary XML into a .ycd container from scratch - so the donor is not a convenience, it
+	// is the only thing that makes a loadable file possible here. Every change that would move a SIZE
+	// is out of scope and refused.
+	// REFUSES BY NAME, and the refusal is ATOMIC: every channel is validated and its bytes STAGED
+	// before any byte is committed, so one refusal means NOTHING is written - the verdict says
+	// `written:false` and no output file is produced. Refused by name: a sequence whose count table is
+	// ambiguous, an animation or sequence count the donor does not have, a channel whose XML shape is
+	// not the donor's, a value list whose length is not the sequence's frame count, a Quantum that is
+	// not positive, a value that does not fit its channel's own numBits (widening a channel moves
+	// every offset after it - a container assembly this lane did not build), and a donor whose
+	// graphics segment is not empty (the re-wrap re-uses the donor's header, which would then announce
+	// bytes the stream no longer holds; empty on 10/10 measured, and 10 produced files is not a
+	// licence). Root translation (bone 0, track 0) is GATED behind `authorroot=1`: it is the channel a
+	// prior in-game test crashed on.
+	// THE MEASURE, computed in the verdict rather than asserted: a pack whose patched image differs
+	// from the donor's in 0 bytes copies the donor's FILE bytes verbatim, so byte identity never
+	// depends on a compressor; an edited pack re-deflates (its compressed bytes WILL differ from the
+	// donor's everywhere, which is legal and why the measure is on the inflated segment) and every
+	// byte that moved is attributed to a declared extent. `ok` is COMPUTED: false on any refusal, on
+	// a byte that moved outside a declared extent, on an XML channel with no donor channel, and on a
+	// run that matched channels and wrote none of them.
+	// THE CLAIM IS GATEABLE. `Options expect=identical` makes ok false unless this pack reproduced the
+	// donor's file bytes; `expect=edited` makes it false unless a channel's value actually moved -
+	// without which a pack that silently wrote nothing would report noOp:true, ok:true and sail
+	// through a gate. An expect= value the tool does not know is refused, never ignored.
+	// Gate: maintainer lane `ycd_pack` (`gate.jsonl` + `compare_ycd_bin.py`).
+	// Returns JSON: {ok, file, xml, template, version, systemSegmentBytes, fileBytes, written, expect,
+	// expectationMet, animations, clips, channelsMatched, channelsAuthored, channelsChanged,
+	// channelsUnchanged, descriptorsWritten, framesWritten, channelsRefused, shapeMismatch,
+	// frameCountMismatch, rawsOutOfRange, xmlChannelsWithoutDonor, rootChannelsGated,
+	// xmlItemsInUnknownList, carriedStatic, carriedRawFloat, carriedIndirect, carriedInlinePool6,
+	// segmentBytesDiffering, bytesDifferingOutsideDeclaredExtents, firstDifferingOffset, noOp,
+	// byteIdenticalToTemplate, reDeflated, authoredButWroteNothing, firstRefusal, note}.
+	// `channelsAuthored` counts the channels this pack wrote bytes back for; `channelsChanged` counts
+	// the ones whose value actually moved. On an untouched export the second is zero while the first
+	// is not - do not read either as the other. (Neither has been observed: this has not been run.)
+	// Nothing this lane writes has been loaded by the game, and this file has not been compiled.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Turn an animation dictionary RUDE wrote into the packed file the game actually loads. Give the game file it came from as the template: this EDITS that file and cannot build a packed file from nothing. Any change that would resize something is refused, and a refusal writes no file at all. An untouched animation comes out byte for byte the same."))
+	static FString PackYcdBinary(const FString& XmlPath, const FString& OutYcdPath, const FString& Options);
+
+	// Read a BINARY .ycd and report the container a packer has to write into, with the reader's own
+	// self-check on it. Reports the RSC7 header and page plan, whether the blockmap's page-count
+	// record agrees with the flag words (10/10 measured), the clip and animation atMap walk, and per
+	// sequence: whether exactly one count table survives the four constraints that pin it (20/20, 0
+	// ambiguous), the nine pool counts, the QuantizeFloat channel census, and - the check that makes
+	// the bit layout evidence rather than a transcription - whether every channel's raws survive a
+	// decode and a write-back byte-identically (20/20) with zero padding bits after the last channel
+	// (1,341/1,341 frames). `ok` is COMPUTED from those: any ambiguous sequence, any broken packed
+	// block, any non-positive Quantum, any numBits outside 1..32, any non-zero padding, or a
+	// blockmap record that disagrees with the flags makes it false. The padding check is SKIPPED, and
+	// counted in `sequencesPadCheckSkippedIndirect`, on a sequence carrying an IndirectQuantizeFloat
+	// channel: those bits belong to a channel this reader does not decode, so checking them for zero
+	// would call a good file broken. None was witnessed here (Indirect 0/20 sequences).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Read a packed animation file and report what is inside it, and whether RUDE reads it consistently.", RudeAudience="agent"))
+	static FString ProbeYcdBinary(const FString& YcdPath);
+
+	// Compare two BINARY .ycd files and say WHERE they differ, in the only place a comparison means
+	// anything: the inflated system segment. A compressed .ycd is not canonical - two files holding
+	// the same image can differ in every compressed byte - so a file-level diff answers the wrong
+	// question. Every differing byte is attributed through the FIRST file's own container walk to a
+	// channel descriptor, a sequence's packed block, or elsewhere. `ok` is COMPUTED: the images are
+	// identical, or every byte that moved sits inside a channel this reader can name. A byte that
+	// moved anywhere else is a structural difference and this tool says so instead of passing.
+	// READ ITS `ok` FOR WHAT IT IS: an ATTRIBUTION verdict, not an identity one - it passes when the
+	// two images are identical AND when they differ only inside channels it can name. For identity,
+	// read `segmentIdentical`/`fileBytesIdentical`, or gate it at the source with PackYcdBinary's
+	// `expect=identical`. Gate: maintainer lane `ycd_pack` (`gate.jsonl` + `compare_ycd_bin.py`).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Check two packed animation files against each other and say exactly which animation channels differ.", RudeAudience="agent"))
+	static FString CompareYcdBinary(const FString& APath, const FString& BPath);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);
