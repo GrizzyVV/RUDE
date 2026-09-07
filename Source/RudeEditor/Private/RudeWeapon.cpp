@@ -62,9 +62,11 @@
 #include "Dom/JsonObject.h"
 #include "Editor.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
+#include "Materials/MaterialInstanceConstant.h"
 #include "MeshDescription.h"
 #include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
@@ -1186,4 +1188,201 @@ FString URudeToolset::SetWeaponComponent(const FString& ActorLabel, const FStrin
 		RowIndex == INDEX_NONE ? 0 : WA->Components[RowIndex].Triangles,
 		ShownComp ? TEXT("true") : TEXT("false"), Hidden,
 		ShownComp ? *JsonEscape(ShownComp->GetName()) : TEXT(""));
+}
+
+// ---- SetWeaponTint (WP12 weapon_tint lane, 2026-09-07) -----------------------------------------
+// Pick which of the game's own tints a weapon is painted in. Everything this needs already sits on
+// the material instances ImportWeapon built - the palette texture in TintPalette and the row scale
+// beside it - so the tool only has to write the SELECTOR and report what it found.
+//
+// WHY IT DOES NOT TOUCH TintAmount. That switch is the IMPORT's decision, made once, from evidence:
+// a palette actually bound, on a RenderBucket-0 shader, over a diffuse whose alpha varies, on a
+// preset the lookup is enabled for. Letting this tool force it to 1 would let an author switch on a
+// lookup the data does not support - exactly the "silent default" shape the conventions forbid. So
+// the index always lands, and the verdict reports slotsTinting: how many slots will actually LOOK
+// different. ok is COMPUTED from that, not from "the write ran".
+//
+// ⛔ WHAT THIS DOES NOT DO: the index is EDITOR STATE. ExportYdr emits a fixed census-standard
+// parameter block and the diffuse/bump/spec samplers - it reads no scalar off the instance and emits
+// no palette sampler - so the tint does not survive an export back to the game's format. Round-
+// tripping it is unbuilt work named in the lane's NOTES.md, not a property this tool has.
+//
+// The RANGE is the palette's own row count, read off the bound texture, never a constant: 94 of the
+// 98 palettes in this corpus's weapon dictionaries are 128x32 and 4 are 4x4, and the number of
+// DISTINCT rows varies too - 27 palettes carry 8 distinct leading rows (the 8 tints weapons.meta's
+// TINT_DEFAULT declares, referenced by 91/91 CWeaponInfo rows in the copy the game loads), 34 carry
+// 9, and 29 are 32 distinct.
+// So the verdict also reports distinctRows and rowDuplicateOf: asking for tint 12 on a palette whose
+// rows 8..29 all repeat row 7 is legal, and says so, instead of looking broken.
+FString URudeToolset::SetWeaponTint(const FString& ActorLabel, const FString& TintIndex)
+{
+	using namespace RudeWeaponLane;
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *JsonEscape(Why));
+	};
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+	const FString Want = ActorLabel.TrimStartAndEnd();
+	AActor* Actor = FindWeaponActor(World, Want);
+	if (!Actor)
+	{
+		TArray<FString> Known;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			if (It->Tags.Contains(FName(TEXT("RUDE_WEAPON_ROOT")))) { Known.Add(It->GetActorLabel()); }
+		}
+		Known.Sort();
+		return Fail(FString::Printf(TEXT("no weapon actor labelled '%s' (ImportWeapon labels them "
+			"Weapon_<model>); this level holds %d: %s"), *Want, Known.Num(),
+			Known.Num() > 0 ? *FString::Join(Known, TEXT(", ")) : TEXT("none")));
+	}
+	FString AssetPath;
+	for (const FName& ActorTag : Actor->Tags)
+	{
+		const FString S = ActorTag.ToString();
+		if (S.StartsWith(TEXT("RUDE_WEAPON_ASSET:"))) { AssetPath = S.Mid(18); }
+	}
+	URudeWeapon* WA = AssetPath.IsEmpty() ? nullptr : LoadObject<URudeWeapon>(nullptr, *AssetPath);
+	if (!WA) { return Fail(TEXT("that actor carries no RUDE weapon asset (was it built by ImportWeapon?)")); }
+
+	const FString IdxText = TintIndex.TrimStartAndEnd();
+	if (IdxText.IsEmpty() || !IdxText.IsNumeric())
+	{
+		return Fail(FString::Printf(TEXT("tint '%s' is not a number - it is the game's tint index, "
+			"counting from 0"), *IdxText));
+	}
+	const int32 Idx = FCString::Atoi(*IdxText);
+	if (Idx < 0) { return Fail(FString::Printf(TEXT("tint %d is negative; tints count from 0"), Idx)); }
+
+	// ---- every material slot on the gun and its components that carries a REAL palette -------------
+	const FMaterialParameterInfo PalInfo(TEXT("TintPalette"));
+	const FMaterialParameterInfo AmtInfo(TEXT("TintAmount"));
+	const FMaterialParameterInfo RowInfo(TEXT("TintRowScale"));
+	const FMaterialParameterInfo SelInfo(TEXT("paletteSelector"));
+	const FMaterialParameterInfo TntInfo(TEXT("tintPaletteSelector"));
+	TArray<UStaticMeshComponent*> Comps;
+	Actor->GetComponents<UStaticMeshComponent>(Comps);
+	TArray<UMaterialInstanceConstant*> Targets;
+	TSet<UMaterialInstanceConstant*> SeenMics;
+	TArray<FString> PaletteNames;
+	int32 SlotsTotal = 0, SlotsWithoutInstance = 0, SlotsWithoutParameter = 0, SlotsPaletteUnbound = 0;
+	int32 RowsMin = MAX_int32, RowsMax = 0;
+	for (UStaticMeshComponent* C : Comps)
+	{
+		UStaticMesh* Mesh = C ? C->GetStaticMesh() : nullptr;
+		if (!Mesh) { continue; }
+		for (const FStaticMaterial& SM : Mesh->GetStaticMaterials())
+		{
+			++SlotsTotal;
+			UMaterialInstanceConstant* MIC = Cast<UMaterialInstanceConstant>(SM.MaterialInterface);
+			if (!MIC) { ++SlotsWithoutInstance; continue; }
+			UTexture* PalTex = nullptr;
+			if (!MIC->GetTextureParameterValue(PalInfo, PalTex)) { ++SlotsWithoutParameter; continue; }
+			UTexture2D* Pal2D = Cast<UTexture2D>(PalTex);
+			// The master's own white default sitting in the parameter is NOT a palette. Counting that
+			// case separately is what turns "nothing happened" into a diagnosable number.
+			// int32(): GetSizeX/Y are int64 in 5.8; the cast is explicit so the narrowing is intended, not
+			// a warning this project's targets are one settings change away from making an error.
+			const int32 Rows = (Pal2D && Pal2D->Source.IsValid()) ? int32(Pal2D->Source.GetSizeY()) : 0;
+			if (!Pal2D || Rows <= 0 || Pal2D->GetPathName().StartsWith(TEXT("/Engine/")))
+			{
+				++SlotsPaletteUnbound;
+				continue;
+			}
+			RowsMin = FMath::Min(RowsMin, Rows);
+			RowsMax = FMath::Max(RowsMax, Rows);
+			PaletteNames.AddUnique(Pal2D->GetName());
+			if (!SeenMics.Contains(MIC)) { SeenMics.Add(MIC); Targets.Add(MIC); }
+		}
+	}
+	if (Targets.Num() == 0)
+	{
+		return Fail(FString::Printf(TEXT("%s has no material carrying a tint palette: %d slots, %d without "
+			"a material instance, %d whose master has no TintPalette parameter, %d with the parameter and "
+			"nothing in it. A weapon only tints when its dictionary carried the <model>_Dpal entry AND its "
+			"drawable's shader bound it - run RegenerateMasters and re-import if this weapon predates the "
+			"palette lane"),
+			*WA->ModelName, SlotsTotal, SlotsWithoutInstance, SlotsWithoutParameter, SlotsPaletteUnbound));
+	}
+	if (Idx >= RowsMin)
+	{
+		return Fail(FString::Printf(TEXT("tint %d is out of range for %s: its palette holds %d rows, so the "
+			"tints are 0..%d (the game declares 8 for every weapon naming TINT_DEFAULT)"),
+			Idx, *WA->ModelName, RowsMin, RowsMin - 1));
+	}
+
+	// ---- write the selector; TintRowScale is RE-DERIVED from the texture, so it cannot drift --------
+	int32 SlotsUpdated = 0, SlotsTinting = 0;
+	for (UMaterialInstanceConstant* MIC : Targets)
+	{
+		UTexture* PalTex = nullptr;
+		MIC->GetTextureParameterValue(PalInfo, PalTex);
+		UTexture2D* Pal2D = Cast<UTexture2D>(PalTex);
+		const int32 Rows = (Pal2D && Pal2D->Source.IsValid()) ? int32(Pal2D->Source.GetSizeY()) : 0;
+		if (Rows <= 0) { continue; }
+		MIC->SetScalarParameterValueEditorOnly(SelInfo, float(Idx));
+		// The two spellings SUM in the master and no shader item carries both (0/583), so exactly one
+		// of them may hold the index; this one does, and the other is pinned to 0.
+		MIC->SetScalarParameterValueEditorOnly(TntInfo, 0.f);
+		MIC->SetScalarParameterValueEditorOnly(RowInfo, 1.f / float(Rows));
+		MIC->PostEditChange();
+		MIC->MarkPackageDirty();
+		++SlotsUpdated;
+		float Amount = 0.f;
+		if (MIC->GetScalarParameterValue(AmtInfo, Amount) && Amount > 0.f) { ++SlotsTinting; }
+	}
+
+	// ---- how many of the palette's rows are actually different, and is THIS one a repeat? ----------
+	// Capped at 64 rows: the duplicate scan is O(rows^2) memcmp and every weapon palette measured in
+	// this corpus is 32 rows or fewer. Beyond the cap it reports -1 (unknown) rather than a number it
+	// did not compute.
+	int32 DistinctRows = -1, RowDuplicateOf = -1;
+	{
+		UTexture* PalTex = nullptr;
+		Targets[0]->GetTextureParameterValue(PalInfo, PalTex);
+		UTexture2D* Pal2D = Cast<UTexture2D>(PalTex);
+		TArray64<uint8> Mip;
+		if (Pal2D && Pal2D->Source.IsValid() && Pal2D->Source.GetFormat() == TSF_BGRA8
+			&& Pal2D->Source.GetSizeY() <= 64 && Pal2D->Source.GetMipData(Mip, 0))
+		{
+			const int32 PalW = int32(Pal2D->Source.GetSizeX());
+			const int32 PalH = int32(Pal2D->Source.GetSizeY());
+			const int64 Pitch = int64(PalW) * 4;
+			if (Mip.Num() >= Pitch * PalH)
+			{
+				DistinctRows = 0;
+				for (int32 Row = 0; Row < PalH; ++Row)
+				{
+					int32 SameAs = -1;
+					for (int32 Prev = 0; Prev < Row; ++Prev)
+					{
+						if (FMemory::Memcmp(Mip.GetData() + Prev * Pitch, Mip.GetData() + Row * Pitch, Pitch) == 0)
+						{
+							SameAs = Prev;
+							break;
+						}
+					}
+					if (SameAs < 0) { ++DistinctRows; }
+					if (Row == Idx) { RowDuplicateOf = SameAs; }
+				}
+			}
+		}
+	}
+
+	// ok is COMPUTED: the index landed AND at least one slot will actually look different for it.
+	const bool bOk = SlotsUpdated > 0 && SlotsTinting > 0;
+	return FString::Printf(TEXT(
+		"{\"ok\":%s,\"weapon\":\"%s\",\"actor\":\"%s\",\"tint\":%d,\"paletteRows\":%d,"
+		"\"paletteRowsMax\":%d,\"distinctRows\":%d,\"rowDuplicateOf\":%d,\"palettes\":[%s],"
+		"\"slots\":%d,\"slotsUpdated\":%d,\"slotsTinting\":%d,\"slotsWithoutInstance\":%d,"
+		"\"slotsWithoutParameter\":%d,\"slotsPaletteUnbound\":%d,\"tintSpecValues\":\"%s\","
+		"\"note\":\"%s\"}"),
+		bOk ? TEXT("true") : TEXT("false"), *JsonEscape(WA->ModelName), *JsonEscape(Actor->GetActorLabel()),
+		Idx, RowsMin, RowsMax, DistinctRows, RowDuplicateOf, *JsonStrings(PaletteNames),
+		SlotsTotal, SlotsUpdated, SlotsTinting, SlotsWithoutInstance, SlotsWithoutParameter, SlotsPaletteUnbound,
+		*JsonEscape(WA->WeaponMeta.FindRef(TEXT("TintSpecValues"))),
+		SlotsTinting > 0
+			? TEXT("material instances are per mesh, so every placed copy of this weapon shows the tint")
+			: TEXT("the index landed but every slot has TintAmount 0 - the import left the lookup off (a non-opaque shader, or a diffuse with no alpha to index with)"));
 }

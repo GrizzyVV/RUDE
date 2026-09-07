@@ -50,6 +50,7 @@
 #include "LevelEditorViewport.h"
 #include "UnrealClient.h"
 #include "Materials/MaterialExpressionAdd.h"
+#include "Materials/MaterialExpressionAppendVector.h"
 #include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionConstant.h"
 #include "Materials/MaterialExpressionDivide.h"
@@ -338,10 +339,22 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 			bStale = true;
 			for (const FMaterialParameterInfo& I : Infos) { if (I.Name == FName(TEXT("OpacityScale"))) { bStale = false; break; } }
 		}
+		// A TINT master generated before 2026-09-07 exposed TintPalette and a selector and wired NEITHER:
+		// the palette was bound and never sampled. Regenerate it IN PLACE, on the same rule and for the
+		// same reason as the glass master above - every material instance parented to it then updates
+		// without a re-import. The probe is TintAmount, which only the new graph declares.
+		if (Old && !bStale && Spec.bTint)
+		{
+			TArray<FMaterialParameterInfo> TintInfos;
+			TArray<FGuid> TintIds;
+			Old->GetAllScalarParameterInfo(TintInfos, TintIds);
+			bStale = true;
+			for (const FMaterialParameterInfo& I : TintInfos) { if (I.Name == FName(TEXT("TintAmount"))) { bStale = false; break; } }
+		}
 		if (!bStale) { return Existing; }
 		M = Old;
 		M->GetExpressionCollection().Empty();
-		UE_LOG(LogTemp, Display, TEXT("[RUDE] regenerating stale glass master %s"), *Name);
+		UE_LOG(LogTemp, Display, TEXT("[RUDE] regenerating stale master %s"), *Name);
 	}
 	if (!M)
 	{
@@ -449,11 +462,67 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 
 	if (Spec.bTint)
 	{
-		// The tint palette is a lookup texture and a faithful selector needs the palette ROW, which
-		// is not yet decoded. Exposing the parameters keeps the binding real and round-trippable
-		// while the visual stays the untinted albedo - an honest placeholder, not an invented tint.
-		MakeTex(TEXT("TintPalette"), DefWhite, SAMPLERTYPE_Color, 900);
-		MakeScalar(TEXT("tintPaletteSelector"), 0.f, 960);
+		// ---- THE PALETTE LOOKUP (maintainer lane `weapon_tint`, measured 2026-09-07) --------------
+		// A weapon body is painted by a 2-D TABLE LOOKUP, not by a multiply, and the two axes are:
+		//   u = the DIFFUSE'S ALPHA - a material-ZONE index, not a shade. Over the 171 diffuse+palette
+		//       pairs whose pixels this corpus actually carries, the alpha holds a MEDIAN OF 10
+		//       authored values and they are round numbers (36, 40, 50, 60 ... 150); it is
+		//       uncorrelated with luminance (mean |r| 0.23, 127/171 below 0.3); and in 114/171 pairs
+		//       EVERY authored value lands on its OWN column of the palette. Meanwhile 136/171 of
+		//       those diffuses are at least 90% desaturated (119/171 at least 99%), so the RGB is
+		//       shading and the colour has to arrive from somewhere else.
+		//   v = the tint index. 94 of the 98 palette entries in the 804 effective weapon dictionaries
+		//       are 128x32 A8R8G8B8 with ONE mip, and the game declares 8 tints (weapons.meta
+		//       TINT_DEFAULT, referenced by 91/91 CWeaponInfo rows in the copy the game loads) - which is
+		//       exactly the number of distinct LEADING rows in 27 of those palettes (9 in 34 more).
+		// The row is (selector + 0.5) * TintRowScale so v lands on a texel CENTRE. TintRowScale is
+		// 1/height of whatever palette bound: a property of the TEXTURE, never of the tint choice, so
+		// changing the tint later touches only paletteSelector and nothing can drift.
+		// paletteSelector and tintPaletteSelector are the game's OWN parameter names, so ImportYdr's
+		// generic value binding lands the authored value (0 in 583/583) with no special case. They are
+		// SUMMED because no shader item carries both (0/583).
+		// (⛔) NOTHING READS THEM BACK. ExportYdr emits a fixed census-standard parameter block and the
+		// diffuse/bump/spec samplers only - no shader VALUE parameters read off the instance, and no
+		// palette sampler - so a tint chosen here is EDITOR STATE ONLY and does not survive an export.
+		// Naming it in the export is unbuilt work (the lane's NOTES.md section 5), not a claim made here.
+		// (⛔) NEUTRAL BY DEFAULT: TintAmount is 0 here, so a master with a palette bound renders
+		// EXACTLY as it does today until ImportYdr proves the data supports the lookup AND the shader
+		// preset is one the lookup is enabled for (RudePresetEnablesTint - weapons only today). This
+		// master is SHARED with every other lane that binds a palette, which is why the enable lives on
+		// the instance and not in the graph.
+		// (⚠) INFERRED, NOT MEASURED - the BLEND. 2 * albedo * palette is the conventional 2x multiply;
+		// it is the identity when the palette is mid-grey, so a wrong guess degrades to "looks like
+		// today" rather than "looks worse". RAGE's own shader math is not read and is not claimed.
+		UMaterialExpressionScalarParameter* PalSel = MakeScalar(TEXT("paletteSelector"), 0.f, 860);
+		UMaterialExpressionScalarParameter* TntSel = MakeScalar(TEXT("tintPaletteSelector"), 0.f, 900);
+		UMaterialExpressionScalarParameter* RowScale = MakeScalar(TEXT("TintRowScale"), 0.f, 940);
+		UMaterialExpressionScalarParameter* TintAmt = MakeScalar(TEXT("TintAmount"), 0.f, 980);
+		UMaterialExpressionAdd* SelSum = NewObject<UMaterialExpressionAdd>(M);
+		SelSum->A.Expression = PalSel; SelSum->B.Expression = TntSel; Add(SelSum, -1350, 860);
+		UMaterialExpressionConstant* HalfRow = NewObject<UMaterialExpressionConstant>(M);
+		HalfRow->R = 0.5f; Add(HalfRow, -1350, 920);
+		UMaterialExpressionAdd* SelCentre = NewObject<UMaterialExpressionAdd>(M);
+		SelCentre->A.Expression = SelSum; SelCentre->B.Expression = HalfRow; Add(SelCentre, -1220, 860);
+		UMaterialExpressionMultiply* RowV = NewObject<UMaterialExpressionMultiply>(M);
+		RowV->A.Expression = SelCentre; RowV->B.Expression = RowScale; Add(RowV, -1090, 860);
+		UMaterialExpressionAppendVector* PalUV = NewObject<UMaterialExpressionAppendVector>(M);
+		PalUV->A.Expression = DiffuseTex; PalUV->A.OutputIndex = 4;   // the ALPHA output of the diffuse sample
+		PalUV->B.Expression = RowV; Add(PalUV, -960, 860);
+		UMaterialExpressionTextureSampleParameter2D* PalTex =
+			MakeTex(TEXT("TintPalette"), DefWhite, SAMPLERTYPE_Color, 1020);
+		PalTex->Coordinates.Expression = PalUV;
+		UMaterialExpressionConstant* TwoTint = NewObject<UMaterialExpressionConstant>(M);
+		TwoTint->R = 2.f; Add(TwoTint, -900, 1080);
+		UMaterialExpressionMultiply* PalDoubled = NewObject<UMaterialExpressionMultiply>(M);
+		PalDoubled->A.Expression = PalTex; PalDoubled->B.Expression = TwoTint; Add(PalDoubled, -760, 1020);
+		UMaterialExpressionMultiply* TintedRaw = NewObject<UMaterialExpressionMultiply>(M);
+		TintedRaw->A.Expression = BaseColor; TintedRaw->B.Expression = PalDoubled; Add(TintedRaw, -620, 960);
+		UMaterialExpressionSaturate* TintedSat = NewObject<UMaterialExpressionSaturate>(M);
+		TintedSat->Input.Expression = TintedRaw; Add(TintedSat, -480, 960);
+		UMaterialExpressionLinearInterpolate* TintLerp = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		TintLerp->A.Expression = BaseColor; TintLerp->B.Expression = TintedSat; TintLerp->Alpha.Expression = TintAmt;
+		Add(TintLerp, -340, 960);
+		BaseColor = TintLerp;
 	}
 
 	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
@@ -531,6 +600,64 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 	FAssetRegistryModule::AssetCreated(M);
 	UE_LOG(LogTemp, Display, TEXT("[RUDE] generated master %s"), *Name);
 	return M;
+}
+
+// ---- ONE SWITCH: WHICH SHADER PRESETS MAY TURN THE TINT LOOKUP ON ----------------------------
+// ImportDrawableNode is the SHARED importer - peds, vehicles, map drawables and weapons all arrive
+// here - and the palette samplers are NOT weapon-only. MEASURED over a seeded random sample of 400
+// NON-weapon files each (maintainer lane `weapon_tint`, law 14): peds declare a palette sampler
+// 1,577 times but only 4 carry a texture NAME; vehicles 8 declared, 8 named; map props and other
+// drawables 92 declared, 42 named. So switching the lookup on everywhere would repaint vehicles and
+// world props from a population this lane never measured.
+// THE MECHANISM GOES IN EVERYWHERE; THE LOOKUP IS ENABLED FOR WEAPON PRESETS ONLY. Every other
+// preset - including the `*_tnt` family the map uses - keeps its palette bound, visible in
+// InspectMesh, and NEUTRAL: it renders exactly as it does today. Inside the weapon set itself that
+// withholds 9 of the 428 bucket-0 palette bindings (`normal_spec_tnt` 8, `normal_spec_detail_tnt` 1;
+// law 3 crossed with law 10), leaving 419.
+// WIDENING IT IS THIS ONE EDIT (`return true;` enables every preset), and the import verdict's
+// tintPalettesNeutralNonWeapon counts what is being deferred rather than letting it be forgotten.
+static bool RudePresetEnablesTint(const FString& Preset)
+{
+	return Preset.StartsWith(TEXT("weapon"), ESearchCase::IgnoreCase);
+}
+
+// Does this texture's ALPHA carry information, or is it flat? The palette lookup reads the diffuse's
+// alpha as a material-zone index; a source with no alpha imports as 255 everywhere, and feeding that
+// to the lookup paints the WHOLE surface with the palette's last column - a uniform wrong colour on
+// every texel. 137 of the weapon set's 583 palette bindings sit on such a diffuse (D3DFMT_DXT1),
+// against 445 on one that carries alpha (maintainer lane `weapon_tint`).
+// SAMPLED, not scanned: at most 4,096 texels spread across the top mip, so a 2048x2048 diffuse costs
+// microseconds, and CACHED per texture because a district import asks the same question thousands of
+// times. (⛔) The bar is TWO DISTINCT VALUES, not "some alpha below 255": a single compression
+// artefact on a genuinely opaque map must not be able to switch a tint on.
+static bool RudeTextureAlphaVaries(UTexture2D* T)
+{
+	if (!T) { return false; }
+	// KEYED ON THE SOURCE, NOT THE OBJECT. ImportYtd edits textures IN PLACE, so the same UTexture2D
+	// can gain real pixels later in the same session; an object-keyed cache would keep answering
+	// "flat" and the weapon would stay untinted with no gate able to see it. FTextureSource::GetId is
+	// the source's own identity (it changes when the source does) and is cheap - it either returns the
+	// stored guid or hashes the header fields, never the payload.
+	static TMap<FString, bool> Cache;
+	const FString Key = T->GetPathName() + TEXT("|") + T->Source.GetIdString();
+	if (const bool* Hit = Cache.Find(Key)) { return *Hit; }
+	bool bVaries = false;
+	TArray64<uint8> Mip;
+	if (T->Source.IsValid() && T->Source.GetFormat() == TSF_BGRA8 && T->Source.GetMipData(Mip, 0))
+	{
+		const int64 Texels = Mip.Num() / 4;
+		if (Texels > 0)
+		{
+			const int64 Stride = FMath::Max<int64>(1, Texels / 4096);
+			const uint8 First = Mip[3];
+			for (int64 i = 0; i < Texels; i += Stride)
+			{
+				if (Mip[i * 4 + 3] != First) { bVaries = true; break; }
+			}
+		}
+	}
+	Cache.Add(Key, bVaries);
+	return bVaries;
 }
 
 static UMaterialInterface* EnsureDetailMaster()
@@ -1651,6 +1778,48 @@ FString URudeToolset::ExportYbn(const FString& AssetPath, const FString& OutXmlP
 		*OutXmlPath, Verts.Num(), Indices.Num() / 3);
 }
 
+// The texture semantics a dictionary's own <Usage> implies. Lifted out of ImportYtd's loop
+// (2026-09-07) because it now has TWO call sites: the import, and the settings-only repair of a
+// texture whose PIXELS are unchanged but whose settings predate a new branch.
+// TINTPALETTE is that new branch, and it is the one Usage where the defaults are actively wrong:
+// a palette is a LOOKUP TABLE, not a picture. Block compression rewrites its swatches (BC1 fits a
+// 4x4 block to two endpoints), a mip chain averages neighbouring TINTS together, and bilinear
+// filtering bleeds one tint row into the next - all three destroy the only property the table has,
+// which is that texel (u,v) is EXACTLY the colour authored there. The game keeps them uncompressed
+// and unmipped itself: 98/98 TINTPALETTE entries across the 804 effective weapon dictionaries are
+// D3DFMT_A8R8G8B8 with MipLevels 1 (maintainer lane `weapon_tint`).
+static void RudeApplyTextureUsage(UTexture2D* Tex, const FString& Usage)
+{
+	if (!Tex) { return; }
+	if (Usage == TEXT("NORMAL"))
+	{
+		Tex->CompressionSettings = TC_Normalmap;
+		Tex->SRGB = false;
+		Tex->LODGroup = TEXTUREGROUP_WorldNormalMap;
+	}
+	else if (Usage == TEXT("SPECULAR"))
+	{
+		Tex->CompressionSettings = TC_Default;
+		Tex->SRGB = false;
+	}
+	else if (Usage == TEXT("TINTPALETTE"))
+	{
+		Tex->CompressionSettings = TC_EditorIcon;   // UserInterface2D: RGBA, uncompressed
+		Tex->SRGB = true;                           // it holds colours and it multiplies an sRGB albedo
+		Tex->Filter = TF_Nearest;
+		Tex->AddressX = TA_Clamp;
+		Tex->AddressY = TA_Clamp;
+#if WITH_EDITORONLY_DATA
+		Tex->MipGenSettings = TMGS_NoMipmaps;
+#endif
+	}
+	else
+	{
+		Tex->CompressionSettings = TC_Default;
+		Tex->SRGB = true;
+	}
+}
+
 FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFolder,
                                 const FString& DestFolder)
 {
@@ -1698,6 +1867,9 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 	//                     2,041 + FENCE 234 = 26,733 of 428,210 items (6.24%) land in the sRGB
 	//                     else-branch. That is defensible and it is now DISCLOSED rather than assumed.
 	int32 Declared = 0, ItemsWithoutName = 0, UsageDefaulted = 0, UsageUnknown = 0;
+	// A texture whose PIXELS are unchanged but whose SETTINGS predate a Usage branch (the palettes,
+	// 2026-09-07). Repaired in place and counted, so "unchanged" never hides a stale compression mode.
+	int32 SettingsRepaired = 0;
 	int32 MissingPixelCount = 0;
 	// Where the pixels came from. The corpus ships DDS sidecars ("<stem>/<tex>.dds", the game's
 	// own block data behind a DDS header); the PNG path is the older offline bridge, kept as the
@@ -1723,7 +1895,12 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 		const FXmlNode* UsageNode = Item->FindChildNode(TEXT("Usage"));
 		if (!UsageNode) { ++UsageDefaulted; }
 		const FString Usage = UsageNode ? UsageNode->GetContent().TrimStartAndEnd() : TEXT("DIFFUSE");
-		if (Usage != TEXT("DIFFUSE") && Usage != TEXT("NORMAL") && Usage != TEXT("SPECULAR"))
+		// TINTPALETTE joined the vocabulary on 2026-09-07: 98 ITEMS across the 804 effective weapon
+		// dictionaries, and 9,796 more .ytd.xml FILES elsewhere carry a TINTPALETTE entry (9,651 distinct
+		// names, every one an __embedded dictionary, none load-order-resolved - a LOWER BOUND, not a
+		// survey). So it is no longer "unknown" - RudeApplyTextureUsage now branches on it.
+		if (Usage != TEXT("DIFFUSE") && Usage != TEXT("NORMAL") && Usage != TEXT("SPECULAR")
+			&& Usage != TEXT("TINTPALETTE"))
 		{
 			++UsageUnknown;
 		}
@@ -1849,28 +2026,26 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 				if (Tex->Source.GetMipData(Existing, 0) && Existing.Num() == BGRA.Num()
 					&& FMemory::Memcmp(Existing.GetData(), BGRA.GetData(), BGRA.Num()) == 0) { bSame = true; }
 			}
+			// (⚠) THE FAST PATH COMPARES PIXELS, AND SETTINGS ARE NOT PIXELS (2026-09-07). A palette
+			// imported before the TINTPALETTE branch existed has byte-identical pixels and the WRONG
+			// settings - block-compressed, mipped, bilinear - and would be skipped forever. Repair the
+			// SETTINGS in place and still count it unchanged: no Source.Init, so the saved-package
+			// bulkdata hazard (conventions 6.9) is never touched. Counted, so it is not silent.
+			if (bSame && Usage == TEXT("TINTPALETTE") && Tex->CompressionSettings != TC_EditorIcon)
+			{
+				RudeApplyTextureUsage(Tex, Usage);
+				Tex->UpdateResource();
+				Tex->PostEditChange();
+				Package->MarkPackageDirty();
+				++SettingsRepaired;
+			}
 			if (bSame) { ++Imported; ++Unchanged; continue; }
 		}
 		Tex->PreEditChange(nullptr);
 		Tex->Source.Init(W, H, 1, 1, TSF_BGRA8, BGRA.GetData());
 
 		// Semantics from the ytd's own Usage - the thing generic importers can't know
-		if (Usage == TEXT("NORMAL"))
-		{
-			Tex->CompressionSettings = TC_Normalmap;
-			Tex->SRGB = false;
-			Tex->LODGroup = TEXTUREGROUP_WorldNormalMap;
-		}
-		else if (Usage == TEXT("SPECULAR"))
-		{
-			Tex->CompressionSettings = TC_Default;
-			Tex->SRGB = false;
-		}
-		else
-		{
-			Tex->CompressionSettings = TC_Default;
-			Tex->SRGB = true;
-		}
+		RudeApplyTextureUsage(Tex, Usage);
 
 		Tex->UpdateResource();
 		Tex->PostEditChange();
@@ -1894,11 +2069,11 @@ FString URudeToolset::ImportYtd(const FString& XmlPath, const FString& PixelFold
 	const bool bTotalLoss = (Declared > 0 && Imported == 0 && InvalidNames > 0);
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"txd\":\"%s\",\"declared\":%d,\"imported\":%d,\"unchanged\":%d,\"invalidNames\":%d,")
-		TEXT("\"itemsWithoutName\":%d,\"usageDefaulted\":%d,\"usageUnknown\":%d,")
+		TEXT("\"itemsWithoutName\":%d,\"usageDefaulted\":%d,\"usageUnknown\":%d,\"settingsRepaired\":%d,")
 		TEXT("\"missingPixelCount\":%d,\"missingPixels\":[%s],")
 		TEXT("\"pixelsFromDds\":%d,\"pixelsFromPng\":%d,\"pixelsRefused\":%d,\"pixelsRefusedReasons\":[%s]}"),
 		bTotalLoss ? TEXT("false") : TEXT("true"),
-		*TxdName, Declared, Imported, Unchanged, InvalidNames, ItemsWithoutName, UsageDefaulted, UsageUnknown,
+		*TxdName, Declared, Imported, Unchanged, InvalidNames, ItemsWithoutName, UsageDefaulted, UsageUnknown, SettingsRepaired,
 		MissingPixelCount, *Missing, PixelsFromDds, PixelsFromPng, PixelsRefused, *RefusedReasons);
 }
 
@@ -2964,6 +3139,14 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 			else if (S.StartsWith(TEXT("Spec"), ESearchCase::IgnoreCase))     { Spec.bSpec = true; }
 			else if (S.StartsWith(TEXT("Detail"), ESearchCase::IgnoreCase))   { Spec.bDetail = true; }
 			else if (S.StartsWith(TEXT("TintPalette"), ESearchCase::IgnoreCase)) { Spec.bTint = true; }
+			// The other spelling (351/583 palette bindings in the weapon set) - without this the commoner
+			// family picks a master with no TintPalette parameter and every bind is a silent no-op.
+			// ⛔ WEAPON PRESETS ONLY (RudePresetEnablesTint): the name is shared with peds, vehicles and
+			// props, and raising bTint for them would re-parent an unmeasured population onto a different
+			// master for no visual gain. They keep the master they get today. The `TintPalette*` spelling
+			// above is UNCHANGED - it has raised bTint since before this lane, and still does.
+			else if (S.Equals(TEXT("TextureSamplerDiffPal"), ESearchCase::IgnoreCase)
+				&& RudePresetEnablesTint(D.Preset)) { Spec.bTint = true; }
 			else if (S.Equals(TEXT("DiffuseSampler2"), ESearchCase::IgnoreCase)) { Spec.bLivery = true; }
 		}
 		// The preset name still tells us a surface EMITS; when it emits is archetype data
@@ -3216,6 +3399,9 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 	int32 UnsupportedByMaster = 0;   // sampler mapped, but the MASTER has no such parameter
 	int32 MissingTextures = 0;       // XML named a texture that is not imported in this project
 	int32 DetailNormalMapsSkipped = 0;   // a NORMAL map bound to Detail: the albedo overlay is left off
+	int32 TintPalettesBound = 0;         // a palette bound AND the lookup switched on (see the gate below)
+	int32 TintPalettesNeutral = 0;       // a palette bound and the tint left OFF - wrong bucket, or a flat alpha
+	int32 TintPalettesNeutralNonWeapon = 0;  // DEFERRED: a palette on a non-weapon preset - mechanism in, lookup off
 	int32 UnmappedSamplers = 0;      // a sampler name with no entry in GSamplerBinds (see below)
 	int32 SlotsWithoutShaderDef = 0; // geometry's ShaderIndex resolves to no shader definition
 	int32 SlotsWithoutMaterial = 0;  // slot kept WorldGridMaterial - see the block below the loop
@@ -3237,7 +3423,16 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		{ TEXT("TextureSamp"),        TEXT("Diffuse")     },  // cable's albedo: 152/152 resolve
 		{ TEXT("distanceMapSampler"), TEXT("Diffuse")     },  // distance_map's only colour source
 		{ TEXT("DetailSampler"),      TEXT("Detail")      },  // inert until the masters gain Detail
-		{ TEXT("TintPaletteSampler"), TEXT("TintPalette") },  // inert until the palettes import
+		{ TEXT("TintPaletteSampler"),    TEXT("TintPalette") },  // the "tnt" family: 232 of 583 palette bindings
+		// THE SECOND SPELLING OF THE SAME IDEA, and the commoner one. MEASURED over the 879 effective
+		// weapon drawables (maintainer lane `weapon_tint`): 351 palette bindings ride
+		// TextureSamplerDiffPal and 232 ride TintPaletteSampler, 0 shader items carry both, and each
+		// name always travels with its own selector (TextureSamplerDiffPal+paletteSelector 351/351,
+		// TintPaletteSampler+tintPaletteSelector 232/232). Both land on ONE master parameter.
+		// ⛔ SHARED WITH THE PED / VEHICLE / PROP LANES: this name is declared outside the weapon set too,
+		// so the BIND is gated on the preset (RudePresetEnablesTint) at the lookup site below. Only the
+		// weapon set was measured - law 13 and law 14 in the lane's LAWS.md say how much was not.
+		{ TEXT("TextureSamplerDiffPal"), TEXT("TintPalette") },  // the "palette" family: 351 of 583
 		{ TEXT("DirtSampler"),        TEXT("Dirt")        },  // inert until those textures import
 	};
 	TMap<FString, UMaterialInstanceConstant*> MIByConfig;   // dedupe: same shader config -> shared MI
@@ -3251,6 +3446,9 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 
 		UMaterialInterface* SlotMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
 		const bool bTerrain = Def && Def->Preset.StartsWith(TEXT("terrain"), ESearchCase::IgnoreCase);
+		// Does THIS preset get the tint lookup? One switch, in RudePresetEnablesTint: the palette
+		// samplers are shared with peds, vehicles and map props, and only the weapon set was measured.
+		const bool bPresetTints = Def && RudePresetEnablesTint(Def->Preset);
 		UMaterialInterface* Master = nullptr;
 		if (Def)
 		{
@@ -3346,7 +3544,10 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 				}
 				bool bBoundDiffuse = false;
 				bool bBoundDetail = false;
+				bool bBoundTint = false;
 				UTexture2D* DetailTexBound = nullptr;   // WHICH texture landed in Detail - the KIND matters (below)
+				UTexture2D* TintTexBound = nullptr;     // the palette, for its ROW COUNT (TintRowScale)
+				UTexture2D* DiffuseTexBound = nullptr;  // the albedo, for its ALPHA (the palette lookup coordinate)
 				auto BindTex = [&](const TCHAR* Param, const FString& TexName) -> bool
 				{
 					if (TexName.IsEmpty()) { return false; }
@@ -3358,6 +3559,10 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 					++BoundTextures;
 					if (PName == FName(TEXT("Diffuse"))) { bBoundDiffuse = true; }
 					if (PName == FName(TEXT("Detail")))  { bBoundDetail = true; DetailTexBound = T; }
+					// The tint lookup needs BOTH textures by hand: the palette it samples, and the diffuse whose
+					// ALPHA is the lookup coordinate (the gate below refuses a flat one).
+					if (PName == FName(TEXT("TintPalette"))) { bBoundTint = true; TintTexBound = T; }
+					if (PName == FName(TEXT("Diffuse")))     { DiffuseTexBound = T; }
 					return true;
 				};
 
@@ -3391,6 +3596,18 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 					if (!Param)
 					{
 						++UnmappedSamplers;
+						continue;
+					}
+					// (⛔) THE SECOND PALETTE SPELLING IS A SHARED SAMPLER. TextureSamplerDiffPal is declared
+					// by peds, vehicles and map props too (see RudePresetEnablesTint for the counts), and this
+					// is the SHARED importer. Outside a weapon preset it is left exactly as it was before this
+					// lane - not bound, nothing re-parented, nothing repainted - and COUNTED here rather than
+					// dropped silently, so the deferred population is a number in the verdict.
+					// (The older TintPaletteSampler spelling has bound since before this lane and still does;
+					// what stays off for it outside a weapon preset is TintAmount, in the gate below.)
+					if (!bPresetTints && Tex.Key.Equals(TEXT("TextureSamplerDiffPal"), ESearchCase::IgnoreCase))
+					{
+						++TintPalettesNeutralNonWeapon;
 						continue;
 					}
 					BindTex(Param, Tex.Value);
@@ -3439,6 +3656,41 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 				{
 					MIC->SetScalarParameterValueEditorOnly(
 						FMaterialParameterInfo(TEXT("DetailAmount")), (bBoundDetail && !bDetailIsNormalMap) ? 1.f : 0.f);
+				}
+
+				// (⛔) THE TINT: PROVE IT BEFORE ENABLING IT - the same law as DetailAmount above. TintAmount
+				// stays 0, i.e. the slot renders EXACTLY as it does today, unless all three arrived:
+				//  1. a palette texture really landed in TintPalette (not the master's white default);
+				//  2. the shader is RenderBucket 0. Buckets 2 and 3 wire the diffuse ALPHA into OpacityMask,
+				//     and the alpha is the palette's lookup coordinate - one channel cannot be both.
+				//     MEASURED (maintainer lane `weapon_tint`): of 583 palette bindings in the weapon set, 428
+				//     are bucket 0, 130 bucket 2, 25 bucket 3 and NONE bucket 1; the bucket-2 diffuses average
+				//     28.0% fully transparent texels against 1.4% in bucket 0, and 180 of 184 bucket-0 diffuses
+				//     carry a DISCRETE alpha (<=24 authored values covering >=80% of the surface).
+				//  3. the diffuse's alpha actually VARIES - see RudeTextureAlphaVaries. 137 of the 583 bindings
+				//     sit on a diffuse with no alpha channel at all, which would read one palette column for
+				//     every texel.
+				//  4. the shader preset is one the lookup is ENABLED for - weapons only today, because this is
+				//     the shared importer and only the weapon set was measured (RudePresetEnablesTint). Inside
+				//     the weapon set that withholds 9 of the 428 bucket-0 bindings (`normal_spec_tnt` 8,
+				//     `normal_spec_detail_tnt` 1), leaving 419; outside it, everything. The withheld ones are
+				//     counted, not dropped: tintPalettesNeutralNonWeapon in the verdict.
+				// TintRowScale is 1/rows of the palette that bound: a property of the TEXTURE, so the row stays
+				// correct however the tint is changed later, and there is no second source of truth to drift.
+				if (MasterParams.Contains(FName(TEXT("TintPalette"))))
+				{
+					// int32(): FTextureSource::GetSizeX/Y return int64 in 5.8, and a silent narrowing is a warning
+					// this project's targets are one settings change away from making an error.
+					const int32 PaletteRows = (bBoundTint && TintTexBound) ? int32(TintTexBound->Source.GetSizeY()) : 0;
+					const bool bTintable = bBoundTint && bPresetTints && PaletteRows > 0 && Def->RenderBucket == 0
+						&& RudeTextureAlphaVaries(DiffuseTexBound);
+					MIC->SetScalarParameterValueEditorOnly(
+						FMaterialParameterInfo(TEXT("TintRowScale")), PaletteRows > 0 ? 1.f / float(PaletteRows) : 0.f);
+					MIC->SetScalarParameterValueEditorOnly(
+						FMaterialParameterInfo(TEXT("TintAmount")), bTintable ? 1.f : 0.f);
+					if (bTintable)                        { ++TintPalettesBound; }
+					else if (bBoundTint && !bPresetTints) { ++TintPalettesNeutralNonWeapon; }
+					else if (bBoundTint)                  { ++TintPalettesNeutral; }
 				}
 
 				// ---- VALUE params -> the MI, guarded exactly like textures ----
@@ -3633,7 +3885,9 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
 		TEXT("\"unmappedSamplers\":%d,\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
 		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,")
-		TEXT("\"valueParamsUnsupported\":%d,\"valueParamsDeduped\":%d,%s,\"slots\":[%s]}"),
+		TEXT("\"valueParamsUnsupported\":%d,\"valueParamsDeduped\":%d,")
+		TEXT("\"tintPalettesBound\":%d,\"tintPalettesNeutral\":%d,\"tintPalettesNeutralNonWeapon\":%d,")
+		TEXT("%s,\"slots\":[%s]}"),
 		bMeshOk ? TEXT("true") : TEXT("false"),
 		*PackageName, Geos.Num(), GeosFailed, *GeoErrors, GeometriesWithoutUV, TotalVerts, TotalTris,
 		TrisOutOfRange, TrisDegenerate,
@@ -3648,6 +3902,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		UnsupportedByMaster, MissingTextures, UnmappedSamplers,
 		SlotsWithoutShaderDef, SlotsWithoutMaterial,
 		ValueParamsSeen, ValueParamsBound, ValueParamsUnsupported, ValueParamsDeduped,
+		TintPalettesBound, TintPalettesNeutral, TintPalettesNeutralNonWeapon,
 		*RudeBound::VerdictJson(Col, ColAssetPath), *SlotsJson);
 }
 

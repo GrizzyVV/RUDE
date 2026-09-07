@@ -937,6 +937,38 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Write the interior you built in Unreal out as a FiveM resource the game loads - its definition file and the map that places it."))
 	static FString ExportNewMlo(const FString& InteriorName, const FString& OutDir, const FString& CorpusRoot);
 
+	// ---- WP12 weapon_tint lane (RudeWeapon.cpp) ----
+	// Paint an imported weapon in one of the game's own tints. A weapon body's diffuse is GREYSCALE by
+	// design (136 of the 171 measurable diffuses behind a palette are >=90% desaturated, 119 of them
+	// >=99%) and the colour arrives from a small lookup texture the drawable binds beside it: 583 shader
+	// items across the 879 effective weapon drawables bind one, 351 as TextureSamplerDiffPal and 232 as
+	// TintPaletteSampler, and each name always travels with its own selector (351/351 and 232/232, 0
+	// carrying both). The lookup is 2-D: u = the DIFFUSE'S ALPHA, which is a material-ZONE index and not
+	// a shade (a median of 10 authored values, round numbers, uncorrelated with luminance - mean |r|
+	// 0.23 - and in 114 of 171 pairs every value lands on its own palette column), and v = the tint.
+	// TintIndex is that row. The range is the bound palette's OWN height (94 of the 98 entries in this
+	// corpus's 804 weapon dictionaries are 128x32, 4 are 4x4), and the verdict reports distinctRows and
+	// rowDuplicateOf, because a 32-row palette does not carry 32 different tints: 27 have 8 distinct
+	// leading rows - which is the count weapons.meta's TINT_DEFAULT declares, referenced by 91/91
+	// CWeaponInfo rows in the copy the game loads - 34 have 9, and 29 have all 32.
+	// REFUSES BY NAME: an actor label no weapon in the level carries (it lists the ones it found), a
+	// non-numeric or negative index, an index at or past the palette's row count, and a weapon on which
+	// no material carries a palette at all (with the slot census that says why).
+	// ⛔ It does NOT switch the lookup on. TintAmount is set once, by the import, only when a palette
+	// bound to a RenderBucket-0 shader over a diffuse whose alpha varies, on a shader preset the lookup
+	// is enabled for (weapons only today - the palette samplers are shared with the ped, vehicle and
+	// prop lanes and only the weapon set was measured) - so this tool cannot enable a tint the data
+	// does not support. slotsTinting says how many slots will actually look different, and ok is
+	// COMPUTED from it. Mirrors SetVehicleLivery / SetPedProp in shape.
+	// ⛔ EDITOR STATE ONLY: the chosen index lives on the material instance. ExportYdr does not yet
+	// emit shader value parameters or the palette sampler, so nothing reads it back and no tint
+	// survives an export today. That exporter work is unbuilt, not assumed.
+	// Returns JSON: {ok, weapon, actor, tint, paletteRows, paletteRowsMax, distinctRows, rowDuplicateOf,
+	// palettes[], slots, slotsUpdated, slotsTinting, slotsWithoutInstance, slotsWithoutParameter,
+	// slotsPaletteUnbound, tintSpecValues, note}.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Paint an imported weapon in one of the colours the game gives it. Give the weapon actor's name and the tint number, counting from 0."))
+	static FString SetWeaponTint(const FString& ActorLabel, const FString& TintIndex);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

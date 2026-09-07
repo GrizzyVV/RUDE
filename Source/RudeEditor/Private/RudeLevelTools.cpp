@@ -3048,7 +3048,7 @@ FString URudeToolset::InspectMesh(const FString& AssetPath)
 	FString MatsJson;
 	for (const FStaticMaterial& SM : Mesh->GetStaticMaterials())
 	{
-		FString Diffuse = TEXT("unbound"), MatPath = TEXT("null"), Master = TEXT("null"), Params;
+		FString Diffuse = TEXT("unbound"), MatPath = TEXT("null"), Master = TEXT("null"), Params, Scalars;
 		if (SM.MaterialInterface)
 		{
 			MatPath = SM.MaterialInterface->GetPathName();
@@ -3074,11 +3074,26 @@ FString URudeToolset::InspectMesh(const FString& AssetPath)
 						Params += FString::Printf(TEXT("%s{\"param\":\"%s\",\"texture\":\"%s\"}"), Params.IsEmpty() ? TEXT("") : TEXT(","),
 							*RudeJsonEscape(I.Name.ToString()), *RudeJsonEscape(Val));
 					}
+					// EVERY SCALAR the master exposes, and what this instance put in it (2026-09-07). A texture
+					// parameter alone cannot answer "is the effect ON?": DetailAmount, TintAmount and
+					// paletteSelector are the switches, and a gate that can see the palette land but not the
+					// index that selects a row is testing the wrong property.
+					{
+						TArray<FMaterialParameterInfo> SInfos; TArray<FGuid> SIds;
+						Par->GetAllScalarParameterInfo(SInfos, SIds);
+						for (const FMaterialParameterInfo& SI : SInfos)
+						{
+							float SV = 0.f;
+							const bool bGotS = MI->GetScalarParameterValue(SI, SV);
+							Scalars += FString::Printf(TEXT("%s{\"param\":\"%s\",\"value\":%s}"), Scalars.IsEmpty() ? TEXT("") : TEXT(","),
+								*RudeJsonEscape(SI.Name.ToString()), bGotS ? *FString::SanitizeFloat(SV) : TEXT("null"));
+						}
+					}
 				}
 			}
 		}
-		MatsJson += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"master\":\"%s\",\"diffuse\":\"%s\",\"textureParams\":[%s]}"), MatsJson.IsEmpty() ? TEXT("") : TEXT(","),
-			*RudeJsonEscape(SM.MaterialSlotName.ToString()), *RudeJsonEscape(MatPath), *RudeJsonEscape(Master), *RudeJsonEscape(Diffuse), *Params);
+		MatsJson += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"master\":\"%s\",\"diffuse\":\"%s\",\"textureParams\":[%s],\"scalarParams\":[%s]}"), MatsJson.IsEmpty() ? TEXT("") : TEXT(","),
+			*RudeJsonEscape(SM.MaterialSlotName.ToString()), *RudeJsonEscape(MatPath), *RudeJsonEscape(Master), *RudeJsonEscape(Diffuse), *Params, *Scalars);
 	}
 	return FString::Printf(TEXT("{\"ok\":true,\"mesh\":\"%s\",\"renderBoundsM\":\"%.1fx%.1fx%.1f\",\"boundsCenterM\":\"%.1f,%.1f,%.1f\",")
 		TEXT("\"lod0Verts\":%d,\"lod0Tris\":%d,\"vertexMinM\":\"%.1f,%.1f,%.1f\",\"vertexMaxM\":\"%.1f,%.1f,%.1f\",")
