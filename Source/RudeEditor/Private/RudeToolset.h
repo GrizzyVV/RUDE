@@ -628,6 +628,59 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one prop of an interior by x,y,z centimetres.", RudeAudience="agent"))
 	static FString MoveMloEntity(const FString& InteriorName, const FString& Index, const FString& DeltaCm);
 
+	// ---- WP12 weapons lane (RudeWeapon.cpp) ----
+	// The weapon bench (GDD Tier 2, the weapon's answer to the vehicle showroom). One actor: the weapon's
+	// own drawable at the origin, and every component its meta row lists placed at the socket bone the meta
+	// names - default components visible, alternates imported and HIDDEN (SetWeaponComponent swaps them).
+	// WeaponName takes either spelling: the meta name (WEAPON_PISTOL) or the model (w_pi_pistol).
+	// MEASURED 2026-09-06 over the whole weapon set of a corpus cut from a legally owned copy of the game
+	// (875 w_* drawables, 184 CWeaponInfo rows, 474 component rows; maintainer lane `weapons` (`LAWS.md`)):
+	//   * The WEAPON's skeleton carries the sockets (WAPClip on 185 drawables, WAPFlshLasr 163, WAPSupp 151,
+	//     WAPScop 115, WAPGrip 76, WAPScop_2 69); the COMPONENT's drawable carries ONE AAP* bone, and it is
+	//     its FIRST bone at parent -1 with identity rotation and zero translation in 516/516 - so a component
+	//     mesh needs NO correction, it drops straight onto the socket's model-space frame. 198 drawables
+	//     carry WAP bones, 516 carry AAP bones, NOT ONE carries both.
+	//   * The pairing comes from the META, never from the bone names: 377 of 402 socket references pair by
+	//     name stem (WAPSupp<-AAPSupp, WAPFlshLasr<-AAPFlsh) and 25 do not (WAPScop_2<-AAPCamo2 x22,
+	//     WAPScop<-AAPFlsh x2, WAPFlshLasr<-AAPCover x1). 133 more sit at gun_root and 12 at gun_gripr.
+	//   * Sockets hang mid-chain (249 of 317 on bone index 2), so bone frames are composed up the parent
+	//     chain, GTA->UE (x,-y,z) cm + the plain quaternion mirror - the vehicle lane's map, same reason.
+	//   * 16 of 272 attach points name a bone the weapon's own skeleton lacks (all WAPClip, on shotguns and
+	//     launchers): those components ride the weapon origin and are COUNTED (componentsUnmapped).
+	//   * Weapons ship NO lod groups inside a file (875/875 High only) and no lights (0/875); collision rides
+	//     the drawable's own <Bounds> (Composite on 627, absent on 248). The detail toggle is a SECOND FILE:
+	//     204 of the 875 drawables have a <name>_hi twin carrying the same skeleton and more vertices in
+	//     194/204 (w_ar_carbinerifle 3,961 -> 20,251), so the _hi is imported as what the actor shows and the
+	//     base drawable becomes its LOD1 - the vehicle lane's rule, applied to the weapon's own file pair.
+	//   * Textures: own dictionary 2,806 of 5,274 sampler references, embedded in the ydr 234, another weapon
+	//     dictionary 1,859, nowhere in the weapon set 375 (env_smooth_concrete2 / env_noise_heavy, which live
+	//     in map dictionaries, and givemechecker, which exists nowhere). gtxd.ymt has ZERO w_ rows, so a
+	//     weapon does not ride the map's texture-parent chain: the scope is the drawable's own dictionary
+	//     plus the other dictionaries of this composite. ⚠ The 2026-09-04 corpus carries pixels for 0 of 804
+	//     weapon dictionaries, so texturesMissing is expected non-zero and never gates ok.
+	// Verdict: bones, wapBones, attachPoints, components, componentsImported, componentsMissingMesh,
+	// componentsUnmapped, componentsWithoutModel, componentBonesMatched, texturesMissing, metaFilesSearched,
+	// weaponMetaFields / ammoMetaFields / componentMetaFields, hiDrawable / componentHiLods / lodFailed,
+	// boneNames[] and componentMeshes[] (name,
+	// model, socket, component bone, vertices, triangles, default - what the offline comparator checks
+	// against the corpus XML), missing[] (capped, total beside it); ok is
+	// COMPUTED and refuses only on the total-loss shape (no weapon mesh, or a weapon whose meta lists
+	// components and not one of them got a mesh).
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring a GTA V weapon into Unreal as one assembled gun: the weapon itself plus every magazine, scope, suppressor, flashlight and grip it can take, each on its own mounting point."))
+	static FString ImportWeapon(const FString& CorpusRoot, const FString& WeaponName,
+	                            const FString& DestFolder);
+
+	// Swap or clear one mounting point of an imported weapon: shows ComponentName on AttachPoint and hides
+	// every other component of that point (one component per point, which is how the game's own data is
+	// shaped - 93 of 273 attach points declare exactly one <Default value="true"/> and NOT ONE declares two).
+	// AttachPoint = the socket bone as the meta spells it (WAPSupp, WAPFlshLasr, gun_root) or its ordinal;
+	// ComponentName = the component's meta name (COMPONENT_AT_AR_SUPP) or its model (w_at_ar_supp); EMPTY =
+	// nothing on that point. Refuses by name on an unknown point, a component that point does not list, or a
+	// component whose mesh never imported. Mirrors SetVehicleLivery / SetPedProp in shape.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Put a scope, suppressor, flashlight, grip or magazine on an imported weapon, or take it off (leave the name empty).", RudeAudience="agent"))
+	static FString SetWeaponComponent(const FString& ActorLabel, const FString& AttachPoint,
+	                                  const FString& ComponentName);
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);
