@@ -1121,6 +1121,56 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Check two packed animation files against each other and say exactly which animation channels differ.", RudeAudience="agent"))
 	static FString CompareYcdBinary(const FString& APath, const FString& BPath);
 
+	// RUDE_PEDVAR_BEGIN header
+	// THE PED VARIATION TABLE (WP13, maintainer lane `ped_variation` (`LAWS.md`)). `ExportPedReplace` ships a ped by
+	// REPLACING its own dictionaries, so it never needed a variation row. Adding a garment does: the ymt is the table
+	// that says which drawables a slot HAS and how many texture letters each carries. These two tools give a NEW
+	// garment a row instead of overwriting one.
+	//
+	// `ExportPedVariationYmt` writes the ped's `CPedVariationInfo` back from the outfit asset by SPLICE, the way
+	// `ExportMloYtyp` / `ExportScenarioRegion` do: every untouched row re-emits its OWN bytes and only an edited or
+	// added one is rebuilt. Measured: cut -> split at the fixed `<Item>` indent -> re-assemble reproduces all
+	// 1,820/1,820 corpus files byte for byte (law 9), each region occurs exactly once (1,820/1,820), and the top-level
+	// order is a single order (1,820/1,820). THE MEASURE: an untouched export is byte-identical to its source -
+	// pass `Expect="identical"` and the tool ASSERTS it (`ok:false` when it is not), which is the only way a
+	// script that stops on ok:false can catch a row this tool rebuilt when it should not have. `Expect="changed"`
+	// asserts the opposite for an export that is meant to carry an edit; empty asserts nothing.
+	// ⚠ The corpus form is the PSO container RENDERED to text - it carries `<MetaSchema>` and an opaque
+	// `<UnknownBlob40>` (1,820/1,820, law 1) and NO original binary survives beside it. The game reads the binary and
+	// this repo has no PSO writer, so the file this tool writes is an AUTHORED variation table, not a drop-in: the
+	// verdict says so itself (`format":"pso-xml"`, `gameReady":false`) and never claims otherwise.
+	// A REBUILT row keeps its own `ownsCloth`: the outfit asset has no cloth field, so the flag is re-read off
+	// the source row (98 of 45,533 corpus rows carry `true`) and a row that does not spell it is left verbatim
+	// instead of being rebuilt - counted as `clothFlagsCarried` / `clothRowsRefused`, never dropped in silence.
+	// CorpusRoot empty = the outfit's own `SourceYmt`. Verdict: ped, ymtPath, sourceYmt, bytes, sourceBytes,
+	// byteIdentical, components, componentsAdded, drawables, drawablesVerbatim, drawablesRebuilt, drawablesAdded,
+	// drawablesOnlyInSource, texRows, numAvailTexRewritten, compInfoRows, compInfoRowsAdded, propRowsVerbatim,
+	// availCompRewritten, clothFlagsCarried, clothRowsRefused, expect, expectMet, format, gameReady, problems[].
+	// ⛔ DRAFT - never compiled and no gate has been run in the editor.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Write a character's clothing-variation table back out from Unreal, keeping every row the game wrote untouched. Expect=identical makes an untouched write prove it changed nothing.", RudeAudience="agent"))
+	static FString ExportPedVariationYmt(const FString& OutfitAssetPath, const FString& OutDir, const FString& CorpusRoot, const FString& Expect);
+
+	// Give a NEW garment its own row on the outfit: one drawable appended to `Slot` (head/berd/hair/uppr/lowr/hand/
+	// feet/teef/accs/task/decl/jbib, or 0..11), pointing at `MeshAssetPath` (a skinned mesh on the ped's own
+	// skeleton), with one texture letter per entry in `TextureAssetPaths` (comma-separated; empty = one letter `a`
+	// with no texture yet). The row's index is the slot's next free one, so the entry name it will ship under is
+	// `<slot>_<ddd>_u` - the name `ExportPedReplace` / `ExportYddBinary` write into `stream/<ped>.ydd`.
+	// Every value the row carries that the caller did not give is the MODE of the game's own data with its
+	// denominator (law 5): `numAlternatives` 0 (41,258/45,533), `distribution` 255 (228,687/228,790), `texId` 0
+	// (176,569/228,790), `ownsCloth` false (45,435/45,533), and `propMask` = the modal mask OF THAT SLOT
+	// (e.g. uppr 17 on 5207/6863). Nothing is invented; a value that has no measured mode is left at zero, and the
+	// three propMask arrays are read out of `measure_variation5.json`, not transcribed.
+	// It REFUSES before touching the outfit - nothing is added and nothing is saved - when the mesh is on a
+	// different skeleton than the ped's, when the mesh has no LOD 0 vertices, when the slot is not one of the
+	// twelve, or when more than 26 textures are named (the letters run a..z and the widest aTexData row in the
+	// corpus is 26). So `ok:false` from this tool always means the outfit is unchanged.
+	// Verdict: ped, slot, slotIndex, drawableIndex, entryName, mesh, propMask, propMaskDenominator, textures,
+	// texturesBound, numAvailTex, vertices, triangles, componentCreated, saved, problems[].
+	// ⛔ DRAFT - never compiled and no gate has been run in the editor.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Add a new piece of clothing to a character as its own variation, instead of replacing one the game already has.", RudeAudience="agent"))
+	static FString AddPedDrawable(const FString& OutfitAssetPath, const FString& Slot, const FString& MeshAssetPath, const FString& TextureAssetPaths);
+	// RUDE_PEDVAR_END header
+
 	// LOD lineage: the chain an entity hands over along (up through its parents) and its children.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show what an object hands over to at distance (its LOD parents) and what hands over to it (its children).", RudeAudience="agent"))
 	static FString LodLineage(const FString& ActorLabel);

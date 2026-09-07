@@ -1842,3 +1842,717 @@ FString URudeToolset::ExportTxdReplace(const FString& DictName, const FString& O
 		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Dict), *RudeJsonEscape(OutDir), *RudeJsonEscape(YtdPath), Textures, NotTextures,
 		JsonInt(YtdVerdict, TEXT("bytes"), -1), *ManifestState, bOk ? *YtdVerdict : *Bad(YtdVerdict.Left(300)));
 }
+
+// RUDE_PEDVAR_BEGIN impl
+// ---- WP13: THE PED VARIATION TABLE (<ped>.ymt, CPedVariationInfo) --------------------------------
+// Laws: maintainer lane `ped_variation` (`LAWS.md`), measured over the 1,820 CPedVariationInfo files of the
+// corpus (11,542 component rows / 45,533 drawable rows / 228,790 texture rows / 45,271 compInfos rows).
+// The writer is a SPLICE, like ExportMloYtyp / ExportScenarioRegion: the source text is cut into its <Item>
+// blocks at the fixed indent each array uses (law 9 - the cut and re-assemble reproduce 1,820/1,820 files
+// byte for byte), untouched blocks travel as their own bytes, and only an edited or added block is rebuilt.
+// Nothing here derives <MetaSchema> or <UnknownBlob40> (law 1: opaque, re-emitted verbatim).
+namespace RudePedVar
+{
+	// The 12 availComp slots in the game's own ePedVarComp order (the ymt's own EnumDefs spell it).
+	static const TCHAR* kSlotWords[12] =
+	{
+		TEXT("head"), TEXT("berd"), TEXT("hair"), TEXT("uppr"), TEXT("lowr"), TEXT("hand"),
+		TEXT("feet"), TEXT("teef"), TEXT("accs"), TEXT("task"), TEXT("decl"), TEXT("jbib")
+	};
+	// The MODAL propMask of each slot, its hits and the denominator it was counted over (LAWS.md law 5). All
+	// three arrays are READ OUT of one artifact - `measure_variation5.json`, keys `kSlotPropMask` /
+	// `kSlotPropMaskHits` / `kSlotPropMaskOf`, written by `measure_variation5.py` over the corpus's 1,820
+	// CPedVariationInfo files - never hand-transcribed. A new row the caller gave no mask for carries its
+	// slot's mode; never a made-up constant.
+	static const int32 kSlotPropMask[12] = { 17, 1, 9, 17, 17, 1, 1, 1, 1, 1, 5, 1 };
+	static const int32 kSlotPropMaskHits[12] = { 3412, 2464, 1608, 5207, 2983, 1233, 2469, 898, 4064, 1150, 3093, 5225 };
+	static const int32 kSlotPropMaskOf[12] = { 3446, 2965, 3159, 6863, 5092, 2286, 2932, 2314, 4580, 1275, 3274, 7083 };
+
+	static int32 SlotIndexOf(const FString& Text)
+	{
+		const FString T = Text.TrimStartAndEnd().ToLower();
+		if (T.IsEmpty()) { return -1; }
+		if (T.IsNumeric()) { const int32 N = FCString::Atoi(*T); return (N >= 0 && N < 12) ? N : -1; }
+		for (int32 i = 0; i < 12; ++i) { if (T == kSlotWords[i]) { return i; } }
+		return -1;
+	}
+
+	// ---- the splice primitives (law 9) -----------------------------------------------------------
+	struct FYmtRegion
+	{
+		int32 Start = -1, End = -1, BodyStart = -1, BodyEnd = -1;
+		bool bSelfClosing = false;
+	};
+
+	// How many <Tag ...> opens the text carries, filling Out with the FIRST. The writer refuses unless the count
+	// is exactly 1 - measured 1,820/1,820 for availComp / aComponentData3 / compInfos / propInfo / aSelectionSets.
+	static int32 FindRegion(const FString& S, const FString& Tag, FYmtRegion& Out)
+	{
+		const FString Open = FString(TEXT("<")) + Tag;
+		int32 Count = 0, At = 0;
+		while (At < S.Len())
+		{
+			const int32 I = S.Find(Open, ESearchCase::CaseSensitive, ESearchDir::FromStart, At);
+			if (I == INDEX_NONE) { break; }
+			At = I + Open.Len();
+			if (At >= S.Len()) { break; }
+			const TCHAR Nxt = S[At];
+			if (Nxt != TEXT(' ') && Nxt != TEXT('>') && Nxt != TEXT('/') && Nxt != TEXT('\t') && Nxt != TEXT('\n')) { continue; }
+			const int32 Gt = S.Find(TEXT(">"), ESearchCase::CaseSensitive, ESearchDir::FromStart, I);
+			if (Gt == INDEX_NONE) { break; }
+			++Count;
+			if (Count == 1)
+			{
+				Out.Start = I;
+				Out.BodyStart = Gt + 1;
+				Out.bSelfClosing = (Gt > 0 && S[Gt - 1] == TEXT('/'));
+				if (Out.bSelfClosing) { Out.End = Gt + 1; Out.BodyEnd = Gt + 1; }
+				else
+				{
+					const FString Close = FString(TEXT("</")) + Tag + TEXT(">");
+					const int32 C = S.Find(Close, ESearchCase::CaseSensitive, ESearchDir::FromStart, Gt);
+					if (C == INDEX_NONE) { return 0; }
+					Out.BodyEnd = C;
+					Out.End = C + Close.Len();
+				}
+			}
+			At = Gt + 1;
+		}
+		return Count;
+	}
+
+	// Split an array body into its <Item> blocks at the indent that array uses. Pre + every block + Suf must
+	// re-assemble the body EXACTLY or the shape is not the one measured and the caller refuses.
+	static bool SplitItems(const FString& Body, int32 Indent, const FString& NL,
+		FString& OutPre, TArray<FString>& OutItems, FString& OutSuf)
+	{
+		OutPre.Empty(); OutItems.Empty(); OutSuf.Empty();
+		const FString Ind = FString::ChrN(Indent, TEXT(' '));
+		const FString OpenPat = NL + Ind + TEXT("<Item>") + NL;
+		const FString ClosePat = NL + Ind + TEXT("</Item>") + NL;
+		TArray<int32> Starts, Ends;
+		for (int32 I = Body.Find(OpenPat, ESearchCase::CaseSensitive, ESearchDir::FromStart, 0); I != INDEX_NONE;
+			I = Body.Find(OpenPat, ESearchCase::CaseSensitive, ESearchDir::FromStart, I + 1))
+		{
+			Starts.Add(I + NL.Len());
+		}
+		for (int32 I = Body.Find(ClosePat, ESearchCase::CaseSensitive, ESearchDir::FromStart, 0); I != INDEX_NONE;
+			I = Body.Find(ClosePat, ESearchCase::CaseSensitive, ESearchDir::FromStart, I + 1))
+		{
+			Ends.Add(I + ClosePat.Len());
+		}
+		if (Starts.Num() == 0) { return Ends.Num() == 0; }   // an empty array is a legal shape
+		if (Starts.Num() != Ends.Num()) { return false; }
+		for (int32 k = 0; k < Starts.Num(); ++k)
+		{
+			if (Ends[k] <= Starts[k]) { return false; }
+			if (k > 0 && Starts[k] != Ends[k - 1]) { return false; }
+			OutItems.Add(Body.Mid(Starts[k], Ends[k] - Starts[k]));
+		}
+		OutPre = Body.Left(Starts[0]);
+		OutSuf = Body.Mid(Ends.Last());
+		return true;
+	}
+
+	// The whole `<tag ...>` + body + `</tag>` of a region, rebuilt from its own open tag and new items.
+	static FString ReassembleRegion(const FString& S, const FYmtRegion& R, const FString& NewBody)
+	{
+		return S.Left(R.BodyStart) + NewBody + S.Mid(R.BodyEnd);   // the open tag ends at BodyStart, the close tag starts at BodyEnd
+	}
+
+	// `<numAvailTex value="N" />` inside a component <Item>, rewritten in place. False when the item does not
+	// spell it the way 1,820/1,820 files do (law 2) - the caller then counts it rather than guessing.
+	static bool RewriteNumAvailTex(FString& Item, int32 NewValue, int32& OutOld)
+	{
+		const FString Key = TEXT("<numAvailTex value=\"");
+		const int32 A = Item.Find(Key, ESearchCase::CaseSensitive, ESearchDir::FromStart, 0);
+		if (A == INDEX_NONE) { return false; }
+		const int32 VStart = A + Key.Len();
+		const int32 VEnd = Item.Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, VStart);
+		if (VEnd == INDEX_NONE) { return false; }
+		OutOld = FCString::Atoi(*Item.Mid(VStart, VEnd - VStart));
+		if (OutOld == NewValue) { return true; }
+		Item = Item.Left(VStart) + FString::FromInt(NewValue) + Item.Mid(VEnd);
+		return true;
+	}
+
+	// `<ownsCloth value="true|false" />` exactly as the SOURCE row spells it. 98 of 45,533 corpus drawable rows
+	// say `true`, in 46 files (`measure_variation5.json` -> `ownsCloth`, `ownsClothTrueFiles`), and
+	// FRudePedDrawable carries NO cloth field - so a rebuilt row can only keep the flag by re-reading it here.
+	// False = this row does not spell it the way 45,533/45,533 do; the caller then refuses to rebuild rather
+	// than writing a flag it never read.
+	static bool ReadOwnsCloth(const FString& Item, bool& bOut)
+	{
+		const FString Key = TEXT("<ownsCloth value=\"");
+		const int32 A = Item.Find(Key, ESearchCase::CaseSensitive, ESearchDir::FromStart, 0);
+		if (A == INDEX_NONE) { return false; }
+		const int32 VStart = A + Key.Len();
+		const int32 VEnd = Item.Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, VStart);
+		if (VEnd == INDEX_NONE) { return false; }
+		bOut = (Item.Mid(VStart, VEnd - VStart).TrimStartAndEnd().ToLower() == TEXT("true"));
+		return true;
+	}
+
+	// One drawable <Item> at the drawable indent (4) in the field order 45,533/45,533 files spell.
+	// bOwnsCloth is NEVER a default: a rebuilt row is handed the flag ReadOwnsCloth took off its own source
+	// row, and a brand-new row is handed false because a garment authored in Unreal has no cloth data in the
+	// dictionary it will ship in (and false is the mode, 45,435/45,533).
+	static FString BuildDrawableItem(const FRudePedDrawable& D, int32 SlotIndex, bool bOwnsCloth, const FString& NL)
+	{
+		const int32 Mask = (D.PropMask != 0) ? D.PropMask : ((SlotIndex >= 0 && SlotIndex < 12) ? kSlotPropMask[SlotIndex] : 0);
+		FString O;
+		O += FString::Printf(TEXT("    <Item>%s"), *NL);
+		O += FString::Printf(TEXT("     <propMask value=\"%d\" />%s"), Mask, *NL);
+		O += FString::Printf(TEXT("     <numAlternatives value=\"%d\" />%s"), D.NumAlternatives, *NL);
+		O += FString::Printf(TEXT("     <aTexData itemType=\"CPVTextureData\">%s"), *NL);
+		const int32 Rows = FMath::Max(1, D.Textures.Num());
+		for (int32 t = 0; t < Rows; ++t)
+		{
+			const int32 TexId = D.Textures.IsValidIndex(t) ? D.Textures[t].TexId : 0;
+			const int32 Dist = D.Textures.IsValidIndex(t) ? D.Textures[t].Distribution : 255;
+			O += FString::Printf(TEXT("      <Item>%s"), *NL);
+			O += FString::Printf(TEXT("       <texId value=\"%d\" />%s"), TexId, *NL);
+			O += FString::Printf(TEXT("       <distribution value=\"%d\" />%s"), Dist, *NL);
+			O += FString::Printf(TEXT("      </Item>%s"), *NL);
+		}
+		O += FString::Printf(TEXT("     </aTexData>%s"), *NL);
+		O += FString::Printf(TEXT("     <clothData>%s"), *NL);
+		O += FString::Printf(TEXT("      <ownsCloth value=\"%s\" />%s"), bOwnsCloth ? TEXT("true") : TEXT("false"), *NL);
+		O += FString::Printf(TEXT("     </clothData>%s"), *NL);
+		O += FString::Printf(TEXT("    </Item>%s"), *NL);
+		return O;
+	}
+
+	// One component <Item> at the component indent (2) wrapping the drawable items it was handed.
+	static FString BuildComponentItem(int32 NumAvailTex, const FString& DrawItems, const FString& NL)
+	{
+		FString O;
+		O += FString::Printf(TEXT("  <Item>%s"), *NL);
+		O += FString::Printf(TEXT("   <numAvailTex value=\"%d\" />%s"), NumAvailTex, *NL);
+		O += FString::Printf(TEXT("   <aDrawblData3 itemType=\"CPVDrawblData\">%s"), *NL);
+		O += DrawItems;
+		O += FString::Printf(TEXT("   </aDrawblData3>%s"), *NL);
+		O += FString::Printf(TEXT("  </Item>%s"), *NL);
+		return O;
+	}
+
+	// One compInfos <Item>: every field the MODE of the game's own data (law 7), including pedXml_vfxComps
+	// PV_COMP_HEAD on 45,091/45,271 rows REGARDLESS of the row's own slot (it matches the slot on only
+	// 3,450/45,271 - writing the slot's own name there would be an invention).
+	static FString BuildCompInfoItem(int32 SlotIndex, int32 DrawableIndex, const FString& NL)
+	{
+		FString O;
+		O += FString::Printf(TEXT("  <Item>%s"), *NL);
+		O += FString::Printf(TEXT("   <pedXml_audioID>none</pedXml_audioID>%s"), *NL);
+		O += FString::Printf(TEXT("   <pedXml_audioID2>none</pedXml_audioID2>%s"), *NL);
+		O += FString::Printf(TEXT("   <pedXml_expressionMods>0 0 0 0 0</pedXml_expressionMods>%s"), *NL);
+		O += FString::Printf(TEXT("   <flags value=\"0\" />%s"), *NL);
+		O += FString::Printf(TEXT("   <inclusions>0</inclusions>%s"), *NL);
+		O += FString::Printf(TEXT("   <exclusions>0</exclusions>%s"), *NL);
+		O += FString::Printf(TEXT("   <pedXml_vfxComps>PV_COMP_HEAD</pedXml_vfxComps>%s"), *NL);
+		O += FString::Printf(TEXT("   <pedXml_flags value=\"0\" />%s"), *NL);
+		O += FString::Printf(TEXT("   <pedXml_compIdx value=\"%d\" />%s"), SlotIndex, *NL);
+		O += FString::Printf(TEXT("   <pedXml_drawblIdx value=\"%d\" />%s"), DrawableIndex, *NL);
+		O += FString::Printf(TEXT("  </Item>%s"), *NL);
+		return O;
+	}
+}
+
+// ---- ExportPedVariationYmt (agent + Matt) -----------------------------------------------------
+// The ped's CPedVariationInfo written back from the outfit asset by splice. Untouched rows re-emit their own
+// bytes; a component whose drawable count or texture-row counts moved is rebuilt, its numAvailTex recomputed
+// (law 6) and a compInfos row APPENDED for each added drawable (law 7 - the order is not a law, so nothing is
+// re-sorted). propInfo, MetaSchema and UnknownBlob40 travel verbatim.
+FString URudeToolset::ExportPedVariationYmt(const FString& OutfitAssetPath, const FString& OutDir, const FString& CorpusRoot, const FString& Expect)
+{
+	using namespace RudePeds;
+	using namespace RudePedVar;
+	auto Bad = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+
+	FString Path = OutfitAssetPath.TrimStartAndEnd();
+	if (Path.IsEmpty()) { return Bad(TEXT("give the outfit asset (/Game/RUDE/Peds/<ped>/<ped>_outfit) or the ped name")); }
+	if (!Path.StartsWith(TEXT("/"))) { Path = FString::Printf(TEXT("/Game/RUDE/Peds/%s/%s_outfit"), *Path, *Path); }
+	if (!Path.Contains(TEXT("."))) { Path += TEXT(".") + FPackageName::GetShortName(Path); }
+	URudePedOutfit* Outfit = LoadObject<URudePedOutfit>(nullptr, *Path);
+	if (!Outfit) { return Bad(FString::Printf(TEXT("outfit asset not found: %s (ImportPed builds it)"), *Path)); }
+	const FString Ped = Outfit->PedName.IsEmpty() ? FPackageName::GetShortName(Path).Replace(TEXT("_outfit"), TEXT("")) : Outfit->PedName;
+	if (OutDir.TrimStartAndEnd().IsEmpty()) { return Bad(TEXT("OutDir is empty")); }
+
+	// Expect is what makes this tool's own MEASURE gateable. Without it `ok` cannot go false on byte identity:
+	// a run that rebuilt a row it should not have has Edits > 0, so `ok` stays true and a gate script (which
+	// stops only on ok:false) sails past it. `identical` says THIS export must reproduce its source byte for
+	// byte; `changed` says it must not; empty keeps the old, unasserted behaviour. A typo refuses here, before
+	// anything is read or written, rather than silently asserting nothing.
+	const FString Want = Expect.TrimStartAndEnd().ToLower();
+	if (!Want.IsEmpty() && Want != TEXT("identical") && Want != TEXT("changed"))
+	{
+		return Bad(FString::Printf(TEXT("Expect '%s' is not one of: '' (assert nothing), 'identical' (this export MUST reproduce its source byte for byte), 'changed' (it MUST differ)"), *Expect));
+	}
+
+	// ---- 0) the source ymt: the corpus copy when a CorpusRoot is given, else the one the import read ----
+	FString SrcPath = Outfit->SourceYmt;
+	const FString Root = CorpusRoot.TrimStartAndEnd();
+	if (!Root.IsEmpty())
+	{
+		SrcPath = Root / (Ped + TEXT(".ymt.xml"));
+		if (FRudeCorpus::LooksLikeCorpus(Root))
+		{
+			FString CorpusErr;
+			const TSharedPtr<FRudeCorpus> Corpus = FRudeCorpus::Open(Root, CorpusErr);
+			if (!Corpus.IsValid()) { return Bad(CorpusErr); }
+			if (const FRudeCorpusEntry* R = Corpus->Effective(TEXT("ymt"), Ped)) { SrcPath = Corpus->PathOf(*R); }
+		}
+	}
+	if (SrcPath.IsEmpty() || !FPaths::FileExists(SrcPath))
+	{
+		return Bad(FString::Printf(TEXT("no source variation table for '%s' (looked at '%s') - this lane SPLICES the game's own file and refuses to invent one"), *Ped, *SrcPath));
+	}
+	FString Src;
+	if (!FFileHelper::LoadFileToString(Src, *SrcPath)) { return Bad(FString::Printf(TEXT("cannot read %s"), *SrcPath)); }
+	const FString NL = Src.Contains(TEXT("\r\n")) ? FString(TEXT("\r\n")) : FString(TEXT("\n"));
+	if (!Src.Contains(TEXT("<CPedVariationInfo>")))
+	{
+		return Bad(FString::Printf(TEXT("%s is not a CPedVariationInfo - nothing to splice"), *SrcPath));
+	}
+
+	TArray<FString> Problems;
+	int32 Components = 0, ComponentsAdded = 0, Drawables = 0, DrawablesVerbatim = 0, DrawablesRebuilt = 0;
+	int32 DrawablesAdded = 0, DrawablesOnlyInSource = 0, TexRows = 0, NumAvailTexRewritten = 0;
+	int32 CompInfoRows = 0, CompInfoRowsAdded = 0, PropRowsVerbatim = 0;
+	int32 ClothFlagsCarried = 0, ClothRowsRefused = 0;
+	bool bAvailCompRewritten = false;
+
+	// ---- 1) availComp: the 12-slot indirection (law 4) ----
+	FYmtRegion AvailReg;
+	if (FindRegion(Src, TEXT("availComp"), AvailReg) != 1) { return Bad(TEXT("availComp is not a single unique node - refusing to splice")); }
+	TArray<int32> Avail;
+	{
+		TArray<FString> Tok;
+		Src.Mid(AvailReg.BodyStart, AvailReg.BodyEnd - AvailReg.BodyStart).ParseIntoArrayWS(Tok);
+		for (const FString& T : Tok) { Avail.Add(FCString::Atoi(*T)); }
+	}
+	if (Avail.Num() != 12) { return Bad(FString::Printf(TEXT("availComp has %d entries, not the 12 that 1,820/1,820 files spell"), Avail.Num())); }
+
+	// ---- 2) aComponentData3 -> component items -> drawable items (law 9) ----
+	FYmtRegion CompReg;
+	if (FindRegion(Src, TEXT("aComponentData3"), CompReg) != 1) { return Bad(TEXT("aComponentData3 is not a single unique node - refusing to splice")); }
+	FString CompPre, CompSuf;
+	TArray<FString> CompItems;
+	if (!SplitItems(Src.Mid(CompReg.BodyStart, CompReg.BodyEnd - CompReg.BodyStart), 2, NL, CompPre, CompItems, CompSuf))
+	{
+		return Bad(TEXT("aComponentData3 does not split into <Item> blocks at the measured indent - refusing rather than guessing"));
+	}
+
+	// ---- 3) rebuild each component the outfit disagrees with; everything else travels as its own bytes ----
+	for (int32 Slot = 0; Slot < 12; ++Slot)
+	{
+		if (Avail[Slot] == 255) { continue; }
+		const int32 RowIx = Avail[Slot];
+		if (!CompItems.IsValidIndex(RowIx))
+		{
+			Problems.Add(FString::Printf(TEXT("availComp slot %d points at row %d and there are only %d - left untouched"), Slot, RowIx, CompItems.Num()));
+			continue;
+		}
+		++Components;
+		const FRudePedComponent* OC = nullptr;
+		for (const FRudePedComponent& C : Outfit->Components) { if (C.ComponentIndex == Slot) { OC = &C; break; } }
+		FString& Item = CompItems[RowIx];
+		FYmtRegion DrawReg;
+		if (FindRegion(Item, TEXT("aDrawblData3"), DrawReg) != 1)
+		{
+			Problems.Add(FString::Printf(TEXT("slot %d: aDrawblData3 is not a single node in its component row - left untouched"), Slot));
+			continue;
+		}
+		FString DPre, DSuf;
+		TArray<FString> DItems;
+		if (!SplitItems(Item.Mid(DrawReg.BodyStart, DrawReg.BodyEnd - DrawReg.BodyStart), 4, NL, DPre, DItems, DSuf))
+		{
+			Problems.Add(FString::Printf(TEXT("slot %d: aDrawblData3 does not split at the measured indent - left untouched"), Slot));
+			continue;
+		}
+		Drawables += DItems.Num();
+		if (!OC)
+		{
+			DrawablesVerbatim += DItems.Num();
+			Problems.Add(FString::Printf(TEXT("slot %d (%s) is in the file but not on the outfit - its rows travel verbatim"), Slot, kSlotWords[Slot]));
+			continue;
+		}
+		// the texture-row count each source drawable spells, so an UNCHANGED one can be recognised
+		bool bChanged = false;
+		FString NewDraws;
+		int32 TexSum = 0;
+		for (int32 d = 0; d < DItems.Num(); ++d)
+		{
+			int32 SrcTexRows = 0;
+			{
+				FYmtRegion TexReg;
+				if (FindRegion(DItems[d], TEXT("aTexData"), TexReg) == 1)
+				{
+					FString TPre, TSuf;
+					TArray<FString> TItems;
+					if (SplitItems(DItems[d].Mid(TexReg.BodyStart, TexReg.BodyEnd - TexReg.BodyStart), 6, NL, TPre, TItems, TSuf)) { SrcTexRows = TItems.Num(); }
+				}
+			}
+			// the outfit row for THIS source index, matched by its own DrawableIndex - the import can skip a row
+			// (a drawable whose dictionary entry never arrived), so array position is not the join key.
+			const FRudePedDrawable* OD = nullptr;
+			for (const FRudePedDrawable& X : OC->Drawables) { if (X.DrawableIndex == d) { OD = &X; break; } }
+			if (!OD)
+			{
+				++DrawablesOnlyInSource; ++DrawablesVerbatim;
+				NewDraws += DItems[d];
+				TexSum += SrcTexRows;
+				continue;
+			}
+			const int32 WantTexRows = FMath::Max(1, OD->Textures.Num());
+			if (WantTexRows == SrcTexRows)
+			{
+				++DrawablesVerbatim;
+				NewDraws += DItems[d];
+				TexSum += SrcTexRows;
+				continue;
+			}
+			// The outfit asset has no cloth field, so the ONLY place the flag can come from is this source row.
+			// 98/45,533 corpus rows carry `true` (measure_variation5.json -> ownsCloth); rebuilding one without
+			// reading it would silently turn it off, which is exactly the silent default this lane forbids.
+			bool bCloth = false;
+			if (!ReadOwnsCloth(DItems[d], bCloth))
+			{
+				++DrawablesVerbatim; ++ClothRowsRefused;
+				Problems.Add(FString::Printf(TEXT("slot %d drawable %d: no <ownsCloth value=\"...\" /> to read, so rebuilding it would invent the cloth flag - the row travels verbatim and its texture rows are NOT the outfit's"), Slot, d));
+				NewDraws += DItems[d];
+				TexSum += SrcTexRows;
+				continue;
+			}
+			if (bCloth) { ++ClothFlagsCarried; }
+			++DrawablesRebuilt; bChanged = true;
+			NewDraws += BuildDrawableItem(*OD, Slot, bCloth, NL);
+			TexSum += WantTexRows;
+		}
+		for (const FRudePedDrawable& X : OC->Drawables)
+		{
+			if (X.DrawableIndex < DItems.Num()) { continue; }   // it already has a row in the file
+			++DrawablesAdded; ++Drawables; bChanged = true;
+			NewDraws += BuildDrawableItem(X, Slot, false, NL);   // a new garment has no cloth data to own
+			TexSum += FMath::Max(1, X.Textures.Num());
+		}
+		TexRows += TexSum;
+		if (!bChanged) { continue; }
+		FString NewItem = Item.Left(DrawReg.BodyStart) + DPre + NewDraws + DSuf + Item.Mid(DrawReg.BodyEnd);
+		int32 OldNat = -1;
+		if (RewriteNumAvailTex(NewItem, TexSum, OldNat))
+		{
+			if (OldNat != TexSum) { ++NumAvailTexRewritten; }
+		}
+		else { Problems.Add(FString::Printf(TEXT("slot %d: no <numAvailTex value=\"N\" /> to rewrite - the count is now stale"), Slot)); }
+		Item = NewItem;
+	}
+
+	// ---- 4) a slot the outfit has and the file does not: a NEW component row + availComp renumbered (law 4) ----
+	for (const FRudePedComponent& C : Outfit->Components)
+	{
+		if (C.ComponentIndex < 0 || C.ComponentIndex > 11) { Problems.Add(FString::Printf(TEXT("outfit component index %d is outside 0..11 - skipped"), C.ComponentIndex)); continue; }
+		if (Avail[C.ComponentIndex] != 255) { continue; }
+		if (C.Drawables.Num() == 0) { continue; }
+		// where the row goes so the availComp indices keep ascending (1,820/1,820)
+		int32 InsertAt = 0;
+		for (int32 s = 0; s < C.ComponentIndex; ++s) { if (Avail[s] != 255) { InsertAt = Avail[s] + 1; } }
+		FString NewDraws;
+		int32 TexSum = 0;
+		for (int32 d = 0; d < C.Drawables.Num(); ++d)
+		{
+			NewDraws += BuildDrawableItem(C.Drawables[d], C.ComponentIndex, false, NL);   // new rows, no cloth
+			TexSum += FMath::Max(1, C.Drawables[d].Textures.Num());
+			++DrawablesAdded; ++Drawables;
+		}
+		TexRows += TexSum;
+		CompItems.Insert(BuildComponentItem(TexSum, NewDraws, NL), FMath::Clamp(InsertAt, 0, CompItems.Num()));
+		Avail[C.ComponentIndex] = InsertAt;
+		for (int32 s = C.ComponentIndex + 1; s < 12; ++s) { if (Avail[s] != 255) { Avail[s] += 1; } }
+		++ComponentsAdded; ++Components;
+		bAvailCompRewritten = true;
+	}
+
+	// ---- 5) compInfos: one row per (slot, drawable); new rows APPENDED, nothing re-sorted (law 7) ----
+	FYmtRegion InfoReg;
+	FString InfoPre, InfoSuf;
+	TArray<FString> InfoItems;
+	bool bInfoOk = (FindRegion(Src, TEXT("compInfos"), InfoReg) == 1);
+	if (bInfoOk && !InfoReg.bSelfClosing)
+	{
+		bInfoOk = SplitItems(Src.Mid(InfoReg.BodyStart, InfoReg.BodyEnd - InfoReg.BodyStart), 2, NL, InfoPre, InfoItems, InfoSuf);
+	}
+	if (!bInfoOk) { Problems.Add(TEXT("compInfos does not split at the measured indent - no row was added for any new drawable")); }
+	CompInfoRows = InfoItems.Num();
+	if (bInfoOk)
+	{
+		// what the file already has, so a row is never doubled
+		const FString CompKey = TEXT("<pedXml_compIdx value=\"");
+		const FString DrawKey = TEXT("<pedXml_drawblIdx value=\"");
+		TSet<FString> Have;
+		for (const FString& R : InfoItems)
+		{
+			const int32 A = R.Find(CompKey, ESearchCase::CaseSensitive, ESearchDir::FromStart, 0);
+			const int32 B = R.Find(DrawKey, ESearchCase::CaseSensitive, ESearchDir::FromStart, 0);
+			if (A == INDEX_NONE || B == INDEX_NONE) { continue; }
+			const int32 AS = A + CompKey.Len(), BS = B + DrawKey.Len();
+			const int32 AE = R.Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, AS);
+			const int32 BE = R.Find(TEXT("\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, BS);
+			if (AE == INDEX_NONE || BE == INDEX_NONE) { continue; }
+			Have.Add(FString::Printf(TEXT("%s:%s"), *R.Mid(AS, AE - AS), *R.Mid(BS, BE - BS)));
+		}
+		FString Appended;
+		for (const FRudePedComponent& C : Outfit->Components)
+		{
+			if (C.ComponentIndex < 0 || C.ComponentIndex > 11) { continue; }
+			// The join key is the drawable's OWN index, the same key step 3 uses at `X.DrawableIndex == d` and
+			// `X.DrawableIndex < DItems.Num()`. Array position is not the key: ImportPed happens to keep the two
+			// equal today, but a row keyed on position would give an added drawable an aDrawblData3 row and no
+			// compInfos row the moment they diverge. Keys already appended are added to Have so a duplicated
+			// DrawableIndex on the outfit cannot double a row either.
+			for (const FRudePedDrawable& X : C.Drawables)
+			{
+				if (X.DrawableIndex < 0) { continue; }
+				const FString Key = FString::Printf(TEXT("%d:%d"), C.ComponentIndex, X.DrawableIndex);
+				if (Have.Contains(Key)) { continue; }
+				Have.Add(Key);
+				Appended += BuildCompInfoItem(C.ComponentIndex, X.DrawableIndex, NL);
+				++CompInfoRowsAdded;
+			}
+		}
+		if (!Appended.IsEmpty())
+		{
+			if (InfoReg.bSelfClosing)
+			{
+				InfoPre = NL;
+				InfoSuf = TEXT(" ");
+			}
+			InfoItems.Add(Appended);
+			CompInfoRows += CompInfoRowsAdded;
+		}
+	}
+
+	// ---- 6) propInfo travels verbatim in v1; count what it carries so the verdict is honest (law 8) ----
+	{
+		FYmtRegion PropReg;
+		if (FindRegion(Src, TEXT("propInfo"), PropReg) == 1 && !PropReg.bSelfClosing)
+		{
+			FString PBody = Src.Mid(PropReg.BodyStart, PropReg.BodyEnd - PropReg.BodyStart);
+			FYmtRegion MetaReg;
+			if (FindRegion(PBody, TEXT("aPropMetaData"), MetaReg) == 1 && !MetaReg.bSelfClosing)
+			{
+				FString MPre, MSuf;
+				TArray<FString> MItems;
+				if (SplitItems(PBody.Mid(MetaReg.BodyStart, MetaReg.BodyEnd - MetaReg.BodyStart), 3, NL, MPre, MItems, MSuf)) { PropRowsVerbatim = MItems.Num(); }
+			}
+		}
+	}
+
+	// ---- 7) splice back, LAST region first so the earlier offsets stay true ----
+	FString Out = Src;
+	if (bInfoOk)
+	{
+		FString NewInfoBody = InfoPre;
+		for (const FString& R : InfoItems) { NewInfoBody += R; }
+		NewInfoBody += InfoSuf;
+		if (InfoReg.bSelfClosing && CompInfoRowsAdded > 0)
+		{
+			Out = Out.Left(InfoReg.Start) + FString::Printf(TEXT("<compInfos itemType=\"CComponentInfo\">%s</compInfos>"), *NewInfoBody) + Out.Mid(InfoReg.End);
+		}
+		else if (!InfoReg.bSelfClosing)
+		{
+			Out = ReassembleRegion(Out, InfoReg, NewInfoBody);
+		}
+	}
+	{
+		FString NewCompBody = CompPre;
+		for (const FString& R : CompItems) { NewCompBody += R; }
+		NewCompBody += CompSuf;
+		Out = ReassembleRegion(Out, CompReg, NewCompBody);
+	}
+	if (bAvailCompRewritten)
+	{
+		FString AvailText;
+		for (int32 s = 0; s < 12; ++s) { AvailText += FString::Printf(TEXT("%s%d"), s ? TEXT(" ") : TEXT(""), Avail[s]); }
+		Out = ReassembleRegion(Out, AvailReg, AvailText);
+	}
+
+	// ---- 8) write it, and MEASURE the identity rather than claiming it ----
+	IFileManager::Get().MakeDirectory(*OutDir, true);
+	const FString OutPath = OutDir / (Ped + TEXT(".ymt.xml"));
+	const bool bWrote = FFileHelper::SaveStringToFile(Out, *OutPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	if (!bWrote) { Problems.Add(FString::Printf(TEXT("cannot write %s"), *OutPath)); }
+	const bool bIdentical = (Out == Src);
+	const int32 Edits = DrawablesRebuilt + DrawablesAdded + ComponentsAdded + CompInfoRowsAdded;
+	if (Edits == 0 && !bIdentical) { Problems.Add(TEXT("nothing was edited yet the output differs from the source - the splice is not byte-safe on this file")); }
+	bool bExpectMet = true;
+	if (Want == TEXT("identical") && !bIdentical)
+	{
+		bExpectMet = false;
+		Problems.Add(FString::Printf(TEXT("Expect=identical: this export had to reproduce its source byte for byte and did not (%d rebuilt, %d added, %d component rows added, %d compInfos rows added) - THE LANE'S MEASURE FAILED"), DrawablesRebuilt, DrawablesAdded, ComponentsAdded, CompInfoRowsAdded));
+	}
+	else if (Want == TEXT("changed") && bIdentical)
+	{
+		bExpectMet = false;
+		Problems.Add(TEXT("Expect=changed: this export had to differ from its source and is byte-identical - the edit never reached the file"));
+	}
+	Problems.Add(TEXT("this is the PSO container rendered as text (law 1): the game reads the binary and RUDE has no PSO writer, so this file is an authored variation table, not a drop-in"));
+
+	FString ProblemsJson;
+	for (const FString& P : Problems) { ProblemsJson += FString::Printf(TEXT("%s\"%s\""), ProblemsJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(P)); }
+	const bool bOk = bWrote && bInfoOk && bExpectMet && (Edits > 0 || bIdentical);
+	return FString::Printf(TEXT("{\"ok\":%s,\"ped\":\"%s\",\"ymtPath\":\"%s\",\"sourceYmt\":\"%s\",\"bytes\":%d,\"sourceBytes\":%d,\"byteIdentical\":%s,")
+		TEXT("\"components\":%d,\"componentsAdded\":%d,\"drawables\":%d,\"drawablesVerbatim\":%d,\"drawablesRebuilt\":%d,\"drawablesAdded\":%d,\"drawablesOnlyInSource\":%d,")
+		TEXT("\"texRows\":%d,\"numAvailTexRewritten\":%d,\"compInfoRows\":%d,\"compInfoRowsAdded\":%d,\"propRowsVerbatim\":%d,\"availCompRewritten\":%s,")
+		TEXT("\"clothFlagsCarried\":%d,\"clothRowsRefused\":%d,\"expect\":\"%s\",\"expectMet\":%s,")
+		TEXT("\"format\":\"pso-xml\",\"gameReady\":false,\"problems\":[%s]}"),
+		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Ped), *RudeJsonEscape(OutPath), *RudeJsonEscape(SrcPath),
+		Out.Len(), Src.Len(), bIdentical ? TEXT("true") : TEXT("false"),
+		Components, ComponentsAdded, Drawables, DrawablesVerbatim, DrawablesRebuilt, DrawablesAdded, DrawablesOnlyInSource,
+		TexRows, NumAvailTexRewritten, CompInfoRows, CompInfoRowsAdded, PropRowsVerbatim, bAvailCompRewritten ? TEXT("true") : TEXT("false"),
+		ClothFlagsCarried, ClothRowsRefused, *RudeJsonEscape(Want), bExpectMet ? TEXT("true") : TEXT("false"),
+		*ProblemsJson);
+}
+
+// ---- AddPedDrawable (agent + Matt) --------------------------------------------------------------
+// A NEW garment gets its own row rather than overwriting one: one drawable appended to the slot, with the
+// texture letters the caller named. Every default is the MODE of the game's own data with its denominator
+// (law 5); nothing is invented. The row lands on the OUTFIT - ExportPedVariationYmt then splices it into the
+// ymt and ExportPedReplace / ExportYddBinary ship the mesh under the entry name this row implies.
+FString URudeToolset::AddPedDrawable(const FString& OutfitAssetPath, const FString& Slot, const FString& MeshAssetPath, const FString& TextureAssetPaths)
+{
+	using namespace RudePeds;
+	using namespace RudePedVar;
+	auto Bad = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+
+	FString Path = OutfitAssetPath.TrimStartAndEnd();
+	if (Path.IsEmpty()) { return Bad(TEXT("give the outfit asset (/Game/RUDE/Peds/<ped>/<ped>_outfit) or the ped name")); }
+	if (!Path.StartsWith(TEXT("/"))) { Path = FString::Printf(TEXT("/Game/RUDE/Peds/%s/%s_outfit"), *Path, *Path); }
+	if (!Path.Contains(TEXT("."))) { Path += TEXT(".") + FPackageName::GetShortName(Path); }
+	URudePedOutfit* Outfit = LoadObject<URudePedOutfit>(nullptr, *Path);
+	if (!Outfit) { return Bad(FString::Printf(TEXT("outfit asset not found: %s (ImportPed builds it)"), *Path)); }
+	const FString Ped = Outfit->PedName.IsEmpty() ? FPackageName::GetShortName(Path).Replace(TEXT("_outfit"), TEXT("")) : Outfit->PedName;
+
+	const int32 SlotIx = SlotIndexOf(Slot);
+	if (SlotIx < 0) { return Bad(FString::Printf(TEXT("unknown slot '%s' - head, berd, hair, uppr, lowr, hand, feet, teef, accs, task, decl, jbib (or 0..11)"), *Slot)); }
+
+	const FString MeshPath = MeshAssetPath.TrimStartAndEnd();
+	if (MeshPath.IsEmpty()) { return Bad(TEXT("give the skinned mesh asset the new garment is (a USkeletalMesh on this ped's skeleton)")); }
+	USkeletalMesh* Mesh = LoadObject<USkeletalMesh>(nullptr, *MeshPath);
+	if (!Mesh) { return Bad(FString::Printf(TEXT("no USkeletalMesh at %s"), *MeshPath)); }
+
+	TArray<FString> Problems;
+
+	// ---- EVERY refusal is decided BEFORE the outfit is touched ------------------------------------
+	// A gate script stops at the first ok:false (RudeCommandlet.cpp), so a tool that mutated and SAVED the
+	// asset before deciding ok:false would leave a changed asset behind with nothing in the verdict saying
+	// so. Each of the three checks below returns instead, and the outfit is untouched when it does.
+	{
+		USkeleton* WantSkel = Outfit->Skeleton.LoadSynchronous();
+		if (WantSkel && Mesh->GetSkeleton() != WantSkel)
+		{
+			return Bad(FString::Printf(TEXT("%s is not on this ped's own skeleton (%s) - the ydd writer would not find the bones, so NOTHING was added to the outfit"), *Mesh->GetName(), *WantSkel->GetName()));
+		}
+	}
+
+	int32 Verts = 0, Tris = 0;
+	if (Mesh->GetImportedModel() && Mesh->GetImportedModel()->LODModels.Num() > 0)
+	{
+		const FSkeletalMeshLODModel& LM = Mesh->GetImportedModel()->LODModels[0];
+		Verts = (int32)LM.NumVertices;
+		for (const FSkelMeshSection& Sec : LM.Sections) { Tris += (int32)Sec.NumTriangles; }
+	}
+	if (Verts <= 0)
+	{
+		return Bad(FString::Printf(TEXT("%s has no LOD 0 vertices - the row would name an empty garment, so NOTHING was added to the outfit"), *Mesh->GetName()));
+	}
+
+	// The texture letters. Empty tokens are culled HERE, so the loop index below counts rows actually added
+	// and a stray "a, ,b" cannot skip letter b. 26 is the ceiling because the letters run a..z and the widest
+	// aTexData in the corpus is 26 rows (`measure_variation5.json` -> `texRowsPerDrawable.max`).
+	TArray<FString> RawTex, WantTex;
+	TextureAssetPaths.ParseIntoArray(RawTex, TEXT(","), true);
+	for (const FString& Raw : RawTex) { const FString T = Raw.TrimStartAndEnd(); if (!T.IsEmpty()) { WantTex.Add(T); } }
+	if (WantTex.Num() > 26)
+	{
+		return Bad(FString::Printf(TEXT("%d textures: the letters run a..z and the widest aTexData row in the corpus is 26 - refusing rather than collapsing everything past the 26th onto 'z'"), WantTex.Num()));
+	}
+
+	FRudePedComponent* Comp = nullptr;
+	for (FRudePedComponent& C : Outfit->Components) { if (C.ComponentIndex == SlotIx) { Comp = &C; break; } }
+	bool bComponentCreated = false;
+	if (!Comp)
+	{
+		FRudePedComponent NewComp;
+		NewComp.ComponentIndex = SlotIx;
+		NewComp.Slot = kSlotWords[SlotIx];
+		NewComp.NumAvailTex = 0;
+		const int32 At = Outfit->Components.Add(MoveTemp(NewComp));
+		Comp = &Outfit->Components[At];
+		bComponentCreated = true;
+	}
+
+	FRudePedDrawable D;
+	D.DrawableIndex = Comp->Drawables.Num();
+	for (const FRudePedDrawable& X : Comp->Drawables) { D.DrawableIndex = FMath::Max(D.DrawableIndex, X.DrawableIndex + 1); }
+	D.Class = TEXT("u");
+	D.Name = FString::Printf(TEXT("%s_%03d_%s"), kSlotWords[SlotIx], D.DrawableIndex, *D.Class);
+	D.PropMask = kSlotPropMask[SlotIx];
+	D.NumAlternatives = 0;
+	D.Mesh = Mesh;
+
+	int32 TexturesBound = 0;
+	for (int32 t = 0; t < WantTex.Num(); ++t)
+	{
+		const FString& TP = WantTex[t];
+		FRudePedTexture Tx;
+		Tx.Letter = FString::Chr((TCHAR)(TEXT('a') + t));   // t counts ROWS ADDED - empties were culled above
+		Tx.TexId = 0;             // the mode, 176,569/228,790 rows
+		Tx.Distribution = 255;    // the mode, 228,687/228,790 rows
+		UTexture2D* T2 = LoadObject<UTexture2D>(nullptr, *TP);
+		if (T2) { Tx.Texture = T2; Tx.TextureName = T2->GetName(); ++TexturesBound; }
+		else { Problems.Add(FString::Printf(TEXT("no UTexture2D at %s - letter %s carries the name only"), *TP, *Tx.Letter)); Tx.TextureName = FPackageName::GetShortName(TP); }
+		D.Textures.Add(MoveTemp(Tx));
+	}
+	if (D.Textures.Num() == 0)
+	{
+		FRudePedTexture Tx;              // a drawable always has at least one texData row (20,447/45,533 have exactly one)
+		Tx.Letter = TEXT("a");
+		Tx.TexId = 0;
+		Tx.Distribution = 255;
+		D.Textures.Add(MoveTemp(Tx));
+		Problems.Add(TEXT("no textures given - the row carries one letter 'a' with no texture yet"));
+	}
+
+	D.Vertices = Verts;
+	D.Triangles = Tris;
+	D.LodGroups = 1;
+	D.LodVertices.Add(Verts);
+	D.LodTriangles.Add(Tris);
+
+	const int32 NewIndex = D.DrawableIndex;
+	const FString EntryName = D.Name;
+	Comp->Drawables.Add(MoveTemp(D));
+	int32 TexSum = 0;
+	for (const FRudePedDrawable& X : Comp->Drawables) { TexSum += FMath::Max(1, X.Textures.Num()); }
+	Comp->NumAvailTex = TexSum;   // law 6: the count that must follow the edit
+
+	Outfit->MarkPackageDirty();
+	const bool bSaved = RudeSaveDirty(false, true);
+	if (!bSaved) { Problems.Add(TEXT("the outfit asset did not save - the row is in memory only")); }
+
+	FString ProblemsJson;
+	for (const FString& P : Problems) { ProblemsJson += FString::Printf(TEXT("%s\"%s\""), ProblemsJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(P)); }
+	// Reaching here means the row IS on the outfit: the wrong skeleton, an empty mesh, an unknown slot and more
+	// than 26 textures each returned above without touching it. `saved` rides in the verdict rather than in
+	// `ok`, so a -nosave run does not read as a failure.
+	return FString::Printf(TEXT("{\"ok\":true,\"ped\":\"%s\",\"slot\":\"%s\",\"slotIndex\":%d,\"drawableIndex\":%d,\"entryName\":\"%s\",\"mesh\":\"%s\",")
+		TEXT("\"propMask\":%d,\"propMaskDenominator\":\"%d/%d\",\"textures\":%d,\"texturesBound\":%d,\"numAvailTex\":%d,\"vertices\":%d,\"triangles\":%d,")
+		TEXT("\"componentCreated\":%s,\"saved\":%s,\"problems\":[%s]}"),
+		*RudeJsonEscape(Ped), kSlotWords[SlotIx], SlotIx, NewIndex, *RudeJsonEscape(EntryName), *RudeJsonEscape(Mesh->GetName()),
+		kSlotPropMask[SlotIx], kSlotPropMaskHits[SlotIx], kSlotPropMaskOf[SlotIx],
+		Comp->Drawables.Last().Textures.Num(), TexturesBound, TexSum, Verts, Tris,
+		bComponentCreated ? TEXT("true") : TEXT("false"), bSaved ? TEXT("true") : TEXT("false"),
+		*ProblemsJson);
+}
+// RUDE_PEDVAR_END impl
