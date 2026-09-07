@@ -3215,6 +3215,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 	int32 ValueParamsDeduped = 0;    // params on a geometry that reused a cached MI - never bound
 	int32 UnsupportedByMaster = 0;   // sampler mapped, but the MASTER has no such parameter
 	int32 MissingTextures = 0;       // XML named a texture that is not imported in this project
+	int32 DetailNormalMapsSkipped = 0;   // a NORMAL map bound to Detail: the albedo overlay is left off
 	int32 UnmappedSamplers = 0;      // a sampler name with no entry in GSamplerBinds (see below)
 	int32 SlotsWithoutShaderDef = 0; // geometry's ShaderIndex resolves to no shader definition
 	int32 SlotsWithoutMaterial = 0;  // slot kept WorldGridMaterial - see the block below the loop
@@ -3345,6 +3346,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 				}
 				bool bBoundDiffuse = false;
 				bool bBoundDetail = false;
+				UTexture2D* DetailTexBound = nullptr;   // WHICH texture landed in Detail - the KIND matters (below)
 				auto BindTex = [&](const TCHAR* Param, const FString& TexName) -> bool
 				{
 					if (TexName.IsEmpty()) { return false; }
@@ -3355,7 +3357,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 					MIC->SetTextureParameterValueEditorOnly(FMaterialParameterInfo(PName), T);
 					++BoundTextures;
 					if (PName == FName(TEXT("Diffuse"))) { bBoundDiffuse = true; }
-					if (PName == FName(TEXT("Detail")))  { bBoundDetail = true; }
+					if (PName == FName(TEXT("Detail")))  { bBoundDetail = true; DetailTexBound = T; }
 					return true;
 				};
 
@@ -3423,10 +3425,20 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 				// DetailSampler. Same answer - the walk above already bound it through the same
 				// guard - but the old spelling resolved the name TWICE, which double-counted it in
 				// the ambiguity counter added 2026-08-04 and loaded the asset a second time.
+				// AND THE RIGHT KIND OF TEXTURE, not merely a texture (2026-09-06). The detail master
+				// applies a signed overlay to the ALBEDO: 1 + (Detail - 0.5) * 2 * strength. That is
+				// neutral only for a COLOUR detail map around mid-grey. Several presets bind a NORMAL
+				// map there instead (weapon_normal_spec_detail_palette binds env_smooth_concrete2,
+				// measured to be a normal map), whose blue channel sits near 1.0 - so the overlay
+				// multiplies base colour by a tiled, blue-biased pattern, seen as a repeating blocky
+				// cast over weapon bodies. A bump-detail map belongs in the NORMAL path; until that
+				// path exists, it must not colour the albedo. Counted, never silent.
+				const bool bDetailIsNormalMap = DetailTexBound && DetailTexBound->CompressionSettings == TC_Normalmap;
+				if (bDetailIsNormalMap) { ++DetailNormalMapsSkipped; }
 				if (MasterParams.Contains(FName(TEXT("Detail"))))
 				{
 					MIC->SetScalarParameterValueEditorOnly(
-						FMaterialParameterInfo(TEXT("DetailAmount")), bBoundDetail ? 1.f : 0.f);
+						FMaterialParameterInfo(TEXT("DetailAmount")), (bBoundDetail && !bDetailIsNormalMap) ? 1.f : 0.f);
 				}
 
 				// ---- VALUE params -> the MI, guarded exactly like textures ----
