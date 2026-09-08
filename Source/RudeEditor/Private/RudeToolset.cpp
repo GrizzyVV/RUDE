@@ -10,6 +10,8 @@
 #include "Engine/Texture2D.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceConstant.h"
+#include "MaterialShared.h"
+#include "ShaderCompiler.h"
 #include "MeshDescription.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
@@ -4456,7 +4458,48 @@ FString URudeToolset::RegenerateMasters()
 			Names += FString::Printf(TEXT("%s\"%s\""), Names.IsEmpty() ? TEXT("") : TEXT(","), *N);
 		}
 	}
-	return FString::Printf(TEXT("{\"ok\":%s,\"masters\":%d,\"regenerated\":%d,\"unparsed\":%d,\"names\":[%s]}"),
-		Seen > 0 ? TEXT("true") : TEXT("false"), Seen, Regenerated, Unparsed, *Names);
+	// ⛔⛔ DID IT ACTUALLY COMPILE? (law 52, added 2026-09-08 because nothing asked.)
+	// A material that fails to compile does not error, does not refuse and does not disappear - the
+	// engine logs one warning and silently substitutes the DEFAULT material, which reads NO parameters
+	// at all. Every generated master with a detail texture was in that state for days: RUDE bound the
+	// palette, the row, the scale and the amount correctly onto instances whose parent was not running,
+	// and every gate went on reporting ok:true because every gate asked "did the tool return true"
+	// rather than "did the engine complain". Three defects in three days shared that shape (laws 49,
+	// 50, 52), so this one gets a CHECKER rather than attention.
+	// Shader compilation is asynchronous, so the wait comes first; without it this reports zero errors
+	// on a master whose compile has not started. In a run with no rendering there is nothing to check
+	// and the count is reported as -1 (unknown) rather than 0 (clean) - an unasked question must never
+	// read as a passed one.
+	int32 CompileFailed = -1;
+	FString FailedNames;
+	if (FApp::CanEverRender())
+	{
+		if (GShaderCompilingManager) { GShaderCompilingManager->FinishAllCompilation(); }
+		CompileFailed = 0;
+		for (const FAssetData& AD : Assets)
+		{
+			const FString N = AD.AssetName.ToString();
+			if (!N.StartsWith(TEXT("M_RUDE_"))) { continue; }
+			UMaterial* Mat = LoadObject<UMaterial>(nullptr, *(AD.PackageName.ToString() + TEXT(".") + N));
+			if (!Mat) { continue; }
+			const FMaterialResource* Res = Mat->GetMaterialResource(GMaxRHIShaderPlatform, EMaterialQualityLevel::Num);
+			if (!Res) { continue; }
+			const TArray<FString>& Errors = Res->GetCompileErrors();
+			if (Errors.Num() > 0)
+			{
+				++CompileFailed;
+				FailedNames += FString::Printf(TEXT("%s{\"master\":\"%s\",\"error\":\"%s\"}"),
+					FailedNames.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(N),
+					*RudeJsonEscape(Errors[0]));
+				UE_LOG(LogTemp, Error, TEXT("[RUDE] master %s FAILED TO COMPILE: %s"), *N, *Errors[0]);
+			}
+		}
+	}
+
+	return FString::Printf(
+		TEXT("{\"ok\":%s,\"masters\":%d,\"regenerated\":%d,\"unparsed\":%d,\"compileFailed\":%d,")
+		TEXT("\"compileChecked\":%s,\"failed\":[%s],\"names\":[%s]}"),
+		(Seen > 0 && CompileFailed <= 0) ? TEXT("true") : TEXT("false"), Seen, Regenerated, Unparsed,
+		CompileFailed, CompileFailed >= 0 ? TEXT("true") : TEXT("false"), *FailedNames, *Names);
 }
 

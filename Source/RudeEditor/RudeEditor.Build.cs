@@ -26,6 +26,9 @@ public class RudeEditor : ModuleRules
 			"WorkspaceMenuStructure",
 			"XmlParser",
 			"Projects",   // IPluginManager: the plugin locates its own bundled catalog
+			// GMaxRHIShaderPlatform: RegenerateMasters asks each generated master whether it actually
+			// COMPILED (law 52) - a material that fails compiles to the DEFAULT material in silence.
+			"RHI",
 			"MeshDescription",
 			"StaticMeshDescription",
 			"MeshReductionInterface",
