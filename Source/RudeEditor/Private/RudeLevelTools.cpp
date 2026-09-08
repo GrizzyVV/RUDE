@@ -974,6 +974,50 @@ FString URudeToolset::MoveRudeEntity(const FString& SourceYmap, const FString& S
 // ---- ProbeWorldPartitionLevel (agent; the WP4 spike) -------------------------------------
 // One question, one answer, in-engine: can RUDE make a World Partition level from code, put a
 // Data Layer in it, place an actor on that layer, and save the lot - headless? Every step reports.
+// ---- ONE map-save, in ONE place (law 50) ------------------------------------------------------
+// Three call sites used to spell this themselves, and all three spelled it wrong the same way: they
+// saved the .umap only when FPaths::FileExists said there was NOT one there yet. That answers "is
+// there a file at this path", which is true forever after the first successful save - never "did THIS
+// save write the level". So every one of them silently stopped writing the map on the second run and
+// still reported success. FEditorFileUtils::SaveMap does nothing headless except rename an untitled
+// world, so the write has to happen through the headless saver, unconditionally, every time.
+// The caller gets the before/after file size so its verdict can report whether the FILE CHANGED
+// rather than whether a function returned true.
+static bool RudeSaveMapUnconditional(UWorld* World, const FString& Path,
+	int64& OutBefore, int64& OutAfter, FString& OutError)
+{
+	OutBefore = OutAfter = -1;
+	OutError.Reset();
+	if (!World) { OutError = TEXT("no world"); return false; }
+	FString MapFile;
+	if (!FPackageName::TryConvertLongPackageNameToFilename(Path, MapFile, FPackageName::GetMapPackageExtension()))
+	{
+		OutError = FString::Printf(TEXT("%s is not a package path"), *Path);
+		return false;
+	}
+	IFileManager& FM = IFileManager::Get();
+	const FDateTime BeforeTime = FM.GetTimeStamp(*MapFile);
+	OutBefore = FM.FileSize(*MapFile);
+
+	// The only leg that can rename an untitled world (/Temp/Untitled_N) into the target package.
+	FEditorFileUtils::SaveMap(World, Path);
+
+	UPackage* WorldPkg = World->GetOutermost();
+	if (WorldPkg->GetName() != Path)
+	{
+		// Refused BY NAME rather than reported as a success that did not happen.
+		OutError = FString::Printf(TEXT("the world is still package %s, not %s - SaveMap did not rename it"),
+			*WorldPkg->GetName(), *Path);
+		return false;
+	}
+	WorldPkg->MarkPackageDirty();
+	RudeSaveDirty(/*bMaps*/ true, /*bContent*/ true);
+
+	const FDateTime AfterTime = FM.GetTimeStamp(*MapFile);
+	OutAfter = FM.FileSize(*MapFile);
+	return OutAfter >= 0 && (OutBefore < 0 || AfterTime > BeforeTime || OutAfter != OutBefore);
+}
+
 FString URudeToolset::ProbeWorldPartitionLevel(const FString& LevelPath)
 {
 	auto Fail = [](const FString& Why)
@@ -1012,18 +1056,12 @@ FString URudeToolset::ProbeWorldPartitionLevel(const FString& LevelPath)
 	A->SetActorLabel(TEXT("RUDE_probe_cube"));
 	const bool bAdded = DlSub->AddActorToDataLayer(A, Dl);
 	// 4) save the map and the asset
-	bool bSavedMap = FEditorFileUtils::SaveMap(World, Path);
 	// Measured 2026-09-05: SaveMap answered true and wrote the external actors + the Data Layer
-	// asset, but NO .umap landed. Second leg: the headless saver over maps + content, then check.
-	{
-		FString MapFileCheck;
-		FPackageName::TryConvertLongPackageNameToFilename(Path, MapFileCheck, FPackageName::GetMapPackageExtension());
-		if (!FPaths::FileExists(MapFileCheck))
-		{
-			World->GetOutermost()->MarkPackageDirty();
-			bSavedMap = RudeSaveDirty(/*bMaps*/ true, /*bContent*/ true) && FPaths::FileExists(MapFileCheck);
-		}
-	}
+	// asset, but NO .umap landed - so the headless leg does the writing. It used to run only when the
+	// .umap did not exist yet, which meant a re-run over an existing level never rewrote it (law 50).
+	int64 MapBefore = -1, MapAfter = -1;
+	FString MapSaveError;
+	const bool bSavedMap = RudeSaveMapUnconditional(World, Path, MapBefore, MapAfter, MapSaveError);
 	FString AssetFile;
 	bool bSavedAsset = false;
 	if (FPackageName::TryConvertLongPackageNameToFilename(DlPkgName, AssetFile, FPackageName::GetAssetPackageExtension()))
@@ -1285,18 +1323,12 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 	int32 LodLinks = 0, LodUnresolved = 0, LodPartial = 0;
 	RudeResolveLodLineage(World, YmapParentMap, LodLinks, LodUnresolved, LodPartial);
 	// save: the map (SaveMap writes external actors + assets; the headless map leg writes the .umap)
-	bool bSaved = FEditorFileUtils::SaveMap(World, Path);
-	FString MapFile;
-	FPackageName::TryConvertLongPackageNameToFilename(Path, MapFile, FPackageName::GetMapPackageExtension());
-	if (!FPaths::FileExists(MapFile))
-	{
-		World->GetOutermost()->MarkPackageDirty();
-		bSaved = RudeSaveDirty(/*bMaps*/ true, /*bContent*/ true) && FPaths::FileExists(MapFile);
-	}
-	else
-	{
-		RudeSaveDirty(/*bMaps*/ false, /*bContent*/ true);   // the layer assets
-	}
+	// law 50: unconditional, and judged by whether the FILE changed. The old shape here skipped the
+	// map write entirely once a .umap existed, so re-importing over an existing level silently left
+	// the old one on disk while reporting a successful save.
+	int64 MapBefore = -1, MapAfter = -1;
+	FString MapSaveError;
+	const bool bSaved = RudeSaveMapUnconditional(World, Path, MapBefore, MapAfter, MapSaveError);
 	FString TopMissing;
 	{
 		TArray<TPair<FString, int32>> Sorted;
@@ -1311,11 +1343,11 @@ FString URudeToolset::BuildDistrictLevel(const FString& LevelPath, const FString
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"level\":\"%s\",\"worldPartition\":true,\"ymaps\":%d,\"layers\":%d,\"layerFailures\":%d,")
 		TEXT("\"actors\":%d,\"proxies\":%d,\"filteredByLod\":%d,\"malformedEntities\":%d,\"missingMeshes\":%d,")
-		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"previousFilesCleared\":%d,")
+		TEXT("\"mapSaved\":%s,\"mapBytes\":%lld,\"mapBytesBefore\":%lld,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"previousFilesCleared\":%d,")
 		TEXT("\"scriptYmaps\":%d,\"scriptActorsHidden\":%d,\"suspectBounds\":%d,\"lodLinks\":%d,\"lodUnresolved\":%d,\"lodPartial\":%d,\"topMissing\":[%s]}"),
 		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Path), NumYmaps, NumLayers, LayerFailures,
 		NumActors, NumProxies, NumFiltered, NumMalformed, Missing.Num(),
-		bSaved ? TEXT("true") : TEXT("false"), FPaths::FileExists(MapFile) ? TEXT("true") : TEXT("false"),
+		bSaved ? TEXT("true") : TEXT("false"), MapAfter, MapBefore, MapAfter >= 0 ? TEXT("true") : TEXT("false"),
 		GRudeLastSaved, GRudeLastSaveFailed, Cleared, NumScriptYmaps, NumScriptActors, NumSuspect, LodLinks, LodUnresolved, LodPartial, *TopMissing);
 }
 
@@ -1719,46 +1751,17 @@ FString URudeToolset::SaveLevel(const FString& LevelPath)
 	FString Path = LevelPath.TrimStartAndEnd();
 	if (Path.IsEmpty()) { Path = World->GetOutermost()->GetName(); }
 	if (!FPackageName::IsValidLongPackageName(Path) || Path.StartsWith(TEXT("/Temp"))) { return Fail(TEXT("give a content path for the level (it is untitled)")); }
-	FString MapFile;
-	FPackageName::TryConvertLongPackageNameToFilename(Path, MapFile, FPackageName::GetMapPackageExtension());
-
-	// (2026-09-07) THE TEST IS "DID THIS SAVE WRITE THE LEVEL", NOT "IS THERE A FILE AT THIS PATH".
-	// This function used to save the map only when FPaths::FileExists(MapFile) was FALSE, and take an
-	// `else` branch that called RudeSaveDirty(/*bMaps*/ FALSE, true) otherwise. FileExists is true
-	// forever after the first successful save, so from the second call onward the level was NEVER
-	// WRITTEN AGAIN and the verdict still said ok:true. Measured: the capture level's .umap sat 20
-	// hours old on disk while every run reported a successful save, so the GUI capture that opens the
-	// level re-photographed the SAME STALE SNAPSHOT every time. That is what produced a whole day of
-	// byte-identical captures, and the false conclusion drawn from them - that a generated master's
-	// graph has no observable effect on what renders. The camera was the only thing that ever moved
-	// the picture because the camera is a CaptureView ARGUMENT, not level state.
-	// So: the write is now UNCONDITIONAL, and the verdict reports whether the FILE ON DISK CHANGED.
-	IFileManager& FM = IFileManager::Get();
-	const FDateTime BeforeTime = FM.GetTimeStamp(*MapFile);
-	const int64 BeforeSize = FM.FileSize(*MapFile);
-
-	// SaveMap is the only leg that can RENAME an untitled world (/Temp/Untitled_N, which is what
-	// NewLevel leaves behind) into the target package. Headless it does that much and writes nothing,
-	// so the write happens below through the same headless saver every other tool persists with.
-	FEditorFileUtils::SaveMap(World, Path);
-
-	UPackage* WorldPkg = World->GetOutermost();
-	if (WorldPkg->GetName() != Path)
-	{
-		// Refused BY NAME rather than reported as a success that did not happen.
-		return Fail(FString::Printf(TEXT("the world is still package %s, not %s - SaveMap did not rename it"),
-			*WorldPkg->GetName(), *Path));
-	}
-	WorldPkg->MarkPackageDirty();
-	RudeSaveDirty(/*bMaps*/ true, /*bContent*/ true);
-
-	const FDateTime AfterTime = FM.GetTimeStamp(*MapFile);
-	const int64 AfterSize = FM.FileSize(*MapFile);
-	const bool bWrote = AfterSize >= 0 && (BeforeSize < 0 || AfterTime > BeforeTime || AfterSize != BeforeSize);
+	// law 50, and the helper above is the ONE place this is spelled. The old body here saved the map
+	// only when the .umap did not already exist, so from the second call onward the level was never
+	// written again and the verdict still said ok:true - measured, a 20-hour-stale capture level.
+	int64 MapBefore = -1, MapAfter = -1;
+	FString MapSaveError;
+	const bool bWrote = RudeSaveMapUnconditional(World, Path, MapBefore, MapAfter, MapSaveError);
+	if (!MapSaveError.IsEmpty()) { return Fail(MapSaveError); }
 	return FString::Printf(TEXT("{\"ok\":%s,\"level\":\"%s\",\"wroteMap\":%s,\"mapBytes\":%lld,\"mapBytesBefore\":%lld,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d}"),
 		bWrote ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Path),
-		bWrote ? TEXT("true") : TEXT("false"), AfterSize, BeforeSize,
-		AfterSize >= 0 ? TEXT("true") : TEXT("false"),
+		bWrote ? TEXT("true") : TEXT("false"), MapAfter, MapBefore,
+		MapAfter >= 0 ? TEXT("true") : TEXT("false"),
 		GRudeLastSaved, GRudeLastSaveFailed);
 }
 
