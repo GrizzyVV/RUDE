@@ -326,7 +326,8 @@ struct FRudeMasterSpec
 // change now only needs this number bumped, and the rule cannot silently miss it again.
 //   1 = every master generated before the stamp existed (they read -1 and are all stale)
 //   2 = the alpha-mask fix in the tint and livery branches (2026-09-07)
-static const int32 RudeMasterGraphVersion = 2;
+//   3 = detailSettings .zw read off their own pins - every Dt master had been FAILING TO COMPILE (2026-09-08)
+static const int32 RudeMasterGraphVersion = 3;
 static const TCHAR* RudeMasterGraphVersionParam = TEXT("RudeGraphVersion");
 
 // ---- THE definition of "this master RUDE generates is stale" ----------------------------------
@@ -512,8 +513,19 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 		UMaterialExpressionScalarParameter* Amt = MakeScalar(TEXT("DetailAmount"), 0.f, -380);
 		UMaterialExpressionTextureCoordinate* UV = NewObject<UMaterialExpressionTextureCoordinate>(M);
 		Add(UV, -1500, -260);
-		UMaterialExpressionComponentMask* ZW = NewObject<UMaterialExpressionComponentMask>(M);
-		ZW->Input.Expression = Set; ZW->R = false; ZW->G = false; ZW->B = true; ZW->A = true;
+		// ⛔⛔ THE .W IS NOT ON THE DEFAULT OUTPUT (2026-09-08, and it broke every detail master).
+		// A ComponentMask over a VectorParameter's DEFAULT output asks a float3 for its fourth
+		// component, and the material compiler refuses the WHOLE material:
+		//   "(Node ComponentMask) Not enough components in (...: float3) for component mask 0011"
+		//   "Failed to compile Material for platform PCD3D_SM6, Default Material will be used in game."
+		// Every generated master with `Dt` in its signature was failing to compile and falling back to
+		// the DEFAULT material - which ignores every parameter, which is why binding a palette, a tint
+		// index and an amount correctly still changed nothing on screen. The tint was never the bug.
+		// A parameter's per-channel pins are separate outputs (1=R, 2=G, 3=B, 4=A), the same convention
+		// the diffuse alpha is read through, so take z and w off their OWN pins and append them.
+		UMaterialExpressionAppendVector* ZW = NewObject<UMaterialExpressionAppendVector>(M);
+		ZW->A.Connect(3, Set);   // detailSettings.z - tile U
+		ZW->B.Connect(4, Set);   // detailSettings.w - tile V
 		Add(ZW, -1350, -500);
 		UMaterialExpressionMultiply* UVm = NewObject<UMaterialExpressionMultiply>(M);
 		UVm->A.Expression = UV; UVm->B.Expression = ZW; Add(UVm, -1220, -320);

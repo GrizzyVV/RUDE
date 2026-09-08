@@ -13,6 +13,9 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialInstance.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Kismet/KismetRenderingLibrary.h"
+#include "ShaderCompiler.h"
 #include "MeshDescription.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
@@ -974,6 +977,168 @@ FString URudeToolset::MoveRudeEntity(const FString& SourceYmap, const FString& S
 // ---- ProbeWorldPartitionLevel (agent; the WP4 spike) -------------------------------------
 // One question, one answer, in-engine: can RUDE make a World Partition level from code, put a
 // Data Layer in it, place an actor on that layer, and save the lot - headless? Every step reports.
+// ---- ProbeMaterial: the LINEAR readout a capture cannot give (law 51) -------------------------
+// A capture goes through post-processing, so its pixels are not the material's numbers. Measured
+// 2026-09-07: multiplying a master's final base colour by 0.25 barely changed the captured image,
+// which is what a tone-mapped readout does to a magnitude question. This draws the material into an
+// RGBA16f render target - unclamped, no lighting, no post - and reports what actually came out.
+static bool RudeProbeMaterialNow(UMaterialInterface* Mat, int32 N, FString& Out)
+{
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { Out = TEXT("no editor world"); return false; }
+
+	// Every texture this material samples must be RESIDENT, or the probe measures streaming rather
+	// than the graph. Same law as the capture's r.Streaming.FullyLoadUsedTextures.
+	FAssetCompilingManager::Get().FinishAllCompilation();
+	// AND ITS SHADERS MUST BE COMPILED. FAssetCompilingManager does not cover shader maps, and
+	// drawing a material whose shader map is still in flight dereferences it inside the renderer:
+	// measured 2026-09-08, EXCEPTION_ACCESS_VIOLATION in UnrealEditor-Renderer.dll on the first run
+	// of this tool, one step after a fresh ImportWeapon created the instance.
+	if (GShaderCompilingManager) { GShaderCompilingManager->FinishAllCompilation(); }
+	IStreamingManager::Get().StreamAllResources(0.0f);
+
+	UTextureRenderTarget2D* RT = UKismetRenderingLibrary::CreateRenderTarget2D(
+		World, N, N, RTF_RGBA16f, FLinearColor::Black, /*bAutoGenerateMipMaps*/ false);
+	if (!RT) { Out = TEXT("could not create a render target"); return false; }
+	UKismetRenderingLibrary::DrawMaterialToRenderTarget(World, RT, Mat);
+
+	FTextureRenderTargetResource* Res = RT->GameThread_GetRenderTargetResource();
+	if (!Res) { Out = TEXT("render target has no resource"); return false; }
+	TArray<FLinearColor> Pixels;
+	if (!Res->ReadLinearColorPixels(Pixels) || Pixels.Num() == 0)
+	{
+		Out = TEXT("could not read the render target back");
+		return false;
+	}
+
+	double SumR = 0, SumG = 0, SumB = 0, SumA = 0;
+	FLinearColor Min(FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX);
+	FLinearColor Max(-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX);
+	int32 OverOne = 0;
+	for (const FLinearColor& C : Pixels)
+	{
+		SumR += C.R; SumG += C.G; SumB += C.B; SumA += C.A;
+		Min.R = FMath::Min(Min.R, C.R); Min.G = FMath::Min(Min.G, C.G); Min.B = FMath::Min(Min.B, C.B); Min.A = FMath::Min(Min.A, C.A);
+		Max.R = FMath::Max(Max.R, C.R); Max.G = FMath::Max(Max.G, C.G); Max.B = FMath::Max(Max.B, C.B); Max.A = FMath::Max(Max.A, C.A);
+		if (C.R > 1.f || C.G > 1.f || C.B > 1.f) { ++OverOne; }
+	}
+	const double Inv = 1.0 / (double)Pixels.Num();
+
+	// AN ALL-ZERO BUFFER IS NOT A MEASUREMENT, IT IS A DRAW THAT DID NOT HAPPEN - and reporting it
+	// as ok:true would be the exact defect this tool exists to catch (laws 49-51: an instrument that
+	// answers "success" while doing nothing). Measured 2026-09-08: a plain commandlet reads back
+	// every pixel as exactly 0 even WITH -AllowCommandletRendering, and so does the editor when the
+	// draw is issued at startup before the renderer is live - which is why this tool has a deferred
+	// mode, the same lesson CaptureView already learned. A material whose base colour really is black
+	// is indistinguishable from that here, so this refuses rather than guess.
+	if (Max.R <= 0.f && Max.G <= 0.f && Max.B <= 0.f)
+	{
+		Out = TEXT("every pixel read back as 0 - the material was not actually drawn. Use the deferred ")
+			TEXT("form in the EDITOR (give OutJson + SettleSeconds); a commandlet cannot draw a material ")
+			TEXT("even with -AllowCommandletRendering.");
+		return false;
+	}
+
+	// A handful of named points so two runs can be compared value by value, not just by their means -
+	// a tint that moves one zone and not another shows up here and washes out of an average.
+	FString PointsJson;
+	const int32 Steps = 4;
+	for (int32 gy = 0; gy < Steps; ++gy)
+	{
+		for (int32 gx = 0; gx < Steps; ++gx)
+		{
+			const int32 X = FMath::Clamp((int32)((gx + 0.5f) / Steps * N), 0, N - 1);
+			const int32 Y = FMath::Clamp((int32)((gy + 0.5f) / Steps * N), 0, N - 1);
+			const FLinearColor& C = Pixels[Y * N + X];
+			PointsJson += FString::Printf(TEXT("%s{\"u\":%.3f,\"v\":%.3f,\"rgba\":[%s,%s,%s,%s]}"),
+				PointsJson.IsEmpty() ? TEXT("") : TEXT(","), (gx + 0.5f) / Steps, (gy + 0.5f) / Steps,
+				*FString::SanitizeFloat(C.R), *FString::SanitizeFloat(C.G), *FString::SanitizeFloat(C.B), *FString::SanitizeFloat(C.A));
+		}
+	}
+
+	const UMaterialInstance* AsMI = Cast<UMaterialInstance>(Mat);
+	Out = FString::Printf(
+		TEXT("{\"ok\":true,\"material\":\"%s\",\"parent\":\"%s\",\"size\":%d,\"pixels\":%d,")
+		TEXT("\"meanRGBA\":[%s,%s,%s,%s],\"minRGB\":[%s,%s,%s],\"maxRGB\":[%s,%s,%s],\"pixelsOverOne\":%d,")
+		TEXT("\"points\":[%s],")
+		TEXT("\"note\":\"the material on a flat 0-1 UV quad: no mesh, no mesh UVs, no lighting, no post-processing. Values above 1 are real, not clipped.\"}"),
+		*RudeJsonEscape(Mat->GetName()),
+		*RudeJsonEscape(AsMI && AsMI->Parent ? AsMI->Parent->GetName() : FString()),
+		N, Pixels.Num(),
+		*FString::SanitizeFloat(SumR * Inv), *FString::SanitizeFloat(SumG * Inv), *FString::SanitizeFloat(SumB * Inv), *FString::SanitizeFloat(SumA * Inv),
+		*FString::SanitizeFloat(Min.R), *FString::SanitizeFloat(Min.G), *FString::SanitizeFloat(Min.B),
+		*FString::SanitizeFloat(Max.R), *FString::SanitizeFloat(Max.G), *FString::SanitizeFloat(Max.B),
+		OverOne, *PointsJson);
+	return true;
+}
+
+FString URudeToolset::ProbeMaterial(const FString& AssetPath, const FString& Size,
+                                    const FString& OutJson, const FString& SettleSeconds)
+{
+	auto Fail = [](const FString& Why)
+	{
+		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
+	};
+	if (!FApp::CanEverRender())
+	{
+		return Fail(TEXT("this run has no rendering - add -AllowCommandletRendering (law 31)"));
+	}
+	const FString Path = AssetPath.TrimStartAndEnd();
+	UMaterialInterface* Mat = LoadObject<UMaterialInterface>(nullptr, *Path);
+	if (!Mat) { return Fail(FString::Printf(TEXT("no material at %s"), *Path)); }
+
+	int32 N = Size.TrimStartAndEnd().IsEmpty() ? 64 : FCString::Atoi(*Size);
+	N = FMath::Clamp(N, 4, 1024);
+
+	const FString OutFile = OutJson.TrimStartAndEnd();
+	if (OutFile.IsEmpty())
+	{
+		// Immediate: only honest where the renderer is already live. Refuses on an all-zero readback.
+		FString Result;
+		if (!RudeProbeMaterialNow(Mat, N, Result)) { return Fail(Result); }
+		return Result;
+	}
+
+	// DEFERRED, exactly as CaptureView defers (2026-09-08). A material drawn at editor startup goes
+	// into a renderer that is not live yet and reads back zeros; the fix already in this codebase is
+	// to hand a ticker the job and fire once compilation has been quiet across REAL frames. Quiet must
+	// be SUSTAINED - compilation dips to zero between batches - so several consecutive quiet ticks are
+	// required, and the caller polls for the file the same way it polls for a capture's PNG.
+	const float MinSettle = SettleSeconds.IsEmpty()
+		? 20.0f : FMath::Clamp(FCString::Atof(*SettleSeconds), 0.0f, 600.0f);
+	const double StartedAt = FPlatformTime::Seconds();
+	TSharedRef<int32> QuietTicks = MakeShared<int32>(0);
+	TWeakObjectPtr<UMaterialInterface> WeakMat(Mat);
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[WeakMat, N, OutFile, StartedAt, MinSettle, QuietTicks](float) -> bool
+		{
+			const bool bBusy =
+				FAssetCompilingManager::Get().GetNumRemainingAssets() > 0
+				|| (GShaderCompilingManager && GShaderCompilingManager->IsCompiling());
+			*QuietTicks = bBusy ? 0 : (*QuietTicks + 1);
+			const double Elapsed = FPlatformTime::Seconds() - StartedAt;
+			if (Elapsed < MinSettle || *QuietTicks < 6) { return true; }
+
+			FString Result;
+			if (!WeakMat.IsValid())
+			{
+				Result = TEXT("{\"ok\":false,\"error\":\"the material went away before the probe fired\"}");
+			}
+			else if (!RudeProbeMaterialNow(WeakMat.Get(), N, Result))
+			{
+				Result = FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Result));
+			}
+			FFileHelper::SaveStringToFile(Result, *OutFile);
+			UE_LOG(LogTemp, Display, TEXT("[RUDE] ProbeMaterial: quiet after %.1fs -> %s"), Elapsed, *OutFile);
+			return false;
+		}), 0.5f);
+
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"requested\":\"%s\",\"settleSeconds\":%.1f,\"note\":\"")
+		TEXT("deferred - fires once compilation is quiet for 6 consecutive ticks AND %.0fs have ")
+		TEXT("passed; poll for the file\"}"), *RudeJsonEscape(OutFile), MinSettle, MinSettle);
+}
+
 // ---- ONE map-save, in ONE place (law 50) ------------------------------------------------------
 // Three call sites used to spell this themselves, and all three spelled it wrong the same way: they
 // saved the .umap only when FPaths::FileExists said there was NOT one there yet. That answers "is
@@ -3080,7 +3245,7 @@ FString URudeToolset::InspectMesh(const FString& AssetPath)
 	FString MatsJson;
 	for (const FStaticMaterial& SM : Mesh->GetStaticMaterials())
 	{
-		FString Diffuse = TEXT("unbound"), MatPath = TEXT("null"), Master = TEXT("null"), Params, Scalars;
+		FString Diffuse = TEXT("unbound"), MatPath = TEXT("null"), Master = TEXT("null"), Params, Scalars, Vectors;
 		if (SM.MaterialInterface)
 		{
 			MatPath = SM.MaterialInterface->GetPathName();
@@ -3121,11 +3286,30 @@ FString URudeToolset::InspectMesh(const FString& AssetPath)
 								*RudeJsonEscape(SI.Name.ToString()), bGotS ? *FString::SanitizeFloat(SV) : TEXT("null"));
 						}
 					}
+					// EVERY VECTOR the master exposes (2026-09-07). Reporting textures and scalars but NOT
+					// vectors is how `detailSettings` stayed invisible through a whole investigation into why
+					// a master's base colour looked wrong - its .x is the detail STRENGTH and its .zw the
+					// tiling, so a tool that cannot show it cannot answer "why does this surface look like
+					// that". Same law as the scalars above: a parameter that changes the render and cannot be
+					// read is a gate testing the wrong property.
+					{
+						TArray<FMaterialParameterInfo> VInfos; TArray<FGuid> VIds;
+						Par->GetAllVectorParameterInfo(VInfos, VIds);
+						for (const FMaterialParameterInfo& VI : VInfos)
+						{
+							FLinearColor VV = FLinearColor::Black;
+							const bool bGotV = MI->GetVectorParameterValue(VI, VV);
+							Vectors += FString::Printf(TEXT("%s{\"param\":\"%s\",\"value\":%s}"), Vectors.IsEmpty() ? TEXT("") : TEXT(","),
+								*RudeJsonEscape(VI.Name.ToString()),
+								bGotV ? *FString::Printf(TEXT("[%s,%s,%s,%s]"), *FString::SanitizeFloat(VV.R), *FString::SanitizeFloat(VV.G),
+									*FString::SanitizeFloat(VV.B), *FString::SanitizeFloat(VV.A)) : TEXT("null"));
+						}
+					}
 				}
 			}
 		}
-		MatsJson += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"master\":\"%s\",\"diffuse\":\"%s\",\"textureParams\":[%s],\"scalarParams\":[%s]}"), MatsJson.IsEmpty() ? TEXT("") : TEXT(","),
-			*RudeJsonEscape(SM.MaterialSlotName.ToString()), *RudeJsonEscape(MatPath), *RudeJsonEscape(Master), *RudeJsonEscape(Diffuse), *Params, *Scalars);
+		MatsJson += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"master\":\"%s\",\"diffuse\":\"%s\",\"textureParams\":[%s],\"scalarParams\":[%s],\"vectorParams\":[%s]}"), MatsJson.IsEmpty() ? TEXT("") : TEXT(","),
+			*RudeJsonEscape(SM.MaterialSlotName.ToString()), *RudeJsonEscape(MatPath), *RudeJsonEscape(Master), *RudeJsonEscape(Diffuse), *Params, *Scalars, *Vectors);
 	}
 	return FString::Printf(TEXT("{\"ok\":true,\"mesh\":\"%s\",\"renderBoundsM\":\"%.1fx%.1fx%.1f\",\"boundsCenterM\":\"%.1f,%.1f,%.1f\",")
 		TEXT("\"lod0Verts\":%d,\"lod0Tris\":%d,\"vertexMinM\":\"%.1f,%.1f,%.1f\",\"vertexMaxM\":\"%.1f,%.1f,%.1f\",")

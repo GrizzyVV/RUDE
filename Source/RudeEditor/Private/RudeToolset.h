@@ -281,6 +281,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Show the size numbers of an imported model: bounds, real vertex extents, collision pieces.", RudeAudience="agent"))
 	static FString InspectMesh(const FString& AssetPath);
 
+	// ⭐ THE LINEAR READOUT (law 51). A capture is TONE-MAPPED, so it can answer "did this texture bind"
+	// and "is this the right zone" but NEVER "what magnitude is this value" - which is why a multiply
+	// inside a master graph could not be measured from a screenshot, and why a whole day went into
+	// reading one. This draws the material itself into a floating-point render target and reports the
+	// ACTUAL linear numbers: per-channel min, max and mean over every pixel, plus named sample points.
+	// ⛔ Boundaries, stated because they are easy to over-read: this is the material on a flat 0..1 UV
+	// quad - no mesh, no mesh UVs, no lighting, no post-processing. Values CAN exceed 1 (that is the
+	// point: RGBA16f, unclamped). It answers questions about the material's own output, not about how
+	// the model looks. Needs -AllowCommandletRendering in a commandlet (law 31) and says so if absent.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Measure a material's actual output as numbers rather than a picture: draws it to a float buffer and reports min/max/mean per channel.", RudeAudience="agent"))
+	static FString ProbeMaterial(const FString& AssetPath, const FString& Size,
+	                             const FString& OutJson, const FString& SettleSeconds);
+
 	// Scenario region export (WP10): the point actors ImportScenarioRegion placed go back to their
 	// region file as a FiveM resource (<OutDir>/stream/<region>.ymt, XML form, + fxmanifest.lua). The
 	// source file's bytes are SPLICED - only the top-level <Points>/<MyPoints> block is replaced; an
