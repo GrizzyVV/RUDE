@@ -313,6 +313,22 @@ struct FRudeMasterSpec
 	}
 };
 
+// ⛔ THE GRAPH VERSION - BUMP THIS ON EVERY CHANGE TO EnsureGeneratedMaster's GRAPH.
+// The staleness rule below used to probe for NAMED PARAMETERS ("does this master declare
+// TintAmount?"). That can only see a change that ADDS OR REMOVES A PARAMETER; it is blind to a
+// change in the WIRING. Measured 2026-09-07: the alpha-mask fix (Connect() instead of a raw
+// Expression assignment, in both the tint and livery branches) added no parameter, so every
+// RegenerateMasters after it reported `regenerated: 0` and NOT ONE existing master was rebuilt -
+// the fix reached the code and never reached an asset. The diagnostic that was supposed to prove
+// the graph reaches the screen (BaseColor multiplied by 0.05) died the same way and read as
+// "a master's graph has no observable effect", which was never what the run measured.
+// So the version is STAMPED INTO THE ASSET as an unconnected scalar and compared here. A wiring
+// change now only needs this number bumped, and the rule cannot silently miss it again.
+//   1 = every master generated before the stamp existed (they read -1 and are all stale)
+//   2 = the alpha-mask fix in the tint and livery branches (2026-09-07)
+static const int32 RudeMasterGraphVersion = 2;
+static const TCHAR* RudeMasterGraphVersionParam = TEXT("RudeGraphVersion");
+
 // ---- THE definition of "this master RUDE generates is stale" ----------------------------------
 // ONE rule, in ONE place, because there were three and they disagreed: each generator below kept
 // its own condition, and RudeDoctor RESTATED one of them in order to report it - so when the tint
@@ -384,6 +400,33 @@ ERudeMasterHealth RudeGeneratedMasterHealth(UMaterial* M, const FString& AssetNa
 		OutWhy = TEXT("tint master with no TintAmount");
 		return ERudeMasterHealth::Stale;
 	}
+
+	// RULE 0, and the LAST word (2026-09-07). Rules 1 and 2 above are kept because they name a
+	// specific historical defect, which is a better message than a version number when they apply.
+	// This one catches everything they cannot: ANY change to the graph's wiring. The stamp is read
+	// off the EXPRESSION COLLECTION rather than GetAllScalarParameterInfo, because the parameter is
+	// deliberately unconnected and an unreferenced parameter is not guaranteed to survive into the
+	// compiled parameter list - the expression it was built from always does.
+	// A master with no stamp reads -1, which is every master generated before this rule: stale, and
+	// regenerated in place, so the instances parented to it pick the fix up with no re-import.
+	int32 Stamped = -1;
+	for (UMaterialExpression* E : M->GetExpressionCollection().Expressions)
+	{
+		if (UMaterialExpressionScalarParameter* SP = Cast<UMaterialExpressionScalarParameter>(E))
+		{
+			if (SP->ParameterName == FName(RudeMasterGraphVersionParam))
+			{
+				Stamped = FMath::RoundToInt(SP->DefaultValue);
+				break;
+			}
+		}
+	}
+	if (Stamped != RudeMasterGraphVersion)
+	{
+		OutWhy = FString::Printf(TEXT("graph version %d, builder writes %d"),
+			Stamped, RudeMasterGraphVersion);
+		return ERudeMasterHealth::Stale;
+	}
 	return ERudeMasterHealth::Healthy;
 }
 
@@ -437,6 +480,11 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 		Add(S, -1500, Y);
 		return S;
 	};
+
+	// THE STAMP. Unconnected on purpose - it is a version marker, not an input - and read back off
+	// the expression collection by RudeGeneratedMasterHealth. Every graph below this line is
+	// covered by it, so a wiring change needs no new staleness probe, only a bump of the constant.
+	MakeScalar(RudeMasterGraphVersionParam, (float)RudeMasterGraphVersion, -1200);
 
 	// RAGE draw bucket -> UE blend mode. Bucket 1 is alpha-BLENDED and must never be alpha-TESTED
 	// (that perforates glass); bucket 3 is the cutout. Same law as MasterForPreset.

@@ -1719,17 +1719,46 @@ FString URudeToolset::SaveLevel(const FString& LevelPath)
 	FString Path = LevelPath.TrimStartAndEnd();
 	if (Path.IsEmpty()) { Path = World->GetOutermost()->GetName(); }
 	if (!FPackageName::IsValidLongPackageName(Path) || Path.StartsWith(TEXT("/Temp"))) { return Fail(TEXT("give a content path for the level (it is untitled)")); }
-	bool bSaved = FEditorFileUtils::SaveMap(World, Path);
 	FString MapFile;
 	FPackageName::TryConvertLongPackageNameToFilename(Path, MapFile, FPackageName::GetMapPackageExtension());
-	if (!FPaths::FileExists(MapFile))
+
+	// (2026-09-07) THE TEST IS "DID THIS SAVE WRITE THE LEVEL", NOT "IS THERE A FILE AT THIS PATH".
+	// This function used to save the map only when FPaths::FileExists(MapFile) was FALSE, and take an
+	// `else` branch that called RudeSaveDirty(/*bMaps*/ FALSE, true) otherwise. FileExists is true
+	// forever after the first successful save, so from the second call onward the level was NEVER
+	// WRITTEN AGAIN and the verdict still said ok:true. Measured: the capture level's .umap sat 20
+	// hours old on disk while every run reported a successful save, so the GUI capture that opens the
+	// level re-photographed the SAME STALE SNAPSHOT every time. That is what produced a whole day of
+	// byte-identical captures, and the false conclusion drawn from them - that a generated master's
+	// graph has no observable effect on what renders. The camera was the only thing that ever moved
+	// the picture because the camera is a CaptureView ARGUMENT, not level state.
+	// So: the write is now UNCONDITIONAL, and the verdict reports whether the FILE ON DISK CHANGED.
+	IFileManager& FM = IFileManager::Get();
+	const FDateTime BeforeTime = FM.GetTimeStamp(*MapFile);
+	const int64 BeforeSize = FM.FileSize(*MapFile);
+
+	// SaveMap is the only leg that can RENAME an untitled world (/Temp/Untitled_N, which is what
+	// NewLevel leaves behind) into the target package. Headless it does that much and writes nothing,
+	// so the write happens below through the same headless saver every other tool persists with.
+	FEditorFileUtils::SaveMap(World, Path);
+
+	UPackage* WorldPkg = World->GetOutermost();
+	if (WorldPkg->GetName() != Path)
 	{
-		World->GetOutermost()->MarkPackageDirty();
-		bSaved = RudeSaveDirty(true, true) && FPaths::FileExists(MapFile);
+		// Refused BY NAME rather than reported as a success that did not happen.
+		return Fail(FString::Printf(TEXT("the world is still package %s, not %s - SaveMap did not rename it"),
+			*WorldPkg->GetName(), *Path));
 	}
-	else { RudeSaveDirty(false, true); }
-	return FString::Printf(TEXT("{\"ok\":%s,\"level\":\"%s\",\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d}"),
-		bSaved ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Path), FPaths::FileExists(MapFile) ? TEXT("true") : TEXT("false"),
+	WorldPkg->MarkPackageDirty();
+	RudeSaveDirty(/*bMaps*/ true, /*bContent*/ true);
+
+	const FDateTime AfterTime = FM.GetTimeStamp(*MapFile);
+	const int64 AfterSize = FM.FileSize(*MapFile);
+	const bool bWrote = AfterSize >= 0 && (BeforeSize < 0 || AfterTime > BeforeTime || AfterSize != BeforeSize);
+	return FString::Printf(TEXT("{\"ok\":%s,\"level\":\"%s\",\"wroteMap\":%s,\"mapBytes\":%lld,\"mapBytesBefore\":%lld,\"mapOnDisk\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d}"),
+		bWrote ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Path),
+		bWrote ? TEXT("true") : TEXT("false"), AfterSize, BeforeSize,
+		AfterSize >= 0 ? TEXT("true") : TEXT("false"),
 		GRudeLastSaved, GRudeLastSaveFailed);
 }
 
