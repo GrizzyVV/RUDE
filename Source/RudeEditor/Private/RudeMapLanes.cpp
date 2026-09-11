@@ -816,6 +816,7 @@ struct FRudeImportTally
 	int32 ScopedAuth = 0, ScopedProv = 0;
 	int32 TbEmbedded = 0, TbNoScope = 0, TbSlotAmb = 0, TbYtypAmb = 0, TbDictAbsent = 0, TbNotInScope = 0;
 	int32 UnmappedSamp = 0, NoShaderDef = 0, NoMaterial = 0;
+	int32 ValInXml = 0, ValArrayUnread = 0, TexInXml = 0, TexUnnamed = 0, TexDeduped = 0;
 	int32 ValSeen = 0, ValBound = 0, ValUnsupported = 0, ValDeduped = 0;
 	// #40 collision, 2026-08-05: the map/MLO lane must surface these too, or a whole-city import
 	// would once again report the geometry it moved and stay silent about the collision it did not.
@@ -854,6 +855,14 @@ struct FRudeImportTally
 		ValSeen        += RudeSumField(R, TEXT("valueParamsSeen"));
 		ValBound       += RudeSumField(R, TEXT("valueParamsBound"));
 		ValUnsupported += RudeSumField(R, TEXT("valueParamsUnsupported"));
+		// law 56 at the AGGREGATION layer: these exist on every unit verdict and used to vanish
+		// here, which is the same defect one level up - nobody imports one drawable, so a residual
+		// that is only visible per file is invisible in every run that matters.
+		ValInXml       += RudeSumField(R, TEXT("valueParamsInXml"));
+		ValArrayUnread += RudeSumField(R, TEXT("valueParamsArrayUnread"));
+		TexInXml       += RudeSumField(R, TEXT("texParamsInXml"));
+		TexUnnamed     += RudeSumField(R, TEXT("texParamsUnnamed"));
+		TexDeduped     += RudeSumField(R, TEXT("texParamsDeduped"));
 		ValDeduped     += RudeSumField(R, TEXT("valueParamsDeduped"));
 		ColSeen        += RudeSumField(R, TEXT("collisionBoundsSeen"));
 		ColPrims       += RudeSumField(R, TEXT("collisionPrimitivesImported"));
@@ -879,6 +888,8 @@ struct FRudeImportTally
 			TEXT("\"tieBreakScopeDictAbsent\":%d,\"tieBreakNameNotInScope\":%d,")
 			TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
 			TEXT("\"unmappedSamplers\":%d,\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
+			TEXT("\"valueParamsInXml\":%d,\"valueParamsArrayUnread\":%d,")
+			TEXT("\"texParamsInXml\":%d,\"texParamsUnnamed\":%d,\"texParamsDeduped\":%d,")
 			TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,\"valueParamsUnsupported\":%d,")
 			TEXT("\"valueParamsDeduped\":%d,\"collisionBoundsSeen\":%d,")
 			TEXT("\"collisionPrimitivesImported\":%d,\"collisionMeshesImported\":%d,")
@@ -889,6 +900,7 @@ struct FRudeImportTally
 			FromArchTxd, FromParentTxd, FromYtyp, FromSlot, ScopedAuth, ScopedProv,
 			TbEmbedded, TbNoScope, TbSlotAmb, TbYtypAmb, TbDictAbsent, TbNotInScope,
 			Unsupported, MissingTex, UnmappedSamp, NoShaderDef, NoMaterial,
+			ValInXml, ValArrayUnread, TexInXml, TexUnnamed, TexDeduped,
 			ValSeen, ValBound, ValUnsupported, ValDeduped,
 			ColSeen, ColPrims, ColMeshes, ColUnmapped, ColMalformed, ColPolysDropped, ColTris);
 	}
@@ -2503,6 +2515,7 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 	// run that bound all of them printed the identical line. A batch must aggregate the counters
 	// its unit reports - a silent contributor has to be as loud as a failing one.
 	int32 Bound = 0, Unsupported = 0, MissingTex = 0, UnmappedSamp = 0;
+	int32 ValInXml = 0, ValArrayUnread = 0, TexInXml = 0, TexUnnamed = 0, TexDeduped = 0;
 	int32 ValSeen = 0, ValBound = 0, ValUnsupported = 0, ValDeduped = 0;
 	// ⛔ THE BATCH SUMMED SEVEN FIELDS AND STOPPED, and the two it left out were the ones that
 	// report LOST GEOMETRY. ImportYdr has emitted geometriesDropped + geometryErrors since
@@ -2574,6 +2587,14 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		ValSeen        += RudeSumField(R, TEXT("valueParamsSeen"));
 		ValBound       += RudeSumField(R, TEXT("valueParamsBound"));
 		ValUnsupported += RudeSumField(R, TEXT("valueParamsUnsupported"));
+		// law 56 at the AGGREGATION layer: these exist on every unit verdict and used to vanish
+		// here, which is the same defect one level up - nobody imports one drawable, so a residual
+		// that is only visible per file is invisible in every run that matters.
+		ValInXml       += RudeSumField(R, TEXT("valueParamsInXml"));
+		ValArrayUnread += RudeSumField(R, TEXT("valueParamsArrayUnread"));
+		TexInXml       += RudeSumField(R, TEXT("texParamsInXml"));
+		TexUnnamed     += RudeSumField(R, TEXT("texParamsUnnamed"));
+		TexDeduped     += RudeSumField(R, TEXT("texParamsDeduped"));
 		ValDeduped     += RudeSumField(R, TEXT("valueParamsDeduped"));
 		GeosDropped    += RudeSumField(R, TEXT("geometriesDropped"));
 		GeosNoUV       += RudeSumField(R, TEXT("geometriesWithoutUV"));
@@ -2686,6 +2707,8 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		TEXT("\"resolvedEntries\":%d,")
 		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,\"unmappedSamplers\":%d,")
 		TEXT("\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
+		TEXT("\"valueParamsInXml\":%d,\"valueParamsArrayUnread\":%d,")
+		TEXT("\"texParamsInXml\":%d,\"texParamsUnnamed\":%d,\"texParamsDeduped\":%d,")
 		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,\"valueParamsUnsupported\":%d,")
 		TEXT("\"valueParamsDeduped\":%d,\"filesWithCollision\":%d,\"collisionBoundsSeen\":%d,")
 		TEXT("\"collisionPrimitivesImported\":%d,\"collisionMeshesImported\":%d,")
@@ -2700,7 +2723,9 @@ FString URudeToolset::ImportYdrBatch(const FString& ListPath, const FString& Des
 		ScopeIndex.GtxdFiles, ScopeIndex.GtxdRelationships, ScopeIndex.GtxdRefusals,
 		ScopeIndex.ResolvedEntries,
 		Unsupported, MissingTex, UnmappedSamp,
-		NoShaderDef, NoMaterial, ValSeen, ValBound, ValUnsupported, ValDeduped,
+		NoShaderDef, NoMaterial,
+		ValInXml, ValArrayUnread, TexInXml, TexUnnamed, TexDeduped,
+		ValSeen, ValBound, ValUnsupported, ValDeduped,
 		FilesWithCollision, ColSeen, ColPrims, ColMeshes, ColUnmapped, ColMalformed,
 		ColPolysDropped, ColTris, *FailedFiles);
 }

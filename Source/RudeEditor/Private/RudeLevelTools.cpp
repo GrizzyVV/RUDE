@@ -1033,9 +1033,8 @@ static bool RudeProbeMaterialNow(UMaterialInterface* Mat, int32 N, FString& Out)
 	// is indistinguishable from that here, so this refuses rather than guess.
 	if (Max.R <= 0.f && Max.G <= 0.f && Max.B <= 0.f)
 	{
-		Out = TEXT("every pixel read back as 0 - the material was not actually drawn. Use the deferred ")
-			TEXT("form in the EDITOR (give OutJson + SettleSeconds); a commandlet cannot draw a material ")
-			TEXT("even with -AllowCommandletRendering.");
+		Out = TEXT("every pixel read back as 0 - the material was not drawn. DrawMaterialToRenderTarget ")
+			TEXT("is not usable in this process (law 53); this tool has no working mechanism yet.");
 		return false;
 	}
 
@@ -1082,6 +1081,20 @@ FString URudeToolset::ProbeMaterial(const FString& AssetPath, const FString& Siz
 	if (!FApp::CanEverRender())
 	{
 		return Fail(TEXT("this run has no rendering - add -AllowCommandletRendering (law 31)"));
+	}
+	// ⛔ AND REFUSE IN A COMMANDLET, BEFORE TOUCHING THE CANVAS (2026-09-11, law 53).
+	// DrawMaterialToRenderTarget goes through a world-owned UCanvas. In a commandlet that path does
+	// not work even with -AllowCommandletRendering: it first read back every pixel as exactly 0, and
+	// when a control draw was added to tell which half had failed, it took an
+	// EXCEPTION_ACCESS_VIOLATION and killed the process instead. A tool that crashes the editor is
+	// strictly worse than one that says no, so this says no. The editor path still gets to try - it
+	// returns zeros rather than crashing - and refuses honestly on an all-zero buffer.
+	if (!FSlateApplication::IsInitialized())
+	{
+		return Fail(TEXT("ProbeMaterial cannot draw in a commandlet - the canvas path is not available ")
+			TEXT("there and attempting it crashes the process. Run it from the editor with -ExecCmds. ")
+			TEXT("⚠ It does not work there either yet (reads back all zeros) - see law 53; this tool ")
+			TEXT("has no working mechanism and is shipped refusing rather than lying."));
 	}
 	const FString Path = AssetPath.TrimStartAndEnd();
 	UMaterialInterface* Mat = LoadObject<UMaterialInterface>(nullptr, *Path);
