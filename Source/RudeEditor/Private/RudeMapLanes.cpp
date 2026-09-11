@@ -4156,6 +4156,8 @@ FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
 	// not be asked must not read as one that passed.
 	int32 MastersCompileFailed = -1;
 	FString CompileFailedNames;
+	int32 InstancesAffected = 0;   // material instances parented to a master that will not compile
+	int32 InstancesOnMasters = 0;  // ...and the total riding on RUDE's masters at all (a health number)
 	if (FApp::CanEverRender())
 	{
 		if (GShaderCompilingManager) { GShaderCompilingManager->FinishAllCompilation(); }
@@ -4168,18 +4170,38 @@ FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
 			if (!Mat) { continue; }
 			const FMaterialResource* Res = Mat->GetMaterialResource(GMaxRHIShaderPlatform, EMaterialQualityLevel::Num);
 			if (!Res) { continue; }
+			// Every master's instance count, not just the broken ones. The total is a health number
+			// on its own ("RUDE has N instances riding on these masters") and, unlike a number that
+			// only appears when something is broken, it can be checked against an independent count.
+			TArray<FName> AllRefs;
+			ARM.Get().GetReferencers(AD.PackageName, AllRefs,
+				UE::AssetRegistry::EDependencyCategory::Package);
+			int32 ThisMasterInstances = 0;
+			for (const FName& R : AllRefs)
+			{
+				if (R.ToString().Contains(TEXT("/Materials/Instances/"))) { ++ThisMasterInstances; }
+			}
+			InstancesOnMasters += ThisMasterInstances;
+
 			const TArray<FString>& Errors = Res->GetCompileErrors();
 			if (Errors.Num() > 0)
 			{
 				++MastersCompileFailed;
-				CompileFailedNames += FString::Printf(TEXT("%s\"%s: %s\""),
+				// ⭐ AND WHAT IT COSTS (2026-09-10, objective 11). "one master fails to compile" is
+				// true and almost useless; "and 844 material instances are rendering as Unreal's
+				// default because of it" is the sentence that makes someone act. The referencer graph
+				// answers it without loading a single instance - the asset registry already knows who
+				// points at this package.
+				const int32 Affected = ThisMasterInstances;
+				InstancesAffected += Affected;
+				CompileFailedNames += FString::Printf(TEXT("%s\"%s: %s (%d instance(s) affected)\""),
 					CompileFailedNames.IsEmpty() ? TEXT("") : TEXT(","),
-					*RudeJsonEscape(AssetName), *RudeJsonEscape(Errors[0]));
+					*RudeJsonEscape(AssetName), *RudeJsonEscape(Errors[0]), Affected);
 			}
 		}
 		if (MastersCompileFailed > 0)
 		{
-			Note(FString::Printf(TEXT("%d master(s) FAIL TO COMPILE - every material instance parented to one of them is rendering as Unreal's default material, which ignores every setting RUDE puts on it. Fix the graph, then RegenerateMasters."), MastersCompileFailed));
+			Note(FString::Printf(TEXT("%d master(s) FAIL TO COMPILE and %d material instance(s) are parented to them - every one of those is rendering as Unreal's default material, which ignores every setting RUDE puts on it. Fix the graph, then RegenerateMasters."), MastersCompileFailed, InstancesAffected));
 		}
 	}
 
@@ -4289,7 +4311,7 @@ FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
 		TEXT("\"plugins\":[%s],\"pluginsEnabled\":%d,")
 		TEXT("\"mastersMounted\":%s,\"masters\":%d,\"generatedMasters\":%d,\"staleMasters\":%d,")
 		TEXT("\"unparsedMasters\":%d,\"staleMasterNames\":[%s],")
-		TEXT("\"mastersCompileFailed\":%d,\"mastersCompileChecked\":%s,\"compileFailedMasters\":[%s],")
+		TEXT("\"mastersCompileFailed\":%d,\"mastersCompileChecked\":%s,\"instancesAffected\":%d,\"instancesOnMasters\":%d,\"compileFailedMasters\":[%s],")
 		TEXT("\"catalogPath\":\"%s\",\"catalogPresent\":%s,\"catalogEntries\":%d,")
 		TEXT("\"corpus\":%s,\"headless\":%s,\"unattended\":%s,\"editorWorld\":%s}"),
 		Problems.Num() == 0 ? TEXT("true") : TEXT("false"), Problems.Num(), *ProblemJson,
@@ -4297,7 +4319,7 @@ FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
 		*PluginJson, EnabledPlugins,
 		bMastersMounted ? TEXT("true") : TEXT("false"), MastersTotal, MastersGen, MastersStale,
 		MastersUnparsed, *StaleNames,
-		MastersCompileFailed, MastersCompileFailed >= 0 ? TEXT("true") : TEXT("false"), *CompileFailedNames,
+		MastersCompileFailed, MastersCompileFailed >= 0 ? TEXT("true") : TEXT("false"), InstancesAffected, InstancesOnMasters, *CompileFailedNames,
 		*RudeJsonEscape(CatalogPath), bCatalog ? TEXT("true") : TEXT("false"), CatalogEntries,
 		*CorpusJson, bSlate ? TEXT("false") : TEXT("true"),
 		FApp::IsUnattended() ? TEXT("true") : TEXT("false"), bWorld ? TEXT("true") : TEXT("false"));
