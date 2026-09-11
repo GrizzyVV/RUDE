@@ -2959,6 +2959,15 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		// `<Item>`s the XML actually carried, so "the file had 213 and we parsed 0" is a contradiction
 		// the verdict can state instead of a silence it cannot.
 		int32 ValueItemsInXml = 0;
+		int32 ValueItemsArray = 0;
+		// Same law, the texture half (2026-09-10). A `type="Texture"` param whose `<Name>` child is
+		// ABSENT or EMPTY is a sampler the game left unbound - there is genuinely nothing to bind, but
+		// it used to `continue` without being counted anywhere, so the arithmetic did not close:
+		// cloudhat drawables report 7 texture params in the file and 6 in the verdict, with
+		// missingTextures 0 and unmappedSamplers 0. Nothing was wrong; nothing could have told you if
+		// something HAD been. Counted now, so bound + missing + unmapped + unnamed == inXml.
+		int32 TexItemsInXml = 0;
+		int32 TexItemsUnnamed = 0;
 	};
 	TArray<FShaderDef> Shaders;
 	if (const FXmlNode* SG = DrawableRoot->FindChildNode(TEXT("ShaderGroup")))
@@ -2984,6 +2993,11 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 						if (PType == TEXT("Vector") || PType == TEXT("Array"))
 						{
 							++Def.ValueItemsInXml;
+							// `Array` is the multi-vec4 form (gCloudViewProj and friends). It is
+							// deliberately NOT read - averaging or taking the first of an array would
+							// invent a value - but "deliberately not read" and "silently dropped" must
+							// not look the same in a verdict, so it gets its own residual.
+							if (PType == TEXT("Array")) { ++Def.ValueItemsArray; }
 						}
 						if (PType == TEXT("Vector"))
 						{
@@ -3025,16 +3039,19 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 							}
 							continue;
 						}
-						if (P->GetAttribute(TEXT("type")) != TEXT("Texture"))
+						if (PType != TEXT("Texture"))
 						{
 							continue;
 						}
+						++Def.TexItemsInXml;
 						const FXmlNode* TexName = P->FindChildNode(TEXT("Name"));
 						if (!TexName)
 						{
+							++Def.TexItemsUnnamed;
 							continue;
 						}
 						const FString Tex = TexName->GetContent().TrimStartAndEnd();
+						if (Tex.IsEmpty()) { ++Def.TexItemsUnnamed; }
 						const FString Sampler = P->GetAttribute(TEXT("name"));
 						if (!Tex.IsEmpty()) { Def.AllTex.Add(Sampler, Tex); }
 						if (Sampler == TEXT("DiffuseSampler"))       { Def.Diffuse = Tex; }
@@ -3584,9 +3601,13 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 	// UnsupportedByMaster counts exactly those silent no-ops; a non-zero value is a real defect.
 	int32 ValueParamsSeen = 0;       // params that REACHED the bind decision (see the verdict note)
 	int32 ValueParamsInXml = 0;      // params the FILE carried, counted before the parse can drop them
+	int32 TexParamsInXml = 0;        // texture params the FILE carried
+	int32 TexParamsUnnamed = 0;      // ...of those, the ones the game left with no texture name
 	int32 ValueParamsBound = 0;      // value param the master DOES expose, so it took effect
 	int32 ValueParamsUnsupported = 0;// value param arrived but no master parameter accepts it
 	int32 ValueParamsDeduped = 0;    // params on a geometry that reused a cached MI - never bound
+	int32 TexParamsDeduped = 0;      // texture params on a geometry that reused a cached MI
+	int32 ValueParamsArrayUnread = 0;// type="Array" params: present, deliberately unread, NOT lost
 	int32 UnsupportedByMaster = 0;   // sampler mapped, but the MASTER has no such parameter
 	int32 MissingTextures = 0;       // XML named a texture that is not imported in this project
 	int32 DetailNormalMapsSkipped = 0;   // a NORMAL map bound to Detail: the albedo overlay is left off
@@ -3641,6 +3662,9 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 			// drawable that genuinely has no value parameters, and that is how 7,013 of 7,013 vector
 			// parameters went missing without a single verdict saying so.
 			ValueParamsInXml += Def->ValueItemsInXml;
+			ValueParamsArrayUnread += Def->ValueItemsArray;
+			TexParamsInXml   += Def->TexItemsInXml;
+			TexParamsUnnamed += Def->TexItemsUnnamed;
 		}
 
 		UMaterialInterface* SlotMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
@@ -3713,6 +3737,12 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 			// The dedupe branch never reaches the bind loop, so its value params were counted in
 			// "seen" and accounted for by nothing. They are a THIRD residual, not a loss.
 			ValueParamsDeduped += Def->Values.Num();
+			// ...and its TEXTURE params, for the same reason (2026-09-10). The value side has had this
+			// residual since it was written; the texture side never did, so `texParamsInXml` and the
+			// bind counters disagreed on 14 of 30 sampled drawables by 3-12 params each and there was
+			// nothing to attribute the difference to. Nothing was lost - a reused MI is already bound -
+			// but an unattributed residual is indistinguishable from one.
+			TexParamsDeduped += Def->TexItemsInXml;
 		}
 		else if (Master)
 		{
@@ -4083,6 +4113,8 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		TEXT("\"tieBreakScopeDictAbsent\":%d,\"tieBreakNameNotInScope\":%d,")
 		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
 		TEXT("\"unmappedSamplers\":%d,\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
+		TEXT("\"texParamsInXml\":%d,\"texParamsUnnamed\":%d,\"texParamsDeduped\":%d,")
+		TEXT("\"valueParamsArrayUnread\":%d,")
 		TEXT("\"valueParamsInXml\":%d,\"valueParamsSeen\":%d,\"valueParamsBound\":%d,")
 		TEXT("\"valueParamsUnsupported\":%d,\"valueParamsDeduped\":%d,")
 		TEXT("\"tintPalettesBound\":%d,\"tintPalettesNeutral\":%d,\"tintPalettesNeutralNonWeapon\":%d,")
@@ -4100,6 +4132,8 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		TieBreakScopeDictAbsent, TieBreakNameNotInScope,
 		UnsupportedByMaster, MissingTextures, UnmappedSamplers,
 		SlotsWithoutShaderDef, SlotsWithoutMaterial,
+		TexParamsInXml, TexParamsUnnamed, TexParamsDeduped,
+		ValueParamsArrayUnread,
 		ValueParamsInXml, ValueParamsSeen, ValueParamsBound, ValueParamsUnsupported, ValueParamsDeduped,
 		TintPalettesBound, TintPalettesNeutral, TintPalettesNeutralNonWeapon,
 		*RudeBound::VerdictJson(Col, ColAssetPath), *SlotsJson);
