@@ -2952,6 +2952,13 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		// detail tiling, specular intensity/falloff, bump scale and wetness never reached the
 		// engine at all. They are emitted now as <Item type="Vector">, so carry them through.
 		TMap<FString, FVector4> Values;
+		// ⛔ COUNTED AT THE SOURCE, not after the parse (law 56). `valueParamsSeen` used to be
+		// `Values.Num()` - a count taken DOWNSTREAM of the very step that was dropping everything, so
+		// when the reader silently matched nothing the verdict read `seen:0, bound:0, unsupported:0`
+		// and looked exactly like a drawable that simply has no value parameters. This counts the
+		// `<Item>`s the XML actually carried, so "the file had 213 and we parsed 0" is a contradiction
+		// the verdict can state instead of a silence it cannot.
+		int32 ValueItemsInXml = 0;
 	};
 	TArray<FShaderDef> Shaders;
 	if (const FXmlNode* SG = DrawableRoot->FindChildNode(TEXT("ShaderGroup")))
@@ -2973,7 +2980,12 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 				{
 					for (const FXmlNode* P : Params->GetChildrenNodes())
 					{
-						if (P->GetAttribute(TEXT("type")) == TEXT("Vector"))
+						const FString PType = P->GetAttribute(TEXT("type"));
+						if (PType == TEXT("Vector") || PType == TEXT("Array"))
+						{
+							++Def.ValueItemsInXml;
+						}
+						if (PType == TEXT("Vector"))
 						{
 							// (2026-09-10) A `type="Vector"` parameter carries x/y/z/w AS ATTRIBUTES ON
 							// ITSELF and is self-closing:
@@ -3571,6 +3583,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 	// shows in the MI editor - and renders nothing. So a rising "boundTextures" proves nothing.
 	// UnsupportedByMaster counts exactly those silent no-ops; a non-zero value is a real defect.
 	int32 ValueParamsSeen = 0;       // params that REACHED the bind decision (see the verdict note)
+	int32 ValueParamsInXml = 0;      // params the FILE carried, counted before the parse can drop them
 	int32 ValueParamsBound = 0;      // value param the master DOES expose, so it took effect
 	int32 ValueParamsUnsupported = 0;// value param arrived but no master parameter accepts it
 	int32 ValueParamsDeduped = 0;    // params on a geometry that reused a cached MI - never bound
@@ -3620,7 +3633,15 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		const int32 ShaderIdx = Geos[GeoIdx].ShaderIndex;
 		const FShaderDef* Def = Shaders.IsValidIndex(ShaderIdx) ? &Shaders[ShaderIdx] : nullptr;
 		if (!Def) { ++SlotsWithoutShaderDef; }
-		else { ValueParamsSeen += Def->Values.Num(); }
+		else
+		{
+			ValueParamsSeen += Def->Values.Num();
+			// What the FILE carried, counted at the source (law 56). `seen` above is measured
+			// DOWNSTREAM of the parse, so when the reader matched nothing it read 0 - identical to a
+			// drawable that genuinely has no value parameters, and that is how 7,013 of 7,013 vector
+			// parameters went missing without a single verdict saying so.
+			ValueParamsInXml += Def->ValueItemsInXml;
+		}
 
 		UMaterialInterface* SlotMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
 		const bool bTerrain = Def && Def->Preset.StartsWith(TEXT("terrain"), ESearchCase::IgnoreCase);
@@ -4062,7 +4083,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		TEXT("\"tieBreakScopeDictAbsent\":%d,\"tieBreakNameNotInScope\":%d,")
 		TEXT("\"unsupportedByMaster\":%d,\"missingTextures\":%d,")
 		TEXT("\"unmappedSamplers\":%d,\"slotsWithoutShaderDef\":%d,\"slotsWithoutMaterial\":%d,")
-		TEXT("\"valueParamsSeen\":%d,\"valueParamsBound\":%d,")
+		TEXT("\"valueParamsInXml\":%d,\"valueParamsSeen\":%d,\"valueParamsBound\":%d,")
 		TEXT("\"valueParamsUnsupported\":%d,\"valueParamsDeduped\":%d,")
 		TEXT("\"tintPalettesBound\":%d,\"tintPalettesNeutral\":%d,\"tintPalettesNeutralNonWeapon\":%d,")
 		TEXT("%s,\"slots\":[%s]}"),
@@ -4079,7 +4100,7 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 		TieBreakScopeDictAbsent, TieBreakNameNotInScope,
 		UnsupportedByMaster, MissingTextures, UnmappedSamplers,
 		SlotsWithoutShaderDef, SlotsWithoutMaterial,
-		ValueParamsSeen, ValueParamsBound, ValueParamsUnsupported, ValueParamsDeduped,
+		ValueParamsInXml, ValueParamsSeen, ValueParamsBound, ValueParamsUnsupported, ValueParamsDeduped,
 		TintPalettesBound, TintPalettesNeutral, TintPalettesNeutralNonWeapon,
 		*RudeBound::VerdictJson(Col, ColAssetPath), *SlotsJson);
 }
