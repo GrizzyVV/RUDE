@@ -1362,6 +1362,111 @@ FString URudeToolset::ExportYftClone(const FString& SourceName, const FString& M
 		}
 	}
 
+	// ---- (d) THE DRAWABLE'S OWN BOUNDS, RECOMPUTED (2026-09-11) ---------------------------------
+	// Replacing a geometry rewrote THAT geometry's bbox (above) and left the DRAWABLE's bounds at the
+	// donor's, so a replacement bigger than the mesh it displaced is culled at the old extent - the
+	// "nothing recomputes the culling bounds" half of the fragment gap.
+	// MEASURED CONVENTION, not assumed. Over 200 drawables: the sphere CENTRE is the bbox centre
+	// (worst axis delta 6.2e-5) and the RADIUS is half the bbox diagonal (worst 1.4e-5) - float
+	// rounding, 200/200 on both, so there is no second rule to discover. And over 60 fragments the
+	// FRAGMENT-level radius equals the DRAWABLE-level radius 60/60, so both are written, same value.
+	// ⛔ ONLY WHEN SOMETHING WAS REPLACED. A pure clone must stay byte-identical (the lane's 6/6
+	// gate), and it does: `Authored` is empty on that path and this block writes nothing.
+	int32 DrawableBoundsWritten = 0;
+	if (Authored.Num() > 0)
+	{
+		auto SpanVec = [&](const FYftSpan& S) -> FVector3f
+		{
+			return FVector3f(
+				FCString::Atof(*AttrOfLine(Blob, Lines[S.FirstLine], TEXT("x"))),
+				FCString::Atof(*AttrOfLine(Blob, Lines[S.FirstLine], TEXT("y"))),
+				FCString::Atof(*AttrOfLine(Blob, Lines[S.FirstLine], TEXT("z"))));
+		};
+		// The union has to span EVERY geometry in the drawable, replaced or not - a union over only
+		// the replaced ones would shrink the box around whatever was left untouched.
+		FVector3f DMin(0.f), DMax(0.f);
+		bool bAnyGeo = false;
+		for (int32 Mi = 0; Mi < Models.Num(); ++Mi)
+		{
+			for (int32 Gi = 0; Gi < Models[Mi].Geometries.Num(); ++Gi)
+			{
+				const FYftGeomView& GV = Models[Mi].Geometries[Gi];
+				FVector3f GMin, GMax;
+				if (Authored.IsValidIndex(Mi) && Authored[Mi].IsValidIndex(Gi))
+				{
+					GMin = Authored[Mi][Gi].BBoxMin;
+					GMax = Authored[Mi][Gi].BBoxMax;
+				}
+				else if (GV.bHasBBoxMin && GV.bHasBBoxMax)
+				{
+					GMin = SpanVec(GV.BBoxMin);
+					GMax = SpanVec(GV.BBoxMax);
+				}
+				else
+				{
+					continue;   // a geometry with no bbox to read contributes nothing, and says so below
+				}
+				if (!bAnyGeo) { DMin = GMin; DMax = GMax; bAnyGeo = true; }
+				else
+				{
+					DMin = FVector3f(FMath::Min(DMin.X, GMin.X), FMath::Min(DMin.Y, GMin.Y), FMath::Min(DMin.Z, GMin.Z));
+					DMax = FVector3f(FMath::Max(DMax.X, GMax.X), FMath::Max(DMax.Y, GMax.Y), FMath::Max(DMax.Z, GMax.Z));
+				}
+			}
+		}
+		if (bAnyGeo)
+		{
+			const FVector3f Centre = (DMin + DMax) * 0.5f;
+			const float Radius = (DMax - DMin).Size() * 0.5f;
+
+			// Indent comes from the line being replaced, never a constant: the fragment level and the
+			// drawable level sit at different depths and the corpus is the authority on both.
+			auto EditVecAt = [&](const FYftSpan& S, const FVector3f& V)
+			{
+				const int32 Ind = IndentOf(Blob, Lines[S.FirstLine]);
+				const FString Pad = FString::ChrN(Ind, TCHAR(' '));
+				const FString W = AttrOfLine(Blob, Lines[S.FirstLine], TEXT("w"));
+				FYftEdit E;
+				E.Start = S.ByteStart;
+				E.End = S.ByteEnd;
+				if (W.IsEmpty())
+				{
+					E.Text = Pad + FString::Printf(TEXT("<%s x=\"%s\" y=\"%s\" z=\"%s\" />\n"),
+						*S.Tag, *FmtF32(V.X), *FmtF32(V.Y), *FmtF32(V.Z));
+				}
+				else
+				{
+					E.Text = Pad + FString::Printf(TEXT("<%s x=\"%s\" y=\"%s\" z=\"%s\" w=\"%s\" />\n"),
+						*S.Tag, *FmtF32(V.X), *FmtF32(V.Y), *FmtF32(V.Z), *FmtF32(V.X));
+				}
+				Edits.Add(E);
+				++DrawableBoundsWritten;
+			};
+			auto EditScalarAt = [&](const FYftSpan& S, float V)
+			{
+				const int32 Ind = IndentOf(Blob, Lines[S.FirstLine]);
+				const FString Pad = FString::ChrN(Ind, TCHAR(' '));
+				FYftEdit E;
+				E.Start = S.ByteStart;
+				E.End = S.ByteEnd;
+				E.Text = Pad + FString::Printf(TEXT("<%s value=\"%s\" />\n"), *S.Tag, *FmtF32(V));
+				Edits.Add(E);
+				++DrawableBoundsWritten;
+			};
+
+			if (const FYftSpan* DrawSpan = FindTag(Top, TEXT("Drawable")))
+			{
+				const TArray<FYftSpan> DrawBoundsChildren = ChildrenAt(Blob, Lines, DrawSpan->FirstLine + 1, DrawSpan->LastLine, 2);
+				if (const FYftSpan* S = FindTag(DrawBoundsChildren, TEXT("BoundingBoxMin")))       { EditVecAt(*S, DMin); }
+				if (const FYftSpan* S = FindTag(DrawBoundsChildren, TEXT("BoundingBoxMax")))       { EditVecAt(*S, DMax); }
+				if (const FYftSpan* S = FindTag(DrawBoundsChildren, TEXT("BoundingSphereCenter"))) { EditVecAt(*S, Centre); }
+				if (const FYftSpan* S = FindTag(DrawBoundsChildren, TEXT("BoundingSphereRadius"))) { EditScalarAt(*S, Radius); }
+			}
+			// ...and the fragment's own radius, which the corpus holds equal to the drawable's 60/60.
+			if (const FYftSpan* S = FindTag(Top, TEXT("BoundingSphereRadius"))) { EditScalarAt(*S, Radius); }
+		}
+	}
+
 	int32 GeometriesReplaced = 0;
 	for (const TArray<FYftAuthoredGeo>& Per : Authored) { GeometriesReplaced += Per.Num(); }
 
@@ -1453,7 +1558,7 @@ FString URudeToolset::ExportYftClone(const FString& SourceName, const FString& M
 		TEXT("\"bytesRewritten\":%lld,\"bytesCarriedVerbatim\":%lld,\"carriedFraction\":%.6f,")
 		TEXT("\"colourValuesNeutral\":%d,\"tangentValuesNeutral\":%d,\"uvChannelsSynthesised\":%d,\"bboxWFollowedX\":%d,")
 		TEXT("\"physChildDrawables\":%d,\"physChildGeometries\":%d,")
-		TEXT("\"fragChildren\":[%s],\"drawableChildren\":[%s],\"carriedTopLevelBlocks\":[%s],\"carriedDrawableBlocks\":[%s],")
+		TEXT("\"drawableBoundsWritten\":%d,\"fragChildren\":[%s],\"drawableChildren\":[%s],\"carriedTopLevelBlocks\":[%s],\"carriedDrawableBlocks\":[%s],")
 		TEXT("\"hiTwinInCorpus\":%s,\"refusals\":[%s],\"warnings\":[%s],")
 		TEXT("\"note\":\"XML interchange only - nothing packs a fragment XML back into a .yft, so the game cannot load this yet\"}"),
 		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Name), *RudeJsonEscape(XmlPath), *RudeJsonEscape(Slot),
@@ -1466,6 +1571,7 @@ FString URudeToolset::ExportYftClone(const FString& SourceName, const FString& M
 		BytesRewritten, BytesCarried, (double)BytesCarried / FMath::Max(1, Blob.Num()),
 		ColourNeutral, TangentNeutral, UvChannelsSynthesised, BBoxWFollowedX,
 		PhysChildDrawables, PhysChildGeometries,
+		DrawableBoundsWritten,
 		*JsonStringArray(TopTags), *JsonStringArray(DrawTags),
 		*JsonStringArray(CarriedTop), *JsonStringArray(CarriedDraw),
 		bHiTwin ? TEXT("true") : TEXT("false"),
