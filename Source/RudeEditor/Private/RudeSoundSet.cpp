@@ -66,6 +66,9 @@
 #include "RudeToolsetInternal.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 
 #if WITH_EDITOR
 
@@ -319,8 +322,130 @@ FString URudeToolset::ExportSoundSet(const FString& Sounds, const FString& OutRe
 		SelfCheckFailed, *RudeJsonEscape(FirstProblem), *SoundJson);
 }
 
+// ---- ExportAudioResource -----------------------------------------------------------------------
+// ONE COMMAND -> ONE FOLDER TO DROP IN. `ExportAwc` writes the wave and `ExportSoundSet` writes the
+// declaration, but a test session should not need someone to assemble a resource by hand around
+// them - and the reason is not convenience.
+//
+// ⛔ THE REASON IS FALSE NEGATIVES. If a manifest line is wrong the game does not complain, it just
+// ignores the file. During a test sitting that reads exactly like "the format is wrong", and the
+// next day is spent chasing a container bug that does not exist. Hand-assembly is the step most
+// likely to be got wrong and the least likely to announce it, so it is the step to remove.
+//
+// ⚠ THE MANIFEST WIRING IS THE PART NOBODY HAS CONFIRMED. The container and the sound set are gated
+// on the desk (`ExportSoundSet`, and ROUT's independent reader agrees with both); the `data_file`
+// lines below are FiveM CONVENTION, written from the documented meaning of AUDIO_WAVEPACK and
+// AUDIO_SOUNDDATA, and no run has proven them. They are reported as `manifestVerified:false` and
+// they are exactly what the server row tests. Do not read a silent game as a format failure until
+// this half is ruled out.
+//
+// ⚠ ONE AWC PER SOUND, and that is a real limit rather than a choice: `ExportAwc` writes a
+// single-stream container. The game ships plenty of single-stream awcs so the shape is legitimate,
+// but a multi-stream wave pack is not something RUDE can build yet.
+//
+// ⚠ LAYOUT: `audiodirectory/` and `audioconfig/` are not a naming decision - `data_file` resolves
+// against those paths, so they are fixed by the thing consuming them. The RESOURCE folder name is
+// the caller's.
+FString URudeToolset::ExportAudioResource(const FString& Sounds, const FString& OutDir, const FString& Options)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	auto VerdictOk = [](const FString& V)
+	{
+		TSharedPtr<FJsonObject> Obj;
+		const TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(V);
+		bool b = false;
+		return FJsonSerializer::Deserialize(R, Obj) && Obj.IsValid() && Obj->TryGetBoolField(TEXT("ok"), b) && b;
+	};
+
+	const FString Root = OutDir.TrimStartAndEnd();
+	if (Root.IsEmpty()) { return Fail(TEXT("give an output folder for the resource")); }
+	FString SetName = FPaths::GetCleanFilename(Root);
+	if (SetName.IsEmpty()) { SetName = TEXT("rude_audio"); }
+
+	// `name=/Game/Path/To/SoundWave`, comma separated
+	TArray<FString> Rows;
+	Sounds.ParseIntoArray(Rows, TEXT(","), true);
+	if (Rows.Num() == 0) { return Fail(TEXT("give at least one sound as name=/Game/Path/To/SoundWave")); }
+
+	const FString WaveDir = Root / TEXT("audiodirectory");
+	const FString ConfDir = Root / TEXT("audioconfig");
+
+	FString SoundSpecs, PerSound, Problems;
+	int32 Written = 0;
+	for (const FString& RawRow : Rows)
+	{
+		FString Name, Asset;
+		if (!RawRow.TrimStartAndEnd().Split(TEXT("="), &Name, &Asset))
+		{
+			return Fail(FString::Printf(TEXT("cannot read \"%s\": expected name=/Game/Path/To/SoundWave"), *RawRow.TrimStartAndEnd()));
+		}
+		Name = Name.TrimStartAndEnd().ToLower();
+		Asset = Asset.TrimStartAndEnd();
+		if (Name.IsEmpty() || Asset.IsEmpty()) { return Fail(TEXT("both a name and a SoundWave path are needed")); }
+
+		// the container and the stream both take the sound's own name: one awc per sound
+		const FString AwcPath = WaveDir / (Name + TEXT(".awc"));
+		const FString AwcVerdict = URudeToolset::ExportAwc(Asset, AwcPath, Name);
+		if (!VerdictOk(AwcVerdict))
+		{
+			Problems += FString::Printf(TEXT("%s\"%s: %s\""), Problems.IsEmpty() ? TEXT("") : TEXT(","),
+				*RudeJsonEscape(Name), *RudeJsonEscape(AwcVerdict.Left(200)));
+			continue;
+		}
+		++Written;
+		SoundSpecs += FString::Printf(TEXT("%s%s=%s/%s"), SoundSpecs.IsEmpty() ? TEXT("") : TEXT(","), *Name, *Name, *Name);
+		PerSound += FString::Printf(TEXT("%s{\"sound\":\"%s\",\"asset\":\"%s\",\"awc\":\"%s\"}"),
+			PerSound.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(Name), *RudeJsonEscape(Asset), *RudeJsonEscape(AwcPath));
+	}
+	if (Written == 0) { return Fail(FString::Printf(TEXT("no wave was written; first problem: %s"), *Problems.Left(300))); }
+
+	// the sound set that names every wave written above
+	const FString RelName = SetName + TEXT("_sounds.dat54.rel");
+	const FString RelPath = ConfDir / RelName;
+	const FString SetVerdict = URudeToolset::ExportSoundSet(SoundSpecs, RelPath, Options);
+	if (!VerdictOk(SetVerdict))
+	{
+		return Fail(FString::Printf(TEXT("the sound set was refused, so no resource was written: %s"), *SetVerdict.Left(300)));
+	}
+
+	// the manifest. ⚠ AUDIO_SOUNDDATA takes the path WITHOUT the .dat54.rel suffix.
+	const FString ManifestPath = Root / TEXT("fxmanifest.lua");
+	const FString Manifest = FString::Printf(TEXT(
+		"fx_version 'cerulean'\ngame 'gta5'\n\n"
+		"-- Audio resource written by RUDE (ExportAudioResource).\n"
+		"-- audiodirectory/<name>.awc  : one uncompressed PCM16 wave per sound. That codec is not a\n"
+		"--   fallback - 80 of the 5,642 .awc in the game are entirely PCM16, so it is a shape the\n"
+		"--   game itself ships. One awc per sound because RUDE writes single-stream containers.\n"
+		"-- audioconfig/%s : a dat54 sound set built from nothing, declaring one\n"
+		"--   SimpleSound per wave (ContainerName = the awc, FileName = the stream inside it).\n"
+		"-- AUDIO_SOUNDDATA takes the path WITHOUT the .dat54.rel suffix.\n"
+		"-- WARNING: these two data_file lines are the ONE part of this resource nobody has confirmed.\n"
+		"-- If the game is silent, rule the manifest out before suspecting the file format.\n\n"
+		"files {\n    'audioconfig/*.dat54.rel',\n    'audiodirectory/*.awc',\n}\n\n"
+		"data_file 'AUDIO_WAVEPACK' 'audiodirectory'\n"
+		"data_file 'AUDIO_SOUNDDATA' 'audioconfig/%s_sounds'\n"),
+		*RelName, *SetName);
+	const bool bManifest = FFileHelper::SaveStringToFile(Manifest, *ManifestPath,
+		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+
+	return FString::Printf(
+		TEXT("{\"ok\":%s,\"resource\":\"%s\",\"outDir\":\"%s\",\"soundsRequested\":%d,\"wavesWritten\":%d,")
+		TEXT("\"soundSet\":\"%s\",\"manifest\":%s,\"manifestVerified\":false,\"sounds\":[%s],\"problems\":[%s],")
+		TEXT("\"playInGame\":\"the sound's name is what a script asks for\",")
+		TEXT("\"note\":\"one folder to drop into a server. The wave and the sound set are both gated on the "
+		     "desk; the two data_file lines in the manifest are FiveM convention and are NOT verified - that "
+		     "is what the server row tests, and a silent game should be blamed on them before the format.\"}"),
+		(bManifest && Problems.IsEmpty()) ? TEXT("true") : TEXT("false"),
+		*RudeJsonEscape(SetName), *RudeJsonEscape(Root), Rows.Num(), Written,
+		*RudeJsonEscape(RelPath), bManifest ? TEXT("true") : TEXT("false"), *PerSound, *Problems);
+}
+
 #else
 FString URudeToolset::ExportSoundSet(const FString&, const FString&, const FString&)
+{
+	return TEXT("{\"ok\":false,\"error\":\"editor-only\"}");
+}
+FString URudeToolset::ExportAudioResource(const FString&, const FString&, const FString&)
 {
 	return TEXT("{\"ok\":false,\"error\":\"editor-only\"}");
 }

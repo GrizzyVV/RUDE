@@ -434,6 +434,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Write the sound-definition file that lets the game play sounds you made. Name each one as soundname=container/wave, where the container is your .awc and the wave is the track inside it."))
 	static FString ExportSoundSet(const FString& Sounds, const FString& OutRelPath, const FString& Options);
 
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Pack sounds you made into a ready FiveM resource: the wave files, the sound-definition file and the manifest, in one folder you can drop into a server. Name each one as soundname=<the Sound asset>."))
+	static FString ExportAudioResource(const FString& Sounds, const FString& OutDir, const FString& Options);
+
 	// Import the PCM16 streams of one corpus .awc as USoundWave assets (AwcName = ledger name, e.g. "chicken").
 	// Converted XML: kind="pcm16" .wav sidecars / kind="raw" PCM16 are imported; kind="none" (ROUT --textures
 	// none - the 2026-09-04 corpus), kind="encrypted" and ADPCM streams are counted and skipped. Kept binary:
