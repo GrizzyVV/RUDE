@@ -54,6 +54,7 @@
 #include "Materials/MaterialExpressionAdd.h"
 #include "Materials/MaterialExpressionAppendVector.h"
 #include "Materials/MaterialExpressionComponentMask.h"
+#include "Materials/MaterialExpressionDotProduct.h"      // specMapIntMask selects the spec map's channel
 #include "Materials/MaterialExpressionConstant.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"   // flat-normal blend target for `bumpiness`
 #include "Materials/MaterialExpressionSquareRoot.h"        // specular exponent -> roughness
@@ -156,7 +157,7 @@ static UMaterialInterface* EnsureDecalGeoMaster()
 // RAGE foliage is alpha-tested AND double-sided (leaf cards are single quads). Imported
 // single-sided, every leaf facing away from the light renders near-black (the dark trees
 // on Cayo, 2026-07-25). Two-sided + masked is the correct foliage material.
-static const int32 RudeMasterGraphVersion = 6;   // 6: foliage + terrain gain WIRED bumpiness/spec params and a staleness rule
+static const int32 RudeMasterGraphVersion = 7;   // 7: specMapIntMask picks the spec map channel (was hardcoded red)
 static const TCHAR* RudeMasterGraphVersionParam = TEXT("RudeGraphVersion");
 
 static UMaterialInterface* EnsureFoliageMaster()
@@ -814,8 +815,25 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 			MakeTex(TEXT("Specular"), DefWhite, SAMPLERTYPE_Color, 600);
 		UMaterialExpressionScalarParameter* Int =
 			MakeScalar(TEXT("specularIntensityMult"), 1.f, 640);
+		// ⭐ WHICH CHANNEL OF THE SPEC MAP IS THE INTENSITY? `specMapIntMask` answers it, and RUDE used
+		// to ignore the question and always read RED. Measured over a 700-file draw (1,239 uses):
+		//     (1,0,0,0) 83.2%   red        <- what the hardcoded MaskR happened to get right
+		//     (1,1,1,0)  5.9%   all three
+		//     (0,0,1,0)  5.9%   BLUE       <- read as red: WRONG
+		//     (0,1,0,0)  2.7%   GREEN      <- read as red: WRONG
+		//     (1,1,0,0)  1.4%   red+green
+		// ⇒ the hardcoded channel was wrong on ~16.8% of spec-mapped materials. The values are
+		// exactly a channel-selection DOT PRODUCT, so implementing it as one is a faithful reading of
+		// the parameter rather than a guess: intensity = dot(specMap.rgb, specMapIntMask.rgb).
+		// The result is scalar, so the Specular input no longer needs a component mask at all.
+		UMaterialExpressionVectorParameter* SpecMask = NewObject<UMaterialExpressionVectorParameter>(M);
+		SpecMask->ParameterName = TEXT("specMapIntMask");
+		SpecMask->DefaultValue = FLinearColor(1.f, 0.f, 0.f, 0.f);   // red: the modal case, and the old behaviour
+		Add(SpecMask, -1500, 560);
+		UMaterialExpressionDotProduct* SpecPick = NewObject<UMaterialExpressionDotProduct>(M);
+		SpecPick->A.Expression = S; SpecPick->B.Expression = SpecMask; Add(SpecPick, -840, 600);
 		UMaterialExpressionMultiply* Mul = NewObject<UMaterialExpressionMultiply>(M);
-		Mul->A.Expression = S; Mul->B.Expression = Int; Add(Mul, -700, 600);
+		Mul->A.Expression = SpecPick; Mul->B.Expression = Int; Add(Mul, -700, 600);
 		// ⭐ WIRED as of graph version 4, both of them, for the same reason as `bumpiness`.
 		// `specularFresnel` is the reflectance at normal incidence, which is exactly what UE's
 		// Specular input scales - so it multiplies alongside the intensity rather than needing a
@@ -824,9 +842,8 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 		UMaterialExpressionScalarParameter* Fres = MakeScalar(TEXT("specularFresnel"), 0.97f, 760);
 		UMaterialExpressionMultiply* SpecF = NewObject<UMaterialExpressionMultiply>(M);
 		SpecF->A.Expression = Mul; SpecF->B.Expression = Fres; Add(SpecF, -560, 600);
+		// no component mask: the dot product above already reduced the map to one number
 		EO->Specular.Expression = SpecF;
-		EO->Specular.MaskR = 1; EO->Specular.Mask = 1;
-		EO->Specular.MaskG = 0; EO->Specular.MaskB = 0; EO->Specular.MaskA = 0;
 		// `specularFalloffMult` is a Blinn-Phong specular EXPONENT (modal 100, 105 distinct values
 		// over a 400-file draw), and until now every opaque master left Roughness at UE's flat 0.5 -
 		// so the whole gloss range the game ships was discarded. Standard conversion:
