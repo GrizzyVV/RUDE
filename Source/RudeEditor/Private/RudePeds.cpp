@@ -196,6 +196,8 @@ namespace RudePeds
 		FVector3f N = FVector3f(0, 0, 1);
 		FVector2f UV0 = FVector2f::ZeroVector;
 		FVector2f UV1 = FVector2f::ZeroVector;
+		// RUDE_PEDUV1: the game's own tangent (float4, w = bitangent sign). Zero w = the file carried none.
+		FVector4f Tan = FVector4f(0, 0, 0, 0);
 		FVector4f Col = FVector4f(1, 1, 1, 1);
 		uint16 Bone[4] = { 0, 0, 0, 0 };   // skeleton indices (after the <BoneIDs> remap)
 		float W[4] = { 0, 0, 0, 0 };
@@ -305,6 +307,13 @@ namespace RudePeds
 				else if (Sem == TEXT("Normal")) { Nrm = FVector3f(FCString::Atof(*Toks[Off]), FCString::Atof(*Toks[Off + 1]), FCString::Atof(*Toks[Off + 2])); }
 				else if (Sem == TEXT("TexCoord0")) { SV.UV0 = FVector2f(FCString::Atof(*Toks[Off]), FCString::Atof(*Toks[Off + 1])); }
 				else if (Sem == TEXT("TexCoord1")) { SV.UV1 = FVector2f(FCString::Atof(*Toks[Off]), FCString::Atof(*Toks[Off + 1])); }
+				else if (Sem == TEXT("Tangent"))
+				{
+					// RUDE_PEDUV1: consumed now (v1 recomputed instead, losing the file's own basis). 4 floats;
+					// the mirror and the handedness flip happen where the mesh is built, next to the normal.
+					SV.Tan = FVector4f(FCString::Atof(*Toks[Off]), FCString::Atof(*Toks[Off + 1]),
+					                   FCString::Atof(*Toks[Off + 2]), FCString::Atof(*Toks[Off + 3]));
+				}
 				else if (Sem == TEXT("Colour0"))
 				{
 					SV.Col = FVector4f(FCString::Atof(*Toks[Off]) / 255.f, FCString::Atof(*Toks[Off + 1]) / 255.f,
@@ -316,6 +325,13 @@ namespace RudePeds
 			}
 			SV.P = FVector3f(Pos.X * 100.f, -Pos.Y * 100.f, Pos.Z * 100.f);
 			SV.N = FVector3f(Nrm.X, -Nrm.Y, Nrm.Z);
+			// RUDE_PEDUV1: the tangent rides the SAME Y mirror, and the bitangent sign flips under the reflection
+			// (B = w N x T, det -1): a RAGE w of -1 is a UE +1. A file with no Tangent channel leaves w = 0 here,
+			// and the exporter treats a zero-length tangent as ABSENT rather than writing a zero basis.
+			if (!FVector3f(SV.Tan.X, SV.Tan.Y, SV.Tan.Z).IsNearlyZero())
+			{
+				SV.Tan = FVector4f(SV.Tan.X, -SV.Tan.Y, SV.Tan.Z, SV.Tan.W >= 0.f ? -1.f : 1.f);
+			}
 			// Law 4/5: weight bytes -> 0..1; index -> skeleton position through <BoneIDs> (raw when absent);
 			// an index outside the table or the skeleton is DROPPED AND COUNTED, never clamped.
 			for (int32 k = 0; k < 4; ++k)
@@ -844,7 +860,7 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 		SK->GetImportedModel()->LODModels.Empty();
 		SK->GetImportedModel()->LODModels.Add(new FSkeletalMeshLODModel());
 		Lod.BuildSettings.bRecomputeNormals = false;
-		Lod.BuildSettings.bRecomputeTangents = true;   // no tangents consumed in v1 (5/28 geometries carry them)
+		Lod.BuildSettings.bRecomputeTangents = true;   // RUDE_PEDUV1: the DESCRIPTION now carries the file's own tangent (read on export); UE still recomputes its RENDER basis
 		Lod.BuildSettings.bUseMikkTSpace = true;
 		Lod.LODHysteresis = 0.02f;
 		FMeshDescription* MD = SK->CreateMeshDescription(0);
@@ -861,6 +877,9 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 		}
 		TVertexAttributesRef<FVector3f> VertexPositions = A.GetVertexPositions();
 		TVertexInstanceAttributesRef<FVector3f> InstNormals = A.GetVertexInstanceNormals();
+		// RUDE_PEDUV1: carry the file's own tangent basis instead of throwing it away and recomputing
+		TVertexInstanceAttributesRef<FVector3f> InstTangents = A.GetVertexInstanceTangents();
+		TVertexInstanceAttributesRef<float> InstSigns = A.GetVertexInstanceBinormalSigns();
 		TVertexInstanceAttributesRef<FVector2f> InstUVs = A.GetVertexInstanceUVs();
 		TVertexInstanceAttributesRef<FVector4f> InstColors = A.GetVertexInstanceColors();
 		TPolygonGroupAttributesRef<FName> GroupSlotNames = A.GetPolygonGroupMaterialSlotNames();
@@ -906,6 +925,8 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 					InstNormals[IID] = V.N;
 					InstUVs.Set(IID, 0, V.UV0);
 					InstUVs.Set(IID, 1, V.UV1);
+					InstTangents[IID] = FVector3f(V.Tan.X, V.Tan.Y, V.Tan.Z);   // RUDE_PEDUV1 (zero = the file had none)
+					InstSigns[IID] = V.Tan.W;
 					InstColors[IID] = V.Col;
 					Inst.Add(IID);
 				}
@@ -968,6 +989,9 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 			}
 			TVertexAttributesRef<FVector3f> LodPositions = LodA.GetVertexPositions();
 			TVertexInstanceAttributesRef<FVector3f> LodNormals = LodA.GetVertexInstanceNormals();
+			// RUDE_PEDUV1: Medium/Low carry the basis too - a LOD that loses it exports a different layout to High
+			TVertexInstanceAttributesRef<FVector3f> LodTangents = LodA.GetVertexInstanceTangents();
+			TVertexInstanceAttributesRef<float> LodSigns = LodA.GetVertexInstanceBinormalSigns();
 			TVertexInstanceAttributesRef<FVector2f> LodUVs = LodA.GetVertexInstanceUVs();
 			TVertexInstanceAttributesRef<FVector4f> LodColors = LodA.GetVertexInstanceColors();
 			TPolygonGroupAttributesRef<FName> LodSlotNames = LodA.GetPolygonGroupMaterialSlotNames();
@@ -1012,6 +1036,8 @@ FString URudeToolset::ImportPed(const FString& CorpusRoot, const FString& PedNam
 						LodNormals[LodIID] = LV.N;
 						LodUVs.Set(LodIID, 0, LV.UV0);
 						LodUVs.Set(LodIID, 1, LV.UV1);
+						LodTangents[LodIID] = FVector3f(LV.Tan.X, LV.Tan.Y, LV.Tan.Z);   // RUDE_PEDUV1
+						LodSigns[LodIID] = LV.Tan.W;
 						LodColors[LodIID] = LV.Col;
 						LodInst.Add(LodIID);
 					}

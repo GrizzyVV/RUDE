@@ -4259,12 +4259,36 @@ FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
 		}
 	}
 
+	// ⛔ Same rule for the compile check: it only runs where there is a renderer, and a plain commandlet
+	// has none. Silently skipping it is how "every DETAIL master fails to compile" survived three days
+	// while the doctor said everything was fine (law 52). Say so instead.
+	int32 CompileCheckSkipped = 0;
+	if (MastersCompileFailed < 0)
+	{
+		++CompileCheckSkipped;
+		Note(TEXT("the master materials were NOT COMPILE-CHECKED - this run has no renderer. Re-run with "
+		          "-AllowCommandletRendering (law 31) to find masters that silently fall back to Unreal's "
+		          "default material, which ignores every setting RUDE puts on them"));
+	}
+
 	// ---- the corpus --------------------------------------------------------------------------
 	// The single most common new-user mistake: pointing CorpusRoot at a folder of loose XML instead
 	// of a ledgered filebase. Both are folders; only one has the manifest every lookup goes through.
 	const FString Root = CorpusRoot.TrimStartAndEnd();
 	FString CorpusJson = TEXT("{\"checked\":false}");
-	if (!Root.IsEmpty())
+	int32 ChecksSkipped = 0;
+	if (Root.IsEmpty())
+	{
+		// ⛔ UNCHECKED IS NOT THE SAME AS FINE (2026-09-11). Run with no CorpusRoot, this tool used to
+		// answer `ok:true, problems:0` - to a new user, "nothing is wrong with your setup" - while never
+		// looking at the single thing most likely to BE wrong. That is the laws 49-53 defect wearing a
+		// different hat: an instrument reporting success for work it did not do. A skipped check is now
+		// a PROBLEM, so `ok:true` can only mean "I looked at everything and it is fine".
+		++ChecksSkipped;
+		Note(TEXT("the corpus was NOT CHECKED - no CorpusRoot was given, so this run cannot tell you whether "
+		          "any import will work. Pass your filebase root (the folder holding _FILEBASE.json) to check it"));
+	}
+	else
 	{
 		const bool bDir = FPaths::DirectoryExists(Root);
 		const bool bLedgered = bDir && FRudeCorpus::LooksLikeCorpus(Root);
@@ -4338,7 +4362,7 @@ FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
 		TEXT("\"unparsedMasters\":%d,\"staleMasterNames\":[%s],")
 		TEXT("\"mastersCompileFailed\":%d,\"mastersCompileChecked\":%s,\"instancesAffected\":%d,\"instancesOnMasters\":%d,\"compileFailedMasters\":[%s],")
 		TEXT("\"catalogPath\":\"%s\",\"catalogPresent\":%s,\"catalogEntries\":%d,")
-		TEXT("\"corpus\":%s,\"headless\":%s,\"unattended\":%s,\"editorWorld\":%s}"),
+		TEXT("\"corpus\":%s,\"checksSkipped\":%d,\"headless\":%s,\"unattended\":%s,\"editorWorld\":%s}"),
 		Problems.Num() == 0 ? TEXT("true") : TEXT("false"), Problems.Num(), *ProblemJson,
 		*RudeJsonEscape(EngineText), bEngineExpected ? TEXT("true") : TEXT("false"),
 		*PluginJson, EnabledPlugins,
@@ -4346,6 +4370,6 @@ FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
 		MastersUnparsed, *StaleNames,
 		MastersCompileFailed, MastersCompileFailed >= 0 ? TEXT("true") : TEXT("false"), InstancesAffected, InstancesOnMasters, *CompileFailedNames,
 		*RudeJsonEscape(CatalogPath), bCatalog ? TEXT("true") : TEXT("false"), CatalogEntries,
-		*CorpusJson, bSlate ? TEXT("false") : TEXT("true"),
+		*CorpusJson, ChecksSkipped + CompileCheckSkipped, bSlate ? TEXT("false") : TEXT("true"),
 		FApp::IsUnattended() ? TEXT("true") : TEXT("false"), bWorld ? TEXT("true") : TEXT("false"));
 }

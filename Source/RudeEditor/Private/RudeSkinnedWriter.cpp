@@ -100,12 +100,35 @@ namespace RudeYdd
 	static const int32 kPedAlloc = (16 * (kPedNPar + kPedNVec) + 4 * kPedNPar + 32 + 15) & ~15; // 432, measured 3/3
 	// skinned GTAV1 layout: Position(0) BlendWeights(1) BlendIndices(2) Normal(3) Colour0(4) Colour1(5) TexCoord0(6)
 	static const uint32 kSkinMask = 0x7F; static const int32 kSkinStride = 48; static const uint8 kSkinChans = 7;
+	// RUDE_PEDUV1: the two RICHER skinned layouts the game itself ships. Census over 12 real component-ped
+	// dictionaries (componentpeds_a_m_m), 251 <Layout> blocks: 157 (62.5%) plain (the mask above),
+	// 74 (29.5%) + TexCoord1 + Tangent, 20 (8.0%) + Tangent alone - so 94/251 (37.5%) of real ped geometry
+	// carries more than mask 0x7F, and writing everything plain DROPS a second UV set and the tangent.
+	// 0/251 carry TexCoord1 WITHOUT Tangent, so UV1 implies Tangent here and the writer enforces that.
+	// Channel sizes come from the SAME GTAV1 nibble word already proven on the rigid prop path
+	// (bit 7 = nibble 5 = float2, bit 14 = nibble 7 = float4); the declaration self-check re-derives the
+	// stride from the mask before the file is written, so a wrong constant here cannot ship.
+	//   0x40FF: +0 pos f3 |+12 bw |+16 bi |+20 nrm f3 |+32 c0 |+36 c1 |+40 uv0 f2 |+48 uv1 f2 |+56 tan f4 = 72
+	//   0x407F: +0 pos f3 |+12 bw |+16 bi |+20 nrm f3 |+32 c0 |+36 c1 |+40 uv0 f2 |+48 tan f4             = 64
+	static const uint32 kSkinUv1TanMask = 0x40FF; static const int32 kSkinUv1TanStride = 72;
+	static const uint32 kSkinTanMask    = 0x407F; static const int32 kSkinTanStride    = 64;
+	// the fvf +0x07 byte is the channel COUNT - popcount of the mask (7 on BOTH proven layouts, 0x7F and 0x40F9)
+	static constexpr uint8 RudeChanCount(uint32 Mask)
+	{
+		uint8 N = 0;
+		for (int32 b = 0; b < 16; ++b) { if ((Mask >> b) & 1u) { ++N; } }
+		return N;
+	}
 	// RUDE_PEDPROPS_BEGIN templates
 	// ---- ped props (WP11, maintainer lane `pedprops` (`LAWS.md`)): the RIGID entry and the `ped_alpha` template ----
 	// The game's prop layout: Position(0) Normal(3) Colour0(4) Colour1(5) TexCoord0(6) TexCoord1(7) Tangent(14) ->
 	// mask 0x40F9, stride 64, 7 channels (2,674/2,677 prop geometries over 709 peds). The fvf nibble word is the same
 	// GTAV1 constant (channel 14 = type 7 = float4). Bytes: +0 pos | +12 nrm | +24 c0 | +28 c1 | +32 uv0 | +40 uv1 | +48 tan.
 	static const uint32 kRigidMask = 0x40F9; static const int32 kRigidStride = 64; static const uint8 kRigidChans = 7;
+	// the popcount rule is not asserted by hand - it is CHECKED against the two layouts that have already
+	// shipped and loaded in the game, at compile time. If either constant is ever edited wrongly, this fails.
+	static_assert(RudeChanCount(kSkinMask) == kSkinChans, "skinned channel count must be the mask popcount");
+	static_assert(RudeChanCount(kRigidMask) == kRigidChans, "rigid channel count must be the mask popcount");
 	// `ped_alpha` (bucket 1; the lens of every 2-geometry prop, 932/2,672 prop shaders; FileName ped_alpha.sps 8/8):
 	// 12 params, 4 samplers - no VolumeSampler, Bump/Spec on registers 5/6 (registers verbatim from the game's files),
 	// the same 8 vec4s on 187..180. Vector VALUES vary per file (a_m_m_business_01 p_eyes_000 shown): per-shader
@@ -142,9 +165,25 @@ namespace RudeYdd
 	{
 		FString Slot, Diffuse, Normal, Spec, Mat;   // Mat = the material the slot resolved to (measurement)
 		FString Preset; bool bRigid = false;        // RUDE_PEDPROPS: the slot's shader preset (ped / ped_alpha); rigid = no skin
+		// RUDE_PEDUV1: which SKINNED layout this geometry writes. Decided from the SOURCE, not from a preference:
+		// bUv1 = the mesh description actually has a second UV channel; bTan = that, or the slot is normal-mapped
+		// (a tangent is the thing a normal map needs). Both false = the proven mask 0x7F / stride 48.
+		bool bUv1 = false, bTan = false;
 		TArray<FYddVert> V; TArray<int32> Idx;
 		FVector3f Mn = FVector3f(FLT_MAX), Mx = FVector3f(-FLT_MAX);
 	};
+	// RUDE_PEDUV1: ONE place decides a geometry's vertex format. The page plan and the packer MUST agree, and
+	// on the first run of the widening gate they did not - sizing kept the old skinned stride while the packer
+	// wrote the wider one, and the no-span law refused the file. Lift, never duplicate: this is the exact shape
+	// that rule exists to prevent, and it cost a gate run to prove the rule still earns its keep.
+	static uint32 RudeGeoMask(const FGeo& G)
+	{
+		return G.bRigid ? kRigidMask : G.bUv1 ? kSkinUv1TanMask : G.bTan ? kSkinTanMask : kSkinMask;
+	}
+	static int32 RudeGeoStride(const FGeo& G)
+	{
+		return G.bRigid ? kRigidStride : G.bUv1 ? kSkinUv1TanStride : G.bTan ? kSkinTanStride : kSkinStride;
+	}
 	struct FDrawable
 	{
 		FString Name, Asset; uint32 Hash = 0;
@@ -161,6 +200,10 @@ namespace RudeYdd
 		uint32 U98 = 0x00120000u;                                // +0x98, chosen by GROUP COUNT (law 8) and reported in the verdict
 		FVector3f Mn = FVector3f(FLT_MAX), Mx = FVector3f(-FLT_MAX);
 		int32 SrcVerts = 0, InflUnmapped = 0, InflTruncated = 0, Rebound = 0, BonesUnmapped = 0, Uv1Dropped = 0, TexMissing = 0, MaxRig = -1;
+		// RUDE_PEDUV1: the conservation counters for the richer layouts - geometries written in each of the three
+		// skinned forms, and how many second-UV vertices actually reached the file instead of being dropped.
+		int32 GeosSkinPlain = 0, GeosSkinTan = 0, GeosSkinUv1Tan = 0, Uv1Carried = 0, TangentsWritten = 0;
+		int32 TangentsSynthesised = 0, TangentsCarried = 0;
 		bool bRigid = false; int32 ShaderSubstituted = 0;   // RUDE_PEDPROPS
 	};
 
@@ -372,6 +415,10 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 			TVertexInstanceAttributesConstRef<FVector3f> InstNormals = A.GetVertexInstanceNormals();
 			TVertexInstanceAttributesConstRef<FVector2f> InstUVs = A.GetVertexInstanceUVs();
 			TVertexInstanceAttributesConstRef<FVector4f> InstColors = A.GetVertexInstanceColors();
+			// RUDE_PEDUV1: a skeletal mesh description carries tangents like a static one (FSkeletalMeshConstAttributes
+			// derives from the static set) - they were simply never read on this path.
+			TVertexInstanceAttributesConstRef<FVector3f> InstTangents = A.GetVertexInstanceTangents();
+			TVertexInstanceAttributesConstRef<float> InstSigns = A.GetVertexInstanceBinormalSigns();
 			TPolygonGroupAttributesConstRef<FName> GroupSlots = A.GetPolygonGroupMaterialSlotNames();
 			FSkinWeightsVertexAttributesConstRef SkinWeights = A.GetVertexSkinWeights();
 			const int32 NumUV = InstUVs.GetNumChannels();
@@ -463,6 +510,32 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 						G.Diffuse = TexName(TEXT("Diffuse")); G.Normal = TexName(TEXT("Normal")); G.Spec = TexName(TEXT("Specular"));
 					}
 				}
+				// RUDE_PEDUV1: pick this geometry's layout from what the SOURCE carries, BEFORE welding - the weld key must
+				// include every channel that will reach the file, or two instances differing only in UV1 or in tangent
+				// handedness collapse into one and the extra channel is silently averaged away (the law-56 shape again).
+				// Choose this geometry's layout from what the SOURCE actually HOLDS - not from what its material could use.
+				// An all-zero second UV channel is not a second UV set (UE hands one out freely), and a normal-mapped slot
+				// whose description carries no tangent basis is not a tangent: declaring either would cost bytes a vertex to
+				// store nothing. This is also what keeps LODs on the game's own shape - the measured ped law is mask 0x7f on
+				// 1,980/1,984 Medium and 1,573/1,579 Low geometries, and those LOD blocks ship no tangent for us to carry.
+				// The one derivation allowed is below: UV1 present but no basis, because 0/251 game blocks carry UV1 alone.
+				bool bSrcUv1 = false, bSrcTan = false;
+				for (const FPolygonID PID : MD->GetPolygonGroupPolygonIDs(GroupID))
+				{
+					for (const FTriangleID TID : MD->GetPolygonTriangles(PID))
+					{
+						for (const FVertexInstanceID VI : MD->GetTriangleVertexInstances(TID))
+						{
+							if (NumUV > 1 && !bSrcUv1 && !InstUVs.Get(VI, 1).IsZero()) { bSrcUv1 = true; }
+							if (!bSrcTan && !InstTangents[VI].IsNearlyZero()) { bSrcTan = true; }
+							if (bSrcUv1 && bSrcTan) { break; }
+						}
+						if (bSrcUv1 && bSrcTan) { break; }
+					}
+					if (bSrcUv1 && bSrcTan) { break; }
+				}
+				G.bUv1 = bSrcUv1;
+				G.bTan = bSrcUv1 || bSrcTan;
 				TMap<FString, int32> Weld;
 				for (const FPolygonID PolyID : MD->GetPolygonGroupPolygonIDs(GroupID))
 				{
@@ -475,9 +548,15 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 							const FVector3f N = InstNormals[Inst];
 							const FVector2f UV = InstUVs.Get(Inst, 0);
 							const FVector4f C = InstColors[Inst];
-							if (NumUV > 1 && !InstUVs.Get(Inst, 1).IsZero()) { ++D.Uv1Dropped; }
-							const FString Key = FString::Printf(TEXT("%d|%.3f,%.3f,%.3f|%.4f,%.4f|%.3f,%.3f,%.3f,%.3f"),
-								VID.GetValue(), N.X, N.Y, N.Z, UV.X, UV.Y, C.X, C.Y, C.Z, C.W);
+							const FVector2f UV1 = G.bUv1 ? InstUVs.Get(Inst, 1) : FVector2f::ZeroVector;
+							const FVector3f Tn = InstTangents[Inst];
+							const float Sg = InstSigns[Inst];
+							// only a SECOND UV set the chosen layout cannot hold is a drop; carried ones are counted at pack time
+							if (NumUV > 1 && !G.bUv1 && !InstUVs.Get(Inst, 1).IsZero()) { ++D.Uv1Dropped; }
+							const FString Key = FString::Printf(TEXT("%d|%.3f,%.3f,%.3f|%.4f,%.4f|%.3f,%.3f,%.3f,%.3f|%.4f,%.4f|%.3f,%.3f,%.3f,%.1f"),
+								VID.GetValue(), N.X, N.Y, N.Z, UV.X, UV.Y, C.X, C.Y, C.Z, C.W,
+								G.bUv1 ? UV1.X : 0.f, G.bUv1 ? UV1.Y : 0.f,
+								G.bTan ? Tn.X : 0.f, G.bTan ? Tn.Y : 0.f, G.bTan ? Tn.Z : 0.f, G.bTan ? Sg : 0.f);
 							int32 Index;
 							if (const int32* Found = Weld.Find(Key)) { Index = *Found; }
 							else
@@ -487,6 +566,10 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 								V.P = FVector3f(P.X / 100.f, -P.Y / 100.f, P.Z / 100.f);
 								V.N = FVector3f(N.X, -N.Y, N.Z);
 								V.UV = UV;
+								// RUDE_PEDUV1: the richer channels, under the SAME mirror the rigid path proved - the bitangent sign flips
+								// under the reflection (B = w N x T, det -1), so a UE +1 is a RAGE -1. Zero when the layout has no room.
+								V.UV1 = G.bUv1 ? UV1 : FVector2f::ZeroVector;
+								V.T = G.bTan ? FVector4f(Tn.X, -Tn.Y, Tn.Z, Sg >= 0.f ? -1.f : 1.f) : FVector4f(1.f, 0.f, 0.f, 1.f);
 								V.C[0] = Byte01(C.X); V.C[1] = Byte01(C.Y); V.C[2] = Byte01(C.Z); V.C[3] = Byte01(C.W);
 								V.S = SkinOf(VID);
 								Index = G.V.Num();
@@ -502,6 +585,50 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 				{
 					if (G.V.Num() > 65535) { return Fail(FString::Printf(TEXT("%s/%s: geometry exceeds 65535 vertices (u16 indices) - split the mesh"), *D.Asset, *G.Slot)); }
 					D.Mn = D.Mn.ComponentMin(G.Mn); D.Mx = D.Mx.ComponentMax(G.Mx);
+					// RUDE_PEDUV1: a DECLARED tangent channel must be FILLED. The game's own ped files carry a tangent wherever
+					// they carry a second UV set (74/251 both, 20/251 tangent only, 0/251 UV1 without one), so a geometry that
+					// reaches here with UV1 but no basis - a user mesh whose description never had one - gets the standard
+					// per-triangle derivation from positions and UV0 rather than a channel full of zeros. It is COUNTED as
+					// synthesised, because a derived basis is not the file's own and the distinction has to survive the verdict.
+					if (G.bTan)
+					{
+						bool bHaveBasis = false;
+						for (const FYddVert& X : G.V) { if (!FVector3f(X.T.X, X.T.Y, X.T.Z).IsNearlyZero()) { bHaveBasis = true; break; } }
+						if (bHaveBasis) { D.TangentsCarried += G.V.Num(); }
+						else
+						{
+							TArray<FVector3f> Tan, Bit;
+							Tan.SetNumZeroed(G.V.Num()); Bit.SetNumZeroed(G.V.Num());
+							for (int32 t = 0; t + 2 < G.Idx.Num(); t += 3)
+							{
+								const int32 a0 = G.Idx[t], a1 = G.Idx[t + 1], a2 = G.Idx[t + 2];
+								const FVector3f e1 = G.V[a1].P - G.V[a0].P, e2 = G.V[a2].P - G.V[a0].P;
+								const FVector2f d1 = G.V[a1].UV - G.V[a0].UV, d2 = G.V[a2].UV - G.V[a0].UV;
+								const float Det = d1.X * d2.Y - d2.X * d1.Y;
+								if (FMath::IsNearlyZero(Det)) { continue; }   // a degenerate UV triangle contributes nothing
+								const float r = 1.f / Det;
+								const FVector3f Tt = (e1 * d2.Y - e2 * d1.Y) * r;
+								const FVector3f Bt = (e2 * d1.X - e1 * d2.X) * r;
+								Tan[a0] += Tt; Tan[a1] += Tt; Tan[a2] += Tt;
+								Bit[a0] += Bt; Bit[a1] += Bt; Bit[a2] += Bt;
+							}
+							for (int32 v = 0; v < G.V.Num(); ++v)
+							{
+								const FVector3f N3 = G.V[v].N.GetSafeNormal();
+								FVector3f T3 = (Tan[v] - N3 * FVector3f::DotProduct(N3, Tan[v])).GetSafeNormal();
+								if (T3.IsNearlyZero()) { T3 = FMath::Abs(N3.Z) < 0.9f ? FVector3f(0, 0, 1) : FVector3f(1, 0, 0); T3 = (T3 - N3 * FVector3f::DotProduct(N3, T3)).GetSafeNormal(); }
+								const float W = FVector3f::DotProduct(FVector3f::CrossProduct(N3, T3), Bit[v]) < 0.f ? -1.f : 1.f;
+								G.V[v].T = FVector4f(T3.X, T3.Y, T3.Z, W);
+							}
+							D.TangentsSynthesised += G.V.Num();
+						}
+					}
+					// RUDE_PEDUV1: the conservation counters for the three skinned forms - which layout this geometry got, and
+					// how many vertices actually carried a second UV / a tangent into the file instead of losing them.
+					if (G.bUv1) { ++D.GeosSkinUv1Tan; D.Uv1Carried += G.V.Num(); }
+					else if (G.bTan) { ++D.GeosSkinTan; }
+					else { ++D.GeosSkinPlain; }
+					if (G.bTan) { D.TangentsWritten += G.V.Num(); }
 					(Lod == 0 ? D.Geos : D.LodGeos[Lod - 1]).Add(MoveTemp(G));   // RUDE_PEDLOD: High -> Geos, Medium/Low -> LodGeos
 				}
 			}
@@ -529,7 +656,7 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 		{
 			for (const FGeo& G : (lg < 0 ? D.Geos : D.LodGeos[lg]))
 			{
-				Largest = FMath::Max(Largest, (uint32)G.V.Num() * (uint32)(G.bRigid ? kRigidStride : kSkinStride));   // RUDE_PEDPROPS: per-entry stride
+				Largest = FMath::Max(Largest, (uint32)G.V.Num() * (uint32)RudeGeoStride(G));   // RUDE_PEDUV1: the SAME stride the packer will write
 				Largest = FMath::Max(Largest, (uint32)G.Idx.Num() * 2u);
 			}
 		}
@@ -602,7 +729,9 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 				const FGeo& G = GG[gi];
 				// RUDE_PEDPROPS: a rigid entry writes the game's own prop layout (mask 0x40F9, stride 64, 2,674/2,677 measured):
 				// +0 pos f3 | +12 normal f3 | +24 Colour0 u8x4 | +28 Colour1 u8x4 (0) | +32 uv0 f2 | +40 uv1 f2 | +48 tangent f4
-				const int32 Stride = G.bRigid ? kRigidStride : kSkinStride;
+				// RUDE_PEDUV1: three skinned forms now, chosen per geometry from the source (see kSkinUv1Tan*).
+				const uint32 GMask = RudeGeoMask(G);
+				const int32 Stride = RudeGeoStride(G);
 				TArray<uint8> VD; VD.SetNumZeroed(G.V.Num() * Stride);
 				for (int32 v = 0; v < G.V.Num(); ++v)
 				{
@@ -622,6 +751,13 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 					PVEC3(VD, o + 20, X.N);
 					for (int32 k = 0; k < 4; ++k) { VD[o + 32 + k] = X.C[k]; VD[o + 36 + k] = 0; }   // Colour1 = 0 (17/18 measured)
 					PF32(VD, o + 40, X.UV.X); PF32(VD, o + 44, X.UV.Y);
+					// RUDE_PEDUV1: TexCoord1 then Tangent, in ascending fvf-bit order - tangent slides to +48 when UV1 is absent
+					if (G.bUv1) { PF32(VD, o + 48, X.UV1.X); PF32(VD, o + 52, X.UV1.Y); }
+					if (G.bTan)
+					{
+						const int32 t = G.bUv1 ? o + 56 : o + 48;
+						PF32(VD, t + 0, X.T.X); PF32(VD, t + 4, X.T.Y); PF32(VD, t + 8, X.T.Z); PF32(VD, t + 12, X.T.W);
+					}
 				}
 				const int32 OV = Emit(VD);
 				TArray<uint8> ID; ID.SetNumZeroed(G.Idx.Num() * 2);
@@ -637,7 +773,7 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 					OBid = Emit(Bid);
 				}
 				TArray<uint8> Fvf; Fvf.AddZeroed(0x10);                              // own fvf per geometry (crash #6)
-				PU32(Fvf, 0x00, G.bRigid ? kRigidMask : kSkinMask); PU16(Fvf, 0x04, (uint16)Stride); Fvf[0x07] = G.bRigid ? kRigidChans : kSkinChans;   // RUDE_PEDPROPS
+				PU32(Fvf, 0x00, GMask); PU16(Fvf, 0x04, (uint16)Stride); Fvf[0x07] = RudeChanCount(GMask);   // RUDE_PEDUV1 (was RUDE_PEDPROPS)
 				PU32(Fvf, 0x08, 0x55996996u); PU32(Fvf, 0x0c, 0x77555555u);
 				const int32 OFvf = Emit(Fvf);
 				TArray<uint8> Vb; Vb.AddZeroed(0x80);
@@ -950,12 +1086,17 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 		DJson += FString::Printf(
 			TEXT("%s{\"name\":\"%s\",\"hash\":\"0x%08x\",\"asset\":\"%s\",\"geometries\":%d,\"vertices\":%d,\"sourceVertices\":%d,\"triangles\":%d,")
 			TEXT("\"bonesReferenced\":%d,\"meshBonesUnmapped\":%d,\"influencesUnmapped\":%d,\"influencesTruncated\":%d,\"verticesRebound\":%d,")
-			TEXT("\"uv1Dropped\":%d,\"texturesMissing\":%d,\"rigid\":%s,\"shaderSubstituted\":%d,")
+			TEXT("\"uv1Dropped\":%d,\"uv1Carried\":%d,\"tangentsWritten\":%d,\"tangentsCarried\":%d,\"tangentsSynthesised\":%d,")
+			TEXT("\"skinLayouts\":{\"plain0x7f\":%d,\"tangent0x407f\":%d,\"uv1tangent0x40ff\":%d},")   // RUDE_PEDUV1
+			TEXT("\"texturesMissing\":%d,\"rigid\":%s,\"shaderSubstituted\":%d,")
 			TEXT("\"lodGroups\":%d,\"lodVertices\":[%d,%d,%d],\"lodTriangles\":[%d,%d,%d],\"lodGeometries\":[%d,%d,%d],")   // RUDE_PEDLOD
 			TEXT("\"lodShaderSubstituted\":%d,\"lodsSkipped\":%d,\"lodDist\":[%g,%g,%g,%g],\"lodDistCarried\":%s,")
 			TEXT("\"u98\":\"0x%08x\",\"u98Basis\":\"%s\",\"textures\":[%s]}"),
 			DJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(D.Name), D.Hash, *RudeJsonEscape(D.Asset), D.Geos.Num(), DV, D.SrcVerts, DT,
-			D.MaxRig + 1, D.BonesUnmapped, D.InflUnmapped, D.InflTruncated, D.Rebound, D.Uv1Dropped, D.TexMissing, D.bRigid ? TEXT("true") : TEXT("false"), D.ShaderSubstituted,
+			D.MaxRig + 1, D.BonesUnmapped, D.InflUnmapped, D.InflTruncated, D.Rebound,
+			D.Uv1Dropped, D.Uv1Carried, D.TangentsWritten, D.TangentsCarried, D.TangentsSynthesised,
+			D.GeosSkinPlain, D.GeosSkinTan, D.GeosSkinUv1Tan,   // RUDE_PEDUV1
+			D.TexMissing, D.bRigid ? TEXT("true") : TEXT("false"), D.ShaderSubstituted,
 			LodGroups, LodV[0], LodV[1], LodV[2], LodT[0], LodT[1], LodT[2], LodG[0], LodG[1], LodG[2],
 			D.LodShaderSubstituted, D.LodsSkipped, D.LodDist[0], D.LodDist[1], D.LodDist[2], D.LodDist[3], D.bLodDistCarried ? TEXT("true") : TEXT("false"),
 			D.U98, U98Basis, *Tex);   // RUDE_PEDLOD
@@ -963,7 +1104,7 @@ FString URudeToolset::ExportYddBinary(const FString& SkeletalMeshAssetPaths, con
 	return FString::Printf(
 		TEXT("{\"ok\":true,\"yddPath\":\"%s\",\"entries\":%d,\"rigidEntries\":%d,\"drawables\":[%s],\"geometries\":%d,\"vertices\":%d,\"triangles\":%d,")
 		TEXT("\"geometriesAllLods\":%d,\"verticesAllLods\":%d,\"trianglesAllLods\":%d,\"lodDistCarried\":%d,\"lodDistMalformed\":%d,")   // RUDE_PEDLOD: the three above stay HIGH-only
-		TEXT("\"rigBones\":%d,\"rig\":\"%s\",\"layout\":\"skinned: mask 0x7f stride 48 (Position BlendWeights BlendIndices Normal Colour0 Colour1 TexCoord0); rigid: mask 0x40f9 stride 64 (Position Normal Colour0 Colour1 TexCoord0 TexCoord1 Tangent)\",")
+		TEXT("\"rigBones\":%d,\"rig\":\"%s\",\"layout\":\"skinned, chosen per geometry from the source: mask 0x7f stride 48 (Position BlendWeights BlendIndices Normal Colour0 Colour1 TexCoord0) | mask 0x407f stride 64 (+Tangent) | mask 0x40ff stride 72 (+TexCoord1 +Tangent); rigid: mask 0x40f9 stride 64 (Position Normal Colour0 Colour1 TexCoord0 TexCoord1 Tangent)\",")
 		TEXT("\"shader\":\"ped (13 params, alloc %d, hashOfs %d)\",\"bytes\":%d,\"segSize\":%d,\"page\":%d,\"pages\":%u,\"sysFlags\":\"0x%08x\",")
 		TEXT("\"selfCheck\":\"passed (dictionary-wide single ownership + geoBounds/count + declarations)\",")
 		TEXT("\"note\":\"the game also needs the matching .ytd (ExportYtdBinary / ExportMeshTextures) and a ped variation (ymt) row for the drawable index; in-game load unverified\"}"),

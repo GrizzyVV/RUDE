@@ -29,6 +29,9 @@ public class RudeEditor : ModuleRules
 			// GMaxRHIShaderPlatform: RegenerateMasters asks each generated master whether it actually
 			// COMPILED (law 52) - a material that fails compiles to the DEFAULT material in silence.
 			"RHI",
+			// FlushRenderingCommands: ProbeMaterial has to know the clear and the draw actually reached
+			// the RHI before it reads the target back, or it measures a surface nobody wrote to.
+			"RenderCore",
 			"MeshDescription",
 			"StaticMeshDescription",
 			"MeshReductionInterface",

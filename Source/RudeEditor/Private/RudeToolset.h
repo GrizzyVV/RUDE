@@ -290,7 +290,7 @@ public:
 	// quad - no mesh, no mesh UVs, no lighting, no post-processing. Values CAN exceed 1 (that is the
 	// point: RGBA16f, unclamped). It answers questions about the material's own output, not about how
 	// the model looks. Needs -AllowCommandletRendering in a commandlet (law 31) and says so if absent.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Measure a material's actual output as numbers rather than a picture: draws it to a float buffer and reports min/max/mean per channel.", RudeAudience="agent"))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Measure a material's EMISSIVE output as numbers rather than a picture: draws it to a float buffer and reports min/max/mean per channel. Editor only. A material whose colour lives in Base Colour reads zero here - that is correct, not a fault.", RudeAudience="agent"))
 	static FString ProbeMaterial(const FString& AssetPath, const FString& Size,
 	                             const FString& OutJson, const FString& SettleSeconds);
 
@@ -304,7 +304,7 @@ public:
 	// ⛔ A donor with a non-empty GRAPHICS segment is refused BY NAME - the kept header would declare
 	// a segment the stream no longer holds.
 	// Gate: `expect=identical` on a no-op must be BYTE-IDENTICAL. Anything less proves nothing.
-	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Repack a GTA V archetype or scenario binary from the game's own file, so the game gets a binary rather than XML.", RudeAudience="agent"))
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Repack a GTA V archetype or scenario binary from the game's own file, so the game gets a binary rather than XML. Can also rename it (hash=old:new) or change a number in place, but only where you say what the old value was - a wrong offset is refused, never written.", RudeAudience="agent"))
 	static FString PackMetaBinary(const FString& TemplateBinPath, const FString& OutBinPath, const FString& Options);
 
 	// Scenario region export (WP10): the point actors ImportScenarioRegion placed go back to their
@@ -1530,6 +1530,19 @@ public:
 	// Returns JSON: {ok, actor, sizeM, zM}.
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Add a flat ocean surface at sea level so you can see where the water sits. A visual guide only, not game data."))
 	static FString SpawnSeaLevel(const FString& SizeMetres, const FString& ZMetres);
+
+	// ---- the WATER lane (2026-09-11) ----------------------------------------------------------
+	// The game's real water table (common.rpf/data/levels/gta5/water.xml: 504 water + 542 calming +
+	// 116 wave quads, counted) in as movable markers, and back out as a SPLICE of the same file.
+	// AddWaterPlane above is a visual guide and stays one; these two are game data.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Bring the game's water in as markers you can move: every water, calming and wave quad. Leave the filter empty for all, or name the kinds you want."))
+	static FString ImportWater(const FString& CorpusRoot, const FString& Filter);
+
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save the water quads you moved back out as the game's water file. Quads you did not touch go back exactly as they came in, and a quad missing from your level is kept, never deleted."))
+	static FString ExportWater(const FString& CorpusRoot, const FString& OutDir, const FString& Options);
+
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one water quad by x,y,z centimetres. Name it by its kind (water, calming or wave) and its number in the water file.", RudeAudience="agent"))
+	static FString MoveWaterQuad(const FString& Kind, const FString& Index, const FString& DeltaCm);
 
 	// Position the level-editor perspective viewport and capture a screenshot -
 	// the agent-vision primitive (verify imports/materials without human eyes at

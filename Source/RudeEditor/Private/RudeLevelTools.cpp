@@ -7,7 +7,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/ARFilter.h"
 #include "AssetCompilingManager.h"
-#include "FileHelpers.h"
+#include "FileHelpers.h"   // FEditorFileUtils + UEditorLoadingAndSavingUtils (RUDE_WPTAKEOVER loads the existing level)
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
 #include "Materials/Material.h"
@@ -997,17 +997,93 @@ static bool RudeProbeMaterialNow(UMaterialInterface* Mat, int32 N, FString& Out)
 	if (GShaderCompilingManager) { GShaderCompilingManager->FinishAllCompilation(); }
 	IStreamingManager::Get().StreamAllResources(0.0f);
 
-	UTextureRenderTarget2D* RT = UKismetRenderingLibrary::CreateRenderTarget2D(
-		World, N, N, RTF_RGBA16f, FLinearColor::Black, /*bAutoGenerateMipMaps*/ false);
-	if (!RT) { Out = TEXT("could not create a render target"); return false; }
-	UKismetRenderingLibrary::DrawMaterialToRenderTarget(World, RT, Mat);
+	// ---- MAKING THE FAILURE TELL US WHICH HALF BROKE (law 53, 2026-09-11) ------------------------
+	// The tool reported "every pixel is 0" and that reading was USELESS, because three different
+	// things produce it and it could not tell them apart: the draw never happened, the readback
+	// returned a surface nobody drew into, or the material really is black. The target was cleared to
+	// BLACK, so an undrawn target and a black material were byte-identical. Same defect family as
+	// laws 49-53 - an instrument whose failure looks exactly like a legitimate result.
+	// ⚠ I first "fixed" this by granting MATUSAGE_UI, on the theory that a canvas draw needs it. That
+	// was wrong twice over: UE 5.8 has no MATUSAGE_UI at all (it is gone from EMaterialUsage), and
+	// reading `DrawMaterialToRenderTarget` shows it performs NO usage check. Recorded because the
+	// plausible-sounding cause is what a guess is made of.
+	// So: clear to a SENTINEL no material can output (negative channels). The readback now separates
+	//   all sentinel  -> the draw was skipped; the canvas path did nothing
+	//   all zero      -> something drew, or handed us, a surface that is not the one we cleared
+	//   real values   -> a measurement
+	// A black material is now distinguishable from a failure, which is the whole point.
+	static const FLinearColor Sentinel(-1.f, -2.f, -3.f, -4.f);
 
+	UTextureRenderTarget2D* RT = UKismetRenderingLibrary::CreateRenderTarget2D(
+		World, N, N, RTF_RGBA16f, Sentinel, /*bAutoGenerateMipMaps*/ false);
+	if (!RT) { Out = TEXT("could not create a render target"); return false; }
 	FTextureRenderTargetResource* Res = RT->GameThread_GetRenderTargetResource();
 	if (!Res) { Out = TEXT("render target has no resource"); return false; }
-	TArray<FLinearColor> Pixels;
-	if (!Res->ReadLinearColorPixels(Pixels) || Pixels.Num() == 0)
+	UKismetRenderingLibrary::ClearRenderTarget2D(World, RT, Sentinel);
+	FlushRenderingCommands();
+
+	// ---- THE DECISIVE EXPERIMENT: read the CLEAR back, before anything is drawn ------------------
+	// Switching the read to the float path did not change the answer - still all zeros, still not the
+	// sentinel - which rules out "wrong read API" and asks a sharper question: is this render target
+	// LIVE IN THIS PROCESS AT ALL? A clear is the simplest possible write. If the sentinel does not
+	// survive a clear plus a flush, then nothing about the draw, the material or the read API matters,
+	// and every previous theory (usage flags, shader compilation, settle time) was aimed at the wrong
+	// half. Three attempts at this tool were spent theorising about the draw; one control answers it.
+	FString ClearProbe;
 	{
-		Out = TEXT("could not read the render target back");
+		TArray<FFloat16Color> Half;
+		if (Res->ReadFloat16Pixels(Half) && Half.Num() > 0)
+		{
+			const FFloat16Color& C = Half[0];
+			ClearProbe = FString::Printf(TEXT("after clear+flush, pixel 0 = (%g,%g,%g,%g)"),
+				(float)C.R, (float)C.G, (float)C.B, (float)C.A);
+		}
+		else { ClearProbe = TEXT("after clear+flush, the target could not be read at all"); }
+	}
+	UE_LOG(LogTemp, Display, TEXT("[RUDE] ProbeMaterial control: %s"), *ClearProbe);
+
+	// the engine's own comment on this call says it ensures shaders are ready so it does not silently
+	// fall back to the default material - which is another way this could have read as "not our graph"
+	Mat->EnsureIsComplete();
+	UKismetRenderingLibrary::DrawMaterialToRenderTarget(World, RT, Mat);
+	FlushRenderingCommands();
+
+
+	// ---- THE READBACK IS THE HALF THAT WAS BROKEN (law 53, found 2026-09-11) ---------------------
+	// With the sentinel clear in place the tool finally said WHICH half failed, and it was not the
+	// draw: all 4,096 pixels came back exactly 0 rather than the sentinel, i.e. we were handed a
+	// surface that is not the one that was cleared and drawn into. The cause is the read API, not the
+	// renderer - `ReadLinearColorPixels` defaults to `FReadSurfaceDataFlags(RCM_MinMax)` and goes down
+	// the generic surface-read path; on an RGBA16f target the FLOAT read is `ReadFloat16Pixels`, which
+	// is what the engine itself uses for half-float targets. So read half-floats and widen them here.
+	// `ReadLinearColorPixels` is kept as a FALLBACK and the verdict REPORTS which path produced the
+	// numbers, because "it worked" is not a result if you cannot say how it was obtained.
+	TArray<FLinearColor> Pixels;
+	const TCHAR* ReadPath = TEXT("ReadFloat16Pixels");
+	{
+		TArray<FFloat16Color> Half;
+		if (Res->ReadFloat16Pixels(Half) && Half.Num() > 0)
+		{
+			Pixels.Reserve(Half.Num());
+			for (const FFloat16Color& H : Half)
+			{
+				Pixels.Add(FLinearColor((float)H.R, (float)H.G, (float)H.B, (float)H.A));
+			}
+		}
+		else
+		{
+			ReadPath = TEXT("ReadLinearColorPixels (fallback)");
+			if (!Res->ReadLinearColorPixels(Pixels) || Pixels.Num() == 0)
+			{
+				Out = TEXT("could not read the render target back by either path");
+				return false;
+			}
+		}
+	}
+	if (Pixels.Num() != N * N)
+	{
+		Out = FString::Printf(TEXT("the readback returned %d pixels for a %dx%d target - that is not this "
+			"target's surface"), Pixels.Num(), N, N);
 		return false;
 	}
 
@@ -1031,10 +1107,41 @@ static bool RudeProbeMaterialNow(UMaterialInterface* Mat, int32 N, FString& Out)
 	// draw is issued at startup before the renderer is live - which is why this tool has a deferred
 	// mode, the same lesson CaptureView already learned. A material whose base colour really is black
 	// is indistinguishable from that here, so this refuses rather than guess.
-	if (Max.R <= 0.f && Max.G <= 0.f && Max.B <= 0.f)
+	// The sentinel survives only where nothing was drawn. Checking it is now a REAL question with a
+	// real answer, where "is every pixel 0" conflated a failed draw with a black material.
+	int32 Undrawn = 0, ExactZero = 0;
+	for (const FLinearColor& C : Pixels)
 	{
-		Out = TEXT("every pixel read back as 0 - the material was not drawn. DrawMaterialToRenderTarget ")
-			TEXT("is not usable in this process (law 53); this tool has no working mechanism yet.");
+		if (C.R == Sentinel.R && C.G == Sentinel.G && C.B == Sentinel.B) { ++Undrawn; }
+		else if (C.R == 0.f && C.G == 0.f && C.B == 0.f && C.A == 0.f) { ++ExactZero; }
+	}
+	if (Undrawn == Pixels.Num())
+	{
+		Out = FString::Printf(TEXT("the draw was SKIPPED: all %d pixels still hold the clear sentinel, so the ")
+			TEXT("canvas path ran without writing anything. The readback is fine - it returned exactly what ")
+			TEXT("was cleared - so the fault is on the draw side. Control: %s"), Pixels.Num(), *ClearProbe);
+		return false;
+	}
+	if (ExactZero == Pixels.Num())
+	{
+		// ⭐ NOT A FAILURE - A DIFFERENT OUTPUT. Proven 2026-09-11: the clear control shows the sentinel,
+		// so the target is live and the readback is exact; the draw DOES run (it overwrote the sentinel)
+		// and it wrote zeros. `DrawMaterialToRenderTarget` goes through the CANVAS, and the canvas
+		// renders a material's EMISSIVE output. A Surface material whose result lives in BaseColor has
+		// no emissive, so it legitimately draws black. Control pair: M_SimpleGlow (emissive) reads
+		// (1,1,1); M_PrototypeGrid (opaque, base colour only) reads 0. Saying "the readback is wrong"
+		// here would have been a third wrong theory, so this says what is actually true.
+		Out = FString::Printf(TEXT("this material's EMISSIVE output is zero, so the canvas draw is black. ")
+			TEXT("That is a real reading, not a broken one: the clear control returned %s, so the target ")
+			TEXT("is live and the readback is exact. ProbeMaterial measures what the CANVAS renders, which ")
+			TEXT("is EMISSIVE - a Surface material whose result lives in BaseColor does not reach this path ")
+			TEXT("and needs an unlit scene capture instead"), *ClearProbe);
+		return false;
+	}
+	if (Undrawn > 0)
+	{
+		Out = FString::Printf(TEXT("the draw covered only part of the target: %d of %d pixels still hold "
+			"the clear sentinel. A partial draw is not a measurement"), Undrawn, Pixels.Num());
 		return false;
 	}
 
@@ -1060,14 +1167,16 @@ static bool RudeProbeMaterialNow(UMaterialInterface* Mat, int32 N, FString& Out)
 		TEXT("{\"ok\":true,\"material\":\"%s\",\"parent\":\"%s\",\"size\":%d,\"pixels\":%d,")
 		TEXT("\"meanRGBA\":[%s,%s,%s,%s],\"minRGB\":[%s,%s,%s],\"maxRGB\":[%s,%s,%s],\"pixelsOverOne\":%d,")
 		TEXT("\"points\":[%s],")
-		TEXT("\"note\":\"the material on a flat 0-1 UV quad: no mesh, no mesh UVs, no lighting, no post-processing. Values above 1 are real, not clipped.\"}"),
+		TEXT("\"clearedTo\":\"sentinel(-1,-2,-3,-4)\",\"readPath\":\"%s\",\"clearControl\":\"%s\",")
+		TEXT("\"measures\":\"EMISSIVE - the canvas renders a material's emissive output, NOT its base colour\",")
+		TEXT("\"note\":\"the material on a flat 0-1 UV quad: no mesh, no mesh UVs, no lighting, no post-processing. Values above 1 are real, not clipped. A Surface material whose result lives in BaseColor reads 0 here and that is correct, not a failure.\"}"),
 		*RudeJsonEscape(Mat->GetName()),
 		*RudeJsonEscape(AsMI && AsMI->Parent ? AsMI->Parent->GetName() : FString()),
 		N, Pixels.Num(),
 		*FString::SanitizeFloat(SumR * Inv), *FString::SanitizeFloat(SumG * Inv), *FString::SanitizeFloat(SumB * Inv), *FString::SanitizeFloat(SumA * Inv),
 		*FString::SanitizeFloat(Min.R), *FString::SanitizeFloat(Min.G), *FString::SanitizeFloat(Min.B),
 		*FString::SanitizeFloat(Max.R), *FString::SanitizeFloat(Max.G), *FString::SanitizeFloat(Max.B),
-		OverOne, *PointsJson);
+		OverOne, *PointsJson, ReadPath, *RudeJsonEscape(ClearProbe));
 	return true;
 }
 
@@ -1092,9 +1201,8 @@ FString URudeToolset::ProbeMaterial(const FString& AssetPath, const FString& Siz
 	if (!FSlateApplication::IsInitialized())
 	{
 		return Fail(TEXT("ProbeMaterial cannot draw in a commandlet - the canvas path is not available ")
-			TEXT("there and attempting it crashes the process. Run it from the editor with -ExecCmds. ")
-			TEXT("⚠ It does not work there either yet (reads back all zeros) - see law 53; this tool ")
-			TEXT("has no working mechanism and is shipped refusing rather than lying."));
+			TEXT("there and attempting it crashes the process. Run it from the editor with -ExecCmds, ")
+			TEXT("where it WORKS (proven 2026-09-11 on a real material; see law 64 for what it measures)."));
 	}
 	const FString Path = AssetPath.TrimStartAndEnd();
 	UMaterialInterface* Mat = LoadObject<UMaterialInterface>(nullptr, *Path);
@@ -1213,35 +1321,78 @@ FString URudeToolset::ProbeWorldPartitionLevel(const FString& LevelPath)
 	// The harm is the DESTRUCTION, not the refusal, so this refuses before anything is touched
 	// rather than overwriting a level someone may care about. Deleting it is the caller's call to
 	// make, not this tool's.
+	// ---- TAKEOVER, not destruction (2026-09-11) --------------------------------------------------
+	// The old behaviour on an existing path was: make a FRESH world, fail to rename it onto the
+	// occupied package, have the save correctly refused - and leave NO `.umap` at all. Measured
+	// 2026-09-07. The stop-gap was to refuse by name, which was right about the harm and wrong about
+	// the job: a tool that cannot be run twice on the same level is not a tool you can build with.
+	// So take the level over instead: LOAD the world that is already there and add to it. The
+	// destructive path is simply never entered, because no second world is ever created.
+	// ⚠ A non-partitioned existing level is still REFUSED. Converting one is a different operation
+	// with different consequences, and doing it silently inside a probe is exactly the kind of
+	// unasked-for change that earns a rollback.
+	bool bTookOver = false;
+	FString TakeoverNote;
+	UWorld* World = nullptr;
 	{
 		FString ExistingMap;
-		if (FPackageName::TryConvertLongPackageNameToFilename(Path, ExistingMap, FPackageName::GetMapPackageExtension())
-			&& FPaths::FileExists(ExistingMap))
+		const bool bExists = FPackageName::TryConvertLongPackageNameToFilename(
+			Path, ExistingMap, FPackageName::GetMapPackageExtension()) && FPaths::FileExists(ExistingMap);
+		if (bExists)
 		{
-			return Fail(FString::Printf(
-				TEXT("%s already exists - this probe writes a THROWAWAY level and cannot safely take over "
-				     "an existing one (a second run on the same path destroys it). Give a path that does not "
-				     "exist yet, or delete %s yourself first."), *Path, *ExistingMap));
+			World = UEditorLoadingAndSavingUtils::LoadMap(ExistingMap);
+			if (!World)
+			{
+				return Fail(FString::Printf(TEXT("%s exists but could not be loaded - refusing rather than "
+					"replacing it with a fresh world, which is what destroyed it before"), *ExistingMap));
+			}
+			if (!World->GetWorldPartition())
+			{
+				return Fail(FString::Printf(TEXT("%s exists and is NOT a world-partition level. Converting a "
+					"level is a different job with different consequences and this tool will not do it "
+					"silently - give a new path, or convert it yourself first"), *Path));
+			}
+			bTookOver = true;
+			TakeoverNote = FString::Printf(TEXT("took over the existing partitioned level at %s"), *ExistingMap);
+		}
+		else
+		{
+			World = GEditor->NewMap(/*bIsPartitionedWorld*/ true);
+			if (!World) { return Fail(TEXT("NewMap(partitioned) returned null")); }
+			TakeoverNote = TEXT("created a new partitioned level");
 		}
 	}
-
-	// 1) a fresh world with World Partition
-	UWorld* World = GEditor->NewMap(/*bIsPartitionedWorld*/ true);
-	if (!World) { return Fail(TEXT("NewMap(partitioned) returned null")); }
 	UWorldPartition* WP = World->GetWorldPartition();
-	if (!WP) { return Fail(TEXT("new map has no WorldPartition")); }
+	if (!WP) { return Fail(TEXT("the level has no WorldPartition")); }
 	// 2) a Data Layer asset + instance
+	// RUDE_WPTAKEOVER: on a takeover the asset is already on disk. Re-creating it over the top would
+	// discard whatever is referencing it, so load it when it exists and only create when it does not.
 	const FString DlPkgName = Path + TEXT("_DL_probe");
-	UPackage* DlPkg = CreatePackage(*DlPkgName);
-	UDataLayerAsset* DlAsset = NewObject<UDataLayerAsset>(DlPkg, FName(*FPackageName::GetLongPackageAssetName(DlPkgName)), RF_Public | RF_Standalone);
-	DlAsset->SetType(EDataLayerType::Runtime);
-	DlPkg->MarkPackageDirty();
+	const FString DlObjPath = DlPkgName + TEXT(".") + FPackageName::GetLongPackageAssetName(DlPkgName);
+	UDataLayerAsset* DlAsset = LoadObject<UDataLayerAsset>(nullptr, *DlObjPath);
+	bool bDlReused = DlAsset != nullptr;
+	UPackage* DlPkg = nullptr;
+	if (DlAsset)
+	{
+		DlPkg = DlAsset->GetPackage();
+	}
+	else
+	{
+		DlPkg = CreatePackage(*DlPkgName);
+		DlAsset = NewObject<UDataLayerAsset>(DlPkg, FName(*FPackageName::GetLongPackageAssetName(DlPkgName)), RF_Public | RF_Standalone);
+		DlAsset->SetType(EDataLayerType::Runtime);
+	}
+	if (DlPkg) { DlPkg->MarkPackageDirty(); }
 	UDataLayerEditorSubsystem* DlSub = UDataLayerEditorSubsystem::Get();
 	if (!DlSub) { return Fail(TEXT("no DataLayerEditorSubsystem")); }
 	FDataLayerCreationParameters P;
 	P.DataLayerAsset = DlAsset;
 	P.WorldDataLayers = World->GetWorldDataLayers();
-	UDataLayerInstance* Dl = DlSub->CreateDataLayerInstance(P);
+	// RUDE_WPTAKEOVER: an instance for this asset may already exist in the level we just took over.
+	// Creating a second one for the same asset is how a repeated run quietly grows a level.
+	UDataLayerInstance* Dl = DlSub->GetDataLayerInstance(DlAsset);
+	const bool bDlInstanceReused = Dl != nullptr;
+	if (!Dl) { Dl = DlSub->CreateDataLayerInstance(P); }
 	if (!Dl) { return Fail(TEXT("CreateDataLayerInstance returned null")); }
 	// 3) an actor on that layer
 	AActor* A = World->SpawnActor<AActor>();
@@ -1274,11 +1425,14 @@ FString URudeToolset::ProbeWorldPartitionLevel(const FString& LevelPath)
 	const bool bMapOnDisk = FPaths::FileExists(MapFile);
 	const bool bOk = bAdded && bSavedMap && bSavedAsset && bMapOnDisk;
 	return FString::Printf(TEXT("{\"ok\":%s,\"worldPartition\":true,\"dataLayerInstance\":\"%s\",\"actorAdded\":%s,")
-		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"assetSaved\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"map\":\"%s\",\"dataLayerAsset\":\"%s\"}"),
+		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"assetSaved\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"map\":\"%s\",\"dataLayerAsset\":\"%s\",")
+		TEXT("\"tookOverExistingLevel\":%s,\"dataLayerAssetReused\":%s,\"dataLayerInstanceReused\":%s,\"takeover\":\"%s\"}"),
 		bOk ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Dl->GetDataLayerShortName()),
 		bAdded ? TEXT("true") : TEXT("false"), bSavedMap ? TEXT("true") : TEXT("false"),
 		bMapOnDisk ? TEXT("true") : TEXT("false"), bSavedAsset ? TEXT("true") : TEXT("false"),
-		GRudeLastSaved, GRudeLastSaveFailed, *RudeJsonEscape(MapFile), *RudeJsonEscape(DlPkgName));
+		GRudeLastSaved, GRudeLastSaveFailed, *RudeJsonEscape(MapFile), *RudeJsonEscape(DlPkgName),
+		bTookOver ? TEXT("true") : TEXT("false"), bDlReused ? TEXT("true") : TEXT("false"),
+		bDlInstanceReused ? TEXT("true") : TEXT("false"), *RudeJsonEscape(TakeoverNote));
 }
 
 // ---- OpenLevel (agent) ------------------------------------------------------------------

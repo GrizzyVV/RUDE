@@ -50,6 +50,22 @@ namespace
 		return Total;
 	}
 
+	// RAGE joaat over the lowercased name - the same one-at-a-time hash the ytd lane already proved
+	// against observed dictionary hashes. An archetype's identity in a binary meta IS this u32.
+	static uint32 RudeMetaJoaat(const FString& S)
+	{
+		uint32 H = 0;
+		const FString L = S.ToLower();
+		for (int32 i = 0; i < L.Len(); ++i)
+		{
+			H += (uint8)L[i];
+			H += (H << 10);
+			H ^= (H >> 6);
+		}
+		H += (H << 3); H ^= (H >> 11); H += (H << 15);
+		return H;
+	}
+
 	struct FMetaImage
 	{
 		TArray<uint8> File;      // the donor's bytes, verbatim
@@ -148,28 +164,166 @@ FString URudeToolset::PackMetaBinary(const FString& TemplateBinPath, const FStri
 		return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why));
 	};
 
+	// ---- THE VALUE-PATCH LAYER (2026-09-11), sitting on a container already proven lossless ----
+	// WHAT THIS IS NOT: a schema-aware meta editor. The binary meta resource is a graph of tagged
+	// pointers into a system image, and RUDE does not model its structures - so it will not pretend to
+	// know where "lodDist" lives. Guessing an offset from a shape that looks right is how a file gets
+	// silently corrupted and reported as written.
+	// WHAT IT IS: operations that are size-preserving AND cannot corrupt silently, because each one
+	// states what it expects to find and REFUSES when it does not find it.
+	//   hash=<old>:<new>  rewrite every ALIGNED u32 equal to joaat(old) as joaat(new). This is what real
+	//                     authoring needs first - the same ytyp under a new name. A name lives in a meta
+	//                     as its hash, so the edit is exact and the slot count is the evidence.
+	//   was=<v>           REQUIRED before either @ form: the value the caller believes is there now.
+	//   u32@<off>=<v>     one 32-bit integer at a byte offset INTO THE INFLATED IMAGE
+	//   f32@<off>=<v>     one 32-bit float, likewise
+	//   find=u32:<v>      no write at all - report every offset holding that value, so an offset can be
+	//   find=f32:<v>      LOCATED BY MEASUREMENT instead of assumed. This is the honest way in.
+	struct FMetaOp { int32 Kind = 0; int64 Off = -1; uint32 New = 0; uint32 Was = 0; FString Src; };
+	TArray<FMetaOp> Ops;
+	TArray<FString> FindWhat;
 	FString Expect = TEXT("identical");
+	FString ParseError;
 	{
 		TArray<FString> Parts;
 		Options.ParseIntoArray(Parts, TEXT(";"), true);
-		for (const FString& P : Parts)
+		uint32 PendingWas = 0; bool bPendingWas = false;
+		auto ToU32 = [](const FString& T, uint32& Out) -> bool
 		{
-			FString K, V;
-			if (P.Split(TEXT("="), &K, &V) && K.TrimStartAndEnd().Equals(TEXT("expect"), ESearchCase::IgnoreCase))
+			const FString T2 = T.TrimStartAndEnd();
+			if (T2.IsEmpty()) { return false; }
+			if (T2.StartsWith(TEXT("0x"), ESearchCase::IgnoreCase))
 			{
-				Expect = V.TrimStartAndEnd().ToLower();
+				Out = (uint32)FCString::Strtoui64(*T2.Mid(2), nullptr, 16); return true;
+			}
+			Out = (uint32)FCString::Strtoui64(*T2, nullptr, 10); return true;
+		};
+		for (const FString& RawP : Parts)
+		{
+			const FString P = RawP.TrimStartAndEnd();
+			FString K, V;
+			if (!P.Split(TEXT("="), &K, &V)) { continue; }
+			K = K.TrimStartAndEnd(); V = V.TrimStartAndEnd();
+			if (K.Equals(TEXT("expect"), ESearchCase::IgnoreCase)) { Expect = V.ToLower(); continue; }
+			if (K.Equals(TEXT("find"), ESearchCase::IgnoreCase)) { FindWhat.Add(V); continue; }
+			if (K.Equals(TEXT("was"), ESearchCase::IgnoreCase))
+			{
+				// `was` may be spelled as a float when it guards an f32 - read it the way it is written
+				if (V.Contains(TEXT(".")))
+				{
+					const float F = FCString::Atof(*V); FMemory::Memcpy(&PendingWas, &F, 4);
+				}
+				else if (!ToU32(V, PendingWas)) { ParseError = FString::Printf(TEXT("cannot read was=%s"), *V); break; }
+				bPendingWas = true;
+				continue;
+			}
+			if (K.Equals(TEXT("hash"), ESearchCase::IgnoreCase))
+			{
+				FString A, B;
+				if (!V.Split(TEXT(":"), &A, &B) || A.IsEmpty() || B.IsEmpty())
+				{
+					ParseError = TEXT("hash= needs <oldName>:<newName>"); break;
+				}
+				FMetaOp Op; Op.Kind = 1; Op.Was = RudeMetaJoaat(A); Op.New = RudeMetaJoaat(B);
+				Op.Src = FString::Printf(TEXT("hash %s(0x%08x) -> %s(0x%08x)"), *A, Op.Was, *B, Op.New);
+				Ops.Add(Op);
+				continue;
+			}
+			if (K.StartsWith(TEXT("u32@")) || K.StartsWith(TEXT("f32@")))
+			{
+				const bool bFloat = K.StartsWith(TEXT("f32@"));
+				uint32 OffU = 0;
+				if (!ToU32(K.Mid(4), OffU)) { ParseError = FString::Printf(TEXT("cannot read the offset in %s"), *K); break; }
+				FMetaOp Op; Op.Kind = 2; Op.Off = (int64)OffU;
+				if (bFloat) { const float F = FCString::Atof(*V); FMemory::Memcpy(&Op.New, &F, 4); }
+				else if (!ToU32(V, Op.New)) { ParseError = FString::Printf(TEXT("cannot read the value %s"), *V); break; }
+				if (!bPendingWas)
+				{
+					ParseError = FString::Printf(TEXT("%s needs a was= immediately before it: a raw offset with no "
+						"guard can corrupt a file silently, so this lane refuses one"), *K);
+					break;
+				}
+				Op.Was = PendingWas; bPendingWas = false;
+				Op.Src = FString::Printf(TEXT("%s at 0x%llx"), bFloat ? TEXT("f32") : TEXT("u32"), (long long)Op.Off);
+				Ops.Add(Op);
+				continue;
 			}
 		}
 	}
+	if (!ParseError.IsEmpty()) { return Fail(ParseError); }
 
 	FMetaImage Donor;
 	FString Error;
 	if (!RudeMetaUnwrap(TemplateBinPath.TrimStartAndEnd(), Donor, Error)) { return Fail(Error); }
 
-	// No value patching yet - this is the CONTAINER round-trip, and its only claim is that unwrapping
-	// and re-wrapping loses nothing. The value-patch layer sits on top of a container that is proven
-	// lossless, never the other way round.
+	// The value-patch layer sits ON TOP of a container proven lossless, never the other way round.
 	TArray<uint8> Patched = Donor.Sys;
+	int32 PatchesApplied = 0, HashSlotsRewritten = 0;
+	FString OpJson, FindJson;
+	for (const FMetaOp& Op : Ops)
+	{
+		if (Op.Kind == 1)
+		{
+			// every ALIGNED u32 equal to the old hash. Alignment is not a detail: an unaligned match is a
+			// byte coincidence, not a field, and rewriting one corrupts whatever value actually lives there.
+			int32 Hits = 0;
+			for (int32 o = 0; o + 4 <= Patched.Num(); o += 4)
+			{
+				uint32 Cur = 0; FMemory::Memcpy(&Cur, Patched.GetData() + o, 4);
+				if (Cur == Op.Was) { FMemory::Memcpy(Patched.GetData() + o, &Op.New, 4); ++Hits; }
+			}
+			if (Hits == 0)
+			{
+				return Fail(FString::Printf(TEXT("%s: that hash appears nowhere in this file - nothing was "
+					"written. A no-op reported as success is exactly the failure this refuses"), *Op.Src));
+			}
+			HashSlotsRewritten += Hits; ++PatchesApplied;
+			OpJson += FString::Printf(TEXT("%s{\"op\":\"%s\",\"slots\":%d}"),
+				OpJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(Op.Src), Hits);
+			continue;
+		}
+		if (Op.Off < 0 || Op.Off + 4 > (int64)Patched.Num())
+		{
+			return Fail(FString::Printf(TEXT("%s: offset is outside the %d-byte image"), *Op.Src, Patched.Num()));
+		}
+		uint32 Cur = 0; FMemory::Memcpy(&Cur, Patched.GetData() + Op.Off, 4);
+		if (Cur != Op.Was)
+		{
+			return Fail(FString::Printf(TEXT("%s: guard failed - the image holds 0x%08x there, not the was=0x%08x "
+				"named. The offset is wrong, or this donor is not the file you think it is"), *Op.Src, Cur, Op.Was));
+		}
+		FMemory::Memcpy(Patched.GetData() + Op.Off, &Op.New, 4);
+		++PatchesApplied;
+		OpJson += FString::Printf(TEXT("%s{\"op\":\"%s\",\"was\":\"0x%08x\",\"now\":\"0x%08x\"}"),
+			OpJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(Op.Src), Op.Was, Op.New);
+	}
+	// find= is a READOUT, never a write: it is how an offset gets located by measurement rather than guessed.
+	for (const FString& W : FindWhat)
+	{
+		FString Ty, Val;
+		if (!W.Split(TEXT(":"), &Ty, &Val)) { continue; }
+		Ty = Ty.TrimStartAndEnd(); Val = Val.TrimStartAndEnd();
+		uint32 Target = 0;
+		if (Ty.Equals(TEXT("f32"), ESearchCase::IgnoreCase))
+		{
+			const float F = FCString::Atof(*Val); FMemory::Memcpy(&Target, &F, 4);
+		}
+		else if (Val.StartsWith(TEXT("0x"), ESearchCase::IgnoreCase))
+		{
+			Target = (uint32)FCString::Strtoui64(*Val.Mid(2), nullptr, 16);
+		}
+		else { Target = (uint32)FCString::Strtoui64(*Val, nullptr, 10); }
+		FString Offs; int32 Hits = 0;
+		for (int32 o = 0; o + 4 <= Donor.Sys.Num(); o += 4)
+		{
+			uint32 Cur = 0; FMemory::Memcpy(&Cur, Donor.Sys.GetData() + o, 4);
+			if (Cur != Target) { continue; }
+			++Hits;
+			if (Hits <= 64) { Offs += FString::Printf(TEXT("%s\"0x%x\""), Offs.IsEmpty() ? TEXT("") : TEXT(","), o); }
+		}
+		FindJson += FString::Printf(TEXT("%s{\"find\":\"%s\",\"hits\":%d,\"offsets\":[%s]}"),
+			FindJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(W), Hits, *Offs);
+	}
 
 	TArray<uint8> OutFile;
 	if (!RudeMetaWrap(Donor, Patched, OutFile, Error)) { return Fail(Error); }
@@ -209,9 +363,16 @@ FString URudeToolset::PackMetaBinary(const FString& TemplateBinPath, const FStri
 	}
 
 	const bool bExpectIdentical = Expect.Equals(TEXT("identical"));
-	// "identical" now means: the image survives the round trip. "edited" additionally requires that
-	// the file actually changed.
-	const bool bMet = bImageIdentical && (bExpectIdentical || !bIdentical);
+	// "identical" means the image survives the round trip untouched. "edited" additionally requires that
+	// the IMAGE actually changed - not merely that the compressed bytes differ, which they can do for
+	// compressor reasons alone (see the note above). An edit that changed nothing must not pass as one.
+	const bool bImageChanged = (Patched.Num() != Donor.Sys.Num())
+		|| FMemory::Memcmp(Patched.GetData(), Donor.Sys.GetData(), Donor.Sys.Num()) != 0;
+	if (bExpectIdentical && bImageChanged)
+	{
+		return Fail(TEXT("expect=identical but the patch options changed the image - say expect=edited when editing"));
+	}
+	const bool bMet = bImageIdentical && (bExpectIdentical || bImageChanged);
 
 	bool bWritten = false;
 	const FString Out = OutBinPath.TrimStartAndEnd();
@@ -225,14 +386,18 @@ FString URudeToolset::PackMetaBinary(const FString& TemplateBinPath, const FStri
 		TEXT("{\"ok\":%s,\"template\":\"%s\",\"out\":\"%s\",\"version\":%u,\"sysBytes\":%d,\"gfxBytes\":0,")
 		TEXT("\"templateFileBytes\":%d,\"outFileBytes\":%d,\"byteIdenticalToTemplate\":%s,\"expect\":\"%s\",")
 		TEXT("\"imageIdenticalAfterReinflate\":%s,\"reinflateNote\":\"%s\",")
-		TEXT("\"expectationMet\":%s,\"written\":%s,")
-		TEXT("\"note\":\"container round-trip only - unwrap and re-wrap with the donor's own header. No value ")
-		TEXT("patching yet, and the lane is SIZE-PRESERVING by construction: the donor's flag words describe ")
-		TEXT("the image exactly, so a different size would make them a lie.\"}"),
+		TEXT("\"expectationMet\":%s,\"written\":%s,\"imageChanged\":%s,")
+		TEXT("\"patchesApplied\":%d,\"hashSlotsRewritten\":%d,\"patches\":[%s],\"finds\":[%s],")
+		TEXT("\"note\":\"donor repack: unwrap, patch the image in place, re-wrap with the donor's own header. ")
+		TEXT("SIZE-PRESERVING by construction - the donor's flag words describe the image exactly, so a ")
+		TEXT("different size would make them a lie. Patching is by HASH or by guarded offset; RUDE does not ")
+		TEXT("model the meta schema and will not guess where a named field lives. Use find= to locate one.\"}"),
 		bMet ? TEXT("true") : TEXT("false"),
 		*RudeJsonEscape(TemplateBinPath), *RudeJsonEscape(Out), Donor.Version,
 		Donor.Sys.Num(), Donor.File.Num(), OutFile.Num(),
 		bIdentical ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Expect),
 		bImageIdentical ? TEXT("true") : TEXT("false"), *RudeJsonEscape(ReinflateNote),
-		bMet ? TEXT("true") : TEXT("false"), bWritten ? TEXT("true") : TEXT("false"));
+		bMet ? TEXT("true") : TEXT("false"), bWritten ? TEXT("true") : TEXT("false"),
+		bImageChanged ? TEXT("true") : TEXT("false"),
+		PatchesApplied, HashSlotsRewritten, *OpJson, *FindJson);
 }
