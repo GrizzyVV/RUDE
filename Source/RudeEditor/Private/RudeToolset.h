@@ -294,6 +294,19 @@ public:
 	static FString ProbeMaterial(const FString& AssetPath, const FString& Size,
 	                             const FString& OutJson, const FString& SettleSeconds);
 
+	// ⭐ THE RSC7 v2 META CONTAINER ROUND-TRIP (ytyp / ymap / scenario ymt), 2026-09-11.
+	// RUDE exports these in the TEXT form, and whether FiveM Legacy loads a text-form file is an open
+	// question. This lane removes the question instead of answering it: hand back the BINARY the game
+	// already loads. A DONOR REPACK, exactly as PackYcdBinary is for clip dictionaries - unwrap the
+	// game's own file, keep the system image, re-wrap with the donor's OWN 16-byte header.
+	// ⛔ SIZE-PRESERVING by construction: the donor's flag words describe the image exactly, so a
+	// patch that changes the size makes them a lie. Adding an archetype is NOT this shape.
+	// ⛔ A donor with a non-empty GRAPHICS segment is refused BY NAME - the kept header would declare
+	// a segment the stream no longer holds.
+	// Gate: `expect=identical` on a no-op must be BYTE-IDENTICAL. Anything less proves nothing.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Repack a GTA V archetype or scenario binary from the game's own file, so the game gets a binary rather than XML.", RudeAudience="agent"))
+	static FString PackMetaBinary(const FString& TemplateBinPath, const FString& OutBinPath, const FString& Options);
+
 	// Scenario region export (WP10): the point actors ImportScenarioRegion placed go back to their
 	// region file as a FiveM resource (<OutDir>/stream/<region>.ymt, XML form, + fxmanifest.lua). The
 	// source file's bytes are SPLICED - only the top-level <Points>/<MyPoints> block is replaced; an
