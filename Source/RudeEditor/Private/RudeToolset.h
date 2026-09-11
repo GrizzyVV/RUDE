@@ -428,6 +428,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Save a sound as a GTA V audio container (.awc) holding one uncompressed track."))
 	static FString ExportAwc(const FString& SoundWaveAssetPath, const FString& OutAwcPath, const FString& StreamName);
 
+	// ---- the SOUND SET (2026-09-11): the other half of authoring your own sound ------------------
+	// ExportAwc writes the wave; the game will not PLAY a wave nobody declared. This writes the
+	// dat54 `.rel` that names it - built from nothing, not repacked from a donor.
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Write the sound-definition file that lets the game play sounds you made. Name each one as soundname=container/wave, where the container is your .awc and the wave is the track inside it."))
+	static FString ExportSoundSet(const FString& Sounds, const FString& OutRelPath, const FString& Options);
+
 	// Import the PCM16 streams of one corpus .awc as USoundWave assets (AwcName = ledger name, e.g. "chicken").
 	// Converted XML: kind="pcm16" .wav sidecars / kind="raw" PCM16 are imported; kind="none" (ROUT --textures
 	// none - the 2026-09-04 corpus), kind="encrypted" and ADPCM streams are counted and skipped. Kept binary:
