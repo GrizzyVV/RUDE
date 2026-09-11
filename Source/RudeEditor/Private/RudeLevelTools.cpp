@@ -1205,6 +1205,26 @@ FString URudeToolset::ProbeWorldPartitionLevel(const FString& LevelPath)
 	if (!GEditor) { return Fail(TEXT("no GEditor")); }
 	const FString Path = LevelPath.TrimStartAndEnd();
 	if (!FPackageName::IsValidLongPackageName(Path)) { return Fail(TEXT("LevelPath must be a long package name like /Game/RUDE/Levels/Probe")); }
+	// ⛔ REFUSE IF THE TARGET ALREADY EXISTS (2026-09-11). This tool builds a THROWAWAY partitioned
+	// level to prove world-partition support, so it always makes a FRESH world. Called twice on one
+	// path in a single process, the second call's world is never renamed onto the existing package,
+	// the save is correctly refused - and the file that was already there does not survive. Measured
+	// 2026-09-07: two calls, no `.umap` left at all; one call on a fresh path is clean.
+	// The harm is the DESTRUCTION, not the refusal, so this refuses before anything is touched
+	// rather than overwriting a level someone may care about. Deleting it is the caller's call to
+	// make, not this tool's.
+	{
+		FString ExistingMap;
+		if (FPackageName::TryConvertLongPackageNameToFilename(Path, ExistingMap, FPackageName::GetMapPackageExtension())
+			&& FPaths::FileExists(ExistingMap))
+		{
+			return Fail(FString::Printf(
+				TEXT("%s already exists - this probe writes a THROWAWAY level and cannot safely take over "
+				     "an existing one (a second run on the same path destroys it). Give a path that does not "
+				     "exist yet, or delete %s yourself first."), *Path, *ExistingMap));
+		}
+	}
+
 	// 1) a fresh world with World Partition
 	UWorld* World = GEditor->NewMap(/*bIsPartitionedWorld*/ true);
 	if (!World) { return Fail(TEXT("NewMap(partitioned) returned null")); }
