@@ -1044,6 +1044,7 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	// upper bound.
 	int32 YmapsParsed = 0, YmapsUnreadable = 0, YmapsNoEntitiesNode = 0, YmapsWithEntities = 0;
 	int32 EntitiesSkipped = 0;   // entity missing <archetypeName> or <position> - was a bare continue
+	int32 EntitiesUnresolvedArchetype = 0;  // entity fine, archetype not in this corpus index
 	TSet<FString> NeededDrawables;
 	FString ScenesJson;
 	for (const FString& F : YmapFiles)
@@ -1094,6 +1095,13 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 			const FString* Asset = Index.ArchToAsset.Find(Arch);
 			++TotalEnts; ++SceneEnts;
 			if (Asset) { ++Resolved; NeededDrawables.Add(*Asset); }
+			// ...and the ones whose archetype this corpus index does not hold (2026-09-10, law 56).
+			// There was no `else`, so `entities` and `resolved` disagreed by exactly the number of
+			// them and nothing could say why: measured on dt1_02, entities 290 vs resolved 289, the
+			// one being a CMloInstanceDef whose archetype is an MLO ytyp rather than a drawable.
+			// Harmless there - but a PROP whose archetype was genuinely missing would vanish from the
+			// arithmetic the same way, and that is the case this counter exists for.
+			else { ++EntitiesUnresolvedArchetype; }
 			// ⭐ timeFlags travels WITH the entity. It belongs to the archetype, but the spawn works
 			// per entity, and carrying it here means the hour mask survives into the manifest that
 			// ImportScene re-spawns from - so a respawn keeps the day/night behaviour without
@@ -1211,7 +1219,7 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 	return FString::Printf(TEXT(
 		"{\"ok\":%s,\"ymapsMatched\":%d,\"ymapsParsed\":%d,\"ymapsUnreadable\":%d,"
 		"\"ymapsWithoutEntitiesNode\":%d,\"ymapsWithEntities\":%d,\"ymaps\":%d,"
-		"\"entities\":%d,\"entitiesSkipped\":%d,\"resolved\":%d,\"meshesImported\":%d,"
+		"\"entities\":%d,\"entitiesSkipped\":%d,\"entitiesUnresolvedArchetype\":%d,\"resolved\":%d,\"meshesImported\":%d,"
 		"\"meshesSkipped\":%d,\"meshesFailed\":%d,\"meshesMissingFromCorpus\":%d,%s,"
 		"\"manifest\":\"%s\",\"spawn\":%s}"),
 		bAreaOk ? TEXT("true") : TEXT("false"),
@@ -1220,7 +1228,7 @@ FString URudeToolset::ImportMapArea(const FString& CorpusRoot, const FString& Ym
 		// Renaming it outright would silently change every existing caller's reading; the four
 		// new fields say where the difference went.
 		YmapsWithEntities,
-		TotalEnts, EntitiesSkipped, Resolved, MeshOk, MeshSkip, MeshFail, MeshMissing,
+		TotalEnts, EntitiesSkipped, EntitiesUnresolvedArchetype, Resolved, MeshOk, MeshSkip, MeshFail, MeshMissing,
 		*Tally.ToJson(), *ManifestPath, *Spawn);
 }
 
