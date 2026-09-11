@@ -87,12 +87,34 @@ namespace RudeCarried
 	// "x, y, z" lines (RAGE metres) -> UE cm with the house Y mirror (RudeArchetype bounds: UE = (x, -y, z) * 100).
 	static int32 ParseVectors(const FString& Text, TArray<FVector>& Out)
 	{
-		TArray<FString> Lines; Text.ParseIntoArrayLines(Lines, true);
-		for (const FString& L : Lines)
+		// ⛔ DO NOT SPLIT ON LINES (fixed 2026-09-11). FXmlFile FLATTENS multi-line text content - this
+		// vault already records that for MLO <attachedObjects> - so a <Vertices> block of N lines comes
+		// back as ONE string. Splitting by line then demanding exactly 3 comma-separated parts therefore
+		// matched nothing, every polygon counted as degenerate, and DebugDrawNavmesh drew ZERO of them:
+		// measured `polygons: 0, polygonVertices: 0, degenerate: 2564` on navmesh[102][102], with the
+		// portals, points and lines around it drawing fine. It had never been seen because the gate row
+		// that runs this sat below a refusal and had never executed (law 60).
+		// Tokenising on BOTH separators and grouping in threes is newline-agnostic: it reads the same
+		// whether the flattening happens or not.
+		TArray<FString> Tok;
+		Text.ParseIntoArray(Tok, TEXT(","), true);
+		TArray<double> Nums;
+		for (const FString& T : Tok)
 		{
-			TArray<FString> P; L.ParseIntoArray(P, TEXT(","), true);
-			if (P.Num() != 3) { continue; }
-			Out.Add(FVector(FCString::Atod(*P[0]) * 100.0, -FCString::Atod(*P[1]) * 100.0, FCString::Atod(*P[2]) * 100.0));
+			TArray<FString> Sub;
+			T.ParseIntoArrayWS(Sub, nullptr, true);
+			for (const FString& S : Sub)
+			{
+				const FString Trimmed = S.TrimStartAndEnd();
+				if (!Trimmed.IsEmpty() && (FChar::IsDigit(Trimmed[0]) || Trimmed[0] == TEXT('-') || Trimmed[0] == TEXT('+') || Trimmed[0] == TEXT('.')))
+				{
+					Nums.Add(FCString::Atod(*Trimmed));
+				}
+			}
+		}
+		for (int32 i = 0; i + 2 < Nums.Num(); i += 3)
+		{
+			Out.Add(FVector(Nums[i] * 100.0, -Nums[i + 1] * 100.0, Nums[i + 2] * 100.0));
 		}
 		return Out.Num();
 	}
