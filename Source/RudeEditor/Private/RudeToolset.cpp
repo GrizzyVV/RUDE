@@ -55,6 +55,8 @@
 #include "Materials/MaterialExpressionAppendVector.h"
 #include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionConstant3Vector.h"   // flat-normal blend target for `bumpiness`
+#include "Materials/MaterialExpressionSquareRoot.h"        // specular exponent -> roughness
 #include "Materials/MaterialExpressionDivide.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionMultiply.h"
@@ -154,16 +156,30 @@ static UMaterialInterface* EnsureDecalGeoMaster()
 // RAGE foliage is alpha-tested AND double-sided (leaf cards are single quads). Imported
 // single-sided, every leaf facing away from the light renders near-black (the dark trees
 // on Cayo, 2026-07-25). Two-sided + masked is the correct foliage material.
+static const int32 RudeMasterGraphVersion = 6;   // 6: foliage + terrain gain WIRED bumpiness/spec params and a staleness rule
+static const TCHAR* RudeMasterGraphVersionParam = TEXT("RudeGraphVersion");
+
 static UMaterialInterface* EnsureFoliageMaster()
 {
-	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_Foliage.M_RUDE_Foliage");
-	if (UMaterialInterface* Existing = LoadObject<UMaterialInterface>(nullptr, FullPath))
+	// ⛔ REBUILD IF POORER, exactly as the cutout master does. This used to return whatever was on
+	// disk, so the master shipped in July was frozen there for good: foliage bound NO shader values
+	// at all while the game varies `bumpiness` (9 distinct values on 27 uses, the modal one only
+	// 30%) and `specularIntensityMult` (7 distinct, modal 28%) across grass and tree shaders.
+	UPackage* Pkg = nullptr;
+	UMaterial* M = LoadObject<UMaterial>(nullptr, TEXT("/RUDE/Masters/M_RUDE_Foliage.M_RUDE_Foliage"));
+	if (M)
 	{
-		return Existing;
+		FString StaleWhy;
+		if (RudeGeneratedMasterHealth(M, TEXT("M_RUDE_Foliage"), StaleWhy) != ERudeMasterHealth::Stale) { return M; }
+		M->GetExpressionCollection().Empty();
+		Pkg = M->GetPackage();
 	}
-	UPackage* Pkg = CreatePackage(TEXT("/RUDE/Masters/M_RUDE_Foliage"));
-	if (!Pkg) { return nullptr; }
-	UMaterial* M = NewObject<UMaterial>(Pkg, TEXT("M_RUDE_Foliage"), RF_Public | RF_Standalone);
+	else
+	{
+		Pkg = CreatePackage(TEXT("/RUDE/Masters/M_RUDE_Foliage"));
+		if (!Pkg) { return nullptr; }
+		M = NewObject<UMaterial>(Pkg, TEXT("M_RUDE_Foliage"), RF_Public | RF_Standalone);
+	}
 	M->BlendMode = BLEND_Masked;
 	M->TwoSided = true;
 	M->SetShadingModel(MSM_TwoSidedFoliage);   // light transmits through leaf cards
@@ -184,9 +200,34 @@ static UMaterialInterface* EnsureFoliageMaster()
 	SubCol->A.Expression = Diff; SubCol->B.Expression = Sub;
 	M->GetExpressionCollection().AddExpression(SubCol);
 
+	// ---- the shader values the game actually varies on foliage, WIRED (2026-09-11) --------------
+	auto FolScalar = [&](const TCHAR* Name, float Def, int32 Y)
+	{
+		UMaterialExpressionScalarParameter* SP = NewObject<UMaterialExpressionScalarParameter>(M);
+		SP->ParameterName = Name; SP->DefaultValue = Def;
+		SP->MaterialExpressionEditorX = -1000; SP->MaterialExpressionEditorY = Y;
+		M->GetExpressionCollection().AddExpression(SP);
+		return SP;
+	};
+	// the version stamp, deliberately unconnected (RudeInertParameters exempts it by name)
+	FolScalar(RudeMasterGraphVersionParam, (float)RudeMasterGraphVersion, -200);
+	UMaterialExpressionScalarParameter* FolBump = FolScalar(TEXT("bumpiness"), 1.f, 360);
+	UMaterialExpressionConstant3Vector* FolFlat = NewObject<UMaterialExpressionConstant3Vector>(M);
+	FolFlat->Constant = FLinearColor(0.f, 0.f, 1.f);
+	FolFlat->MaterialExpressionEditorX = -800; FolFlat->MaterialExpressionEditorY = 420;
+	M->GetExpressionCollection().AddExpression(FolFlat);
+	UMaterialExpressionLinearInterpolate* FolN = NewObject<UMaterialExpressionLinearInterpolate>(M);
+	FolN->A.Expression = FolFlat; FolN->B.Expression = Nrm; FolN->Alpha.Expression = FolBump;
+	FolN->MaterialExpressionEditorX = -600; FolN->MaterialExpressionEditorY = 340;
+	M->GetExpressionCollection().AddExpression(FolN);
+	// Foliage had NO Specular output at all, so the game's spec intensity had nowhere to land. The
+	// measured modal value is 0.125 - leaves are dull - which is also a better default than UE's 0.5.
+	UMaterialExpressionScalarParameter* FolSpec = FolScalar(TEXT("specularIntensityMult"), 0.125f, 520);
+
 	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
 	EO->BaseColor.Expression = Diff;
-	EO->Normal.Expression = Nrm;
+	EO->Normal.Expression = FolN;
+	EO->Specular.Expression = FolSpec;
 	EO->SubsurfaceColor.Expression = SubCol;
 	EO->OpacityMask.Expression = Diff;
 	EO->OpacityMask.MaskA = 1; EO->OpacityMask.Mask = 1;
@@ -329,13 +370,71 @@ struct FRudeMasterSpec
 //   1 = every master generated before the stamp existed (they read -1 and are all stale)
 //   2 = the alpha-mask fix in the tint and livery branches (2026-09-07)
 //   3 = detailSettings .zw read off their own pins - every Dt master had been FAILING TO COMPILE (2026-09-08)
-static const int32 RudeMasterGraphVersion = 3;
-static const TCHAR* RudeMasterGraphVersionParam = TEXT("RudeGraphVersion");
 
 // The stamp, read off the EXPRESSION COLLECTION rather than the compiled parameter list: the
 // parameter is deliberately unconnected, and an unreferenced parameter is not guaranteed to survive
 // into the compiled list, but the expression it was built from always does. -1 = no stamp, which is
 // every master generated before the stamp existed.
+// ---- THE INERT-PARAMETER CHECK (2026-09-11) --------------------------------------------------
+// ⛔ WHY THIS EXISTS, AND IT IS A DEFECT WE SHIPPED FOR MONTHS. A generated master DECLARED
+// `bumpiness`, `specularFalloffMult` and `specularFresnel` and connected none of them. The
+// importer bound all three - `GetAllScalarParameterInfo` lists a parameter whether or not it feeds
+// anything - the verdict counted them in `valueParamsBound`, and the surface never changed. Three
+// of the four values bound onto a normal+spec master did nothing at all.
+// That is the "wrong property tested" failure with a counter attached to it: every gate we had
+// asked *was the value bound*, and none asked *does the value reach an output*.
+// So: walk the graph from the material's OUTPUTS and collect what is reachable. Any parameter
+// expression outside that set is INERT and is reported by name. The version stamp is exempt - it is
+// deliberately unconnected and says so where it is created.
+static void RudeCollectReached(UMaterialExpression* E, TSet<UMaterialExpression*>& Out)
+{
+	if (!E || Out.Contains(E)) { return; }
+	Out.Add(E);
+	for (FExpressionInputIterator It{ E }; It; ++It)
+	{
+		if (It->Expression) { RudeCollectReached(It->Expression, Out); }
+	}
+}
+
+// Names of parameters this material declares but never reaches from an output. Empty = healthy.
+static TArray<FString> RudeInertParameters(UMaterial* M)
+{
+	TArray<FString> Inert;
+	if (!M) { return Inert; }
+	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
+	if (!EO) { return Inert; }
+	TSet<UMaterialExpression*> Reached;
+	FExpressionInput* Outs[] = {
+		&EO->BaseColor, &EO->Metallic, &EO->Specular, &EO->Roughness, &EO->Anisotropy,
+		&EO->Normal, &EO->Tangent, &EO->EmissiveColor, &EO->Opacity, &EO->OpacityMask,
+		&EO->AmbientOcclusion, &EO->SubsurfaceColor,
+	};
+	for (FExpressionInput* In : Outs)
+	{
+		if (In && In->Expression) { RudeCollectReached(In->Expression, Reached); }
+	}
+	for (UMaterialExpression* E : M->GetExpressionCollection().Expressions)
+	{
+		if (!E || Reached.Contains(E)) { continue; }
+		FString Name;
+		if (const UMaterialExpressionScalarParameter* SP = Cast<UMaterialExpressionScalarParameter>(E))
+		{
+			Name = SP->ParameterName.ToString();
+		}
+		else if (const UMaterialExpressionVectorParameter* VP = Cast<UMaterialExpressionVectorParameter>(E))
+		{
+			Name = VP->ParameterName.ToString();
+		}
+		else if (const UMaterialExpressionTextureSampleParameter2D* TP = Cast<UMaterialExpressionTextureSampleParameter2D>(E))
+		{
+			Name = TP->ParameterName.ToString();
+		}
+		if (Name.IsEmpty() || Name == RudeMasterGraphVersionParam) { continue; }   // the stamp is exempt by design
+		Inert.AddUnique(Name);
+	}
+	return Inert;
+}
+
 static int32 RudeGraphVersionOf(UMaterial* M)
 {
 	if (!M) { return -1; }
@@ -404,6 +503,26 @@ ERudeMasterHealth RudeGeneratedMasterHealth(UMaterial* M, const FString& AssetNa
 		if (Has(TextureInfos, TEXT("Normal"))) { return ERudeMasterHealth::Healthy; }
 		OutWhy = TEXT("cutout master with no Normal texture parameter");
 		return ERudeMasterHealth::Stale;
+	}
+	// ⛔ THE OTHER TWO NAME-ROUTED MASTERS, ADDED 2026-09-11 - and until today neither had a health
+	// rule OR a version stamp, so their builders returned any asset already on disk and no wiring
+	// change could ever reach them. That is law 49's defect surviving in the one corner the law-49
+	// fix did not cover. Both now carry `bumpiness`, so its absence is the staleness condition, and
+	// both carry the graph stamp so a future wiring change costs only a bump.
+	if (AssetName == TEXT("M_RUDE_Foliage") || AssetName == TEXT("M_RUDE_Terrain"))
+	{
+		if (!Has(ScalarInfos, TEXT("bumpiness")))
+		{
+			OutWhy = FString::Printf(TEXT("%s with no bumpiness parameter"), *AssetName);
+			return ERudeMasterHealth::Stale;
+		}
+		if (RudeGraphVersionOf(M) != RudeMasterGraphVersion)
+		{
+			OutWhy = FString::Printf(TEXT("graph version %d, builder writes %d"),
+				RudeGraphVersionOf(M), RudeMasterGraphVersion);
+			return ERudeMasterHealth::Stale;
+		}
+		return ERudeMasterHealth::Healthy;
 	}
 
 	// Everything else this rule judges is M_RUDE_<letters>_b<bucket>.
@@ -674,8 +793,20 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 	{
 		UMaterialExpressionTextureSampleParameter2D* N =
 			MakeTex(TEXT("Normal"), DefNormal, SAMPLERTYPE_Normal, 300);
-		EO->Normal.Expression = N;
-		MakeScalar(TEXT("bumpiness"), 1.f, 340);
+		// ⭐ WIRED as of graph version 4. `bumpiness` was declared and bound for months while
+		// connected to NOTHING - see RudeInertParameters for the whole story. The game varies it
+		// (39 distinct values over a 400-file draw, the modal one only 59%), so it is real
+		// information that was being read, counted and thrown away. Blend the sampled normal toward
+		// flat: 1 = the map as authored, 0 = flat, >1 exaggerates. UE normalises the tangent-space
+		// normal itself, so the interpolation needs no renormalise here.
+		UMaterialExpressionScalarParameter* Bump = MakeScalar(TEXT("bumpiness"), 1.f, 340);
+		UMaterialExpressionConstant3Vector* FlatN = NewObject<UMaterialExpressionConstant3Vector>(M);
+		FlatN->Constant = FLinearColor(0.f, 0.f, 1.f);
+		Add(FlatN, -900, 400);
+		UMaterialExpressionLinearInterpolate* NBlend = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		NBlend->A.Expression = FlatN; NBlend->B.Expression = N; NBlend->Alpha.Expression = Bump;
+		Add(NBlend, -700, 300);
+		EO->Normal.Expression = NBlend;
 	}
 	if (Spec.bSpec)
 	{
@@ -685,11 +816,44 @@ static UMaterialInterface* EnsureGeneratedMaster(const FRudeMasterSpec& Spec)
 			MakeScalar(TEXT("specularIntensityMult"), 1.f, 640);
 		UMaterialExpressionMultiply* Mul = NewObject<UMaterialExpressionMultiply>(M);
 		Mul->A.Expression = S; Mul->B.Expression = Int; Add(Mul, -700, 600);
-		EO->Specular.Expression = Mul;
+		// ⭐ WIRED as of graph version 4, both of them, for the same reason as `bumpiness`.
+		// `specularFresnel` is the reflectance at normal incidence, which is exactly what UE's
+		// Specular input scales - so it multiplies alongside the intensity rather than needing a
+		// new home. Typical values are near 1 (0.97 on 34.9% of a 400-file draw) so the effect is
+		// small on most surfaces and real on the ones the game deliberately dulls, like peds at 0.8.
+		UMaterialExpressionScalarParameter* Fres = MakeScalar(TEXT("specularFresnel"), 0.97f, 760);
+		UMaterialExpressionMultiply* SpecF = NewObject<UMaterialExpressionMultiply>(M);
+		SpecF->A.Expression = Mul; SpecF->B.Expression = Fres; Add(SpecF, -560, 600);
+		EO->Specular.Expression = SpecF;
 		EO->Specular.MaskR = 1; EO->Specular.Mask = 1;
 		EO->Specular.MaskG = 0; EO->Specular.MaskB = 0; EO->Specular.MaskA = 0;
-		MakeScalar(TEXT("specularFalloffMult"), 100.f, 700);
-		MakeScalar(TEXT("specularFresnel"), 0.97f, 760);
+		// `specularFalloffMult` is a Blinn-Phong specular EXPONENT (modal 100, 105 distinct values
+		// over a 400-file draw), and until now every opaque master left Roughness at UE's flat 0.5 -
+		// so the whole gloss range the game ships was discarded. Standard conversion:
+		//     roughness = sqrt(2 / (n + 2))
+		// which puts foliage (n=8) at 0.45, the modal surface (n=100) at 0.14 and polished metal
+		// (n=500) at 0.06. ⚠ The MAPPING is a calibration, not a measurement - it is the textbook
+		// exponent-to-roughness identity, and it is the kind of number Matt has re-tuned before
+		// (the 0.42 flat specular above is his). The wiring is the fix; the curve is tunable.
+		// ⚠ NOT ON THE TRANSLUCENT BUCKET. Bucket 1 is glass, and the branch further down deliberately
+		// pins its Roughness to 0.12 (Matt's calibration) - which runs AFTER this and would override
+		// anything computed here, leaving `specularFalloffMult` declared and reaching nothing. The
+		// inert-parameter scan caught exactly that on 4 masters. A master that cannot USE a parameter
+		// must not ADVERTISE it: the importer then counts the value as unsupported, which is true,
+		// instead of binding it into a void and counting it as bound, which is not.
+		if (Spec.Bucket != 1)
+		{
+		UMaterialExpressionScalarParameter* Fall = MakeScalar(TEXT("specularFalloffMult"), 100.f, 700);
+		UMaterialExpressionConstant* Two = NewObject<UMaterialExpressionConstant>(M);
+		Two->R = 2.f; Add(Two, -900, 740);
+		UMaterialExpressionAdd* NPlus2 = NewObject<UMaterialExpressionAdd>(M);
+		NPlus2->A.Expression = Fall; NPlus2->B.Expression = Two; Add(NPlus2, -760, 700);
+		UMaterialExpressionDivide* TwoOver = NewObject<UMaterialExpressionDivide>(M);
+		TwoOver->A.Expression = Two; TwoOver->B.Expression = NPlus2; Add(TwoOver, -620, 700);
+		UMaterialExpressionSquareRoot* RoughFromFalloff = NewObject<UMaterialExpressionSquareRoot>(M);
+		RoughFromFalloff->Input.Expression = TwoOver; Add(RoughFromFalloff, -480, 700);
+		EO->Roughness.Expression = RoughFromFalloff;
+		}
 	}
 	else
 	{
@@ -918,14 +1082,24 @@ static UMaterialInterface* EnsureDetailMaster()
 
 static UMaterialInterface* EnsureTerrainMaster()
 {
-	const TCHAR* FullPath = TEXT("/RUDE/Masters/M_RUDE_Terrain.M_RUDE_Terrain");
-	if (UMaterialInterface* Existing = LoadObject<UMaterialInterface>(nullptr, FullPath))
+	// ⛔ REBUILD IF POORER - same reason as the foliage master above. Terrain bound no shader values
+	// either, while the game varies `bumpiness` (11 distinct values over 131 uses, modal 42%) and
+	// `specularIntensityMult` (10 distinct, modal 0.01) on terrain shaders.
+	UPackage* Pkg = nullptr;
+	UMaterial* M = LoadObject<UMaterial>(nullptr, TEXT("/RUDE/Masters/M_RUDE_Terrain.M_RUDE_Terrain"));
+	if (M)
 	{
-		return Existing;
+		FString StaleWhy;
+		if (RudeGeneratedMasterHealth(M, TEXT("M_RUDE_Terrain"), StaleWhy) != ERudeMasterHealth::Stale) { return M; }
+		M->GetExpressionCollection().Empty();
+		Pkg = M->GetPackage();
 	}
-	UPackage* Pkg = CreatePackage(TEXT("/RUDE/Masters/M_RUDE_Terrain"));
-	if (!Pkg) { return nullptr; }
-	UMaterial* M = NewObject<UMaterial>(Pkg, TEXT("M_RUDE_Terrain"), RF_Public | RF_Standalone);
+	else
+	{
+		Pkg = CreatePackage(TEXT("/RUDE/Masters/M_RUDE_Terrain"));
+		if (!Pkg) { return nullptr; }
+		M = NewObject<UMaterial>(Pkg, TEXT("M_RUDE_Terrain"), RF_Public | RF_Standalone);
+	}
 	UTexture* DefWhite = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
 	UTexture* DefNormal = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineMaterials/FlatNormal.FlatNormal"));
 
@@ -1020,14 +1194,8 @@ static UMaterialInterface* EnsureTerrainMaster()
 		D[i] = TexParam(FString::Printf(TEXT("Diffuse%d"), i), false, -1300, -400 + i * 150);
 		N[i] = TexParam(FString::Printf(TEXT("Normal%d"), i), true, -1300, 300 + i * 150);
 	}
-	auto* Rough = NewObject<UMaterialExpressionConstant>(M);
-	Rough->R = 0.85f;
-	M->GetExpressionCollection().AddExpression(Rough);
-
 	UMaterialEditorOnlyData* EO = M->GetEditorOnlyData();
 	EO->BaseColor.Expression = Chain(D, -200);
-	EO->Normal.Expression = Chain(N, 400);
-	EO->Roughness.Expression = Rough;
 
 	// ⭐ The terrain presets DO bind spec, and this master used to expose none of it, so every
 	// specularIntensityMult / specularFalloffMult on a terrain shader counted as
@@ -1042,14 +1210,56 @@ static UMaterialInterface* EnsureTerrainMaster()
 		M->GetExpressionCollection().AddExpression(E);
 		return E;
 	};
+	// the version stamp, deliberately unconnected (RudeInertParameters exempts it by name)
+	Scalar(RudeMasterGraphVersionParam, (float)RudeMasterGraphVersion, 740);
 	auto* SpecInt = Scalar(TEXT("specularIntensityMult"), 0.42f, 800);
-	Scalar(TEXT("specularFalloffMult"), 100.f, 860);
-	Scalar(TEXT("bumpiness"), 1.f, 920);
-	Scalar(TEXT("materialWetnessMultiplier"), 0.f, 980);
-	Scalar(TEXT("bumpSelfShadowAmount"), 0.f, 1040);
 	// Matt's calibration: ground surfaces sit around 0.35-0.5 specular. Terrain IS ground, so the
 	// default matches the flat value the generated masters use for spec-less presets.
 	EO->Specular.Expression = SpecInt;
+
+	// ---- WIRED, not merely declared (2026-09-11) -------------------------------------------------
+	// This block used to DECLARE bumpiness / specularFalloffMult / materialWetnessMultiplier /
+	// bumpSelfShadowAmount and connect none of them, on a master that also had no staleness rule -
+	// so it never even reached disk, and terrain bound nothing at all. Two of the four have an
+	// honest home in UE and are wired here; the other two do not, and are NO LONGER ADVERTISED.
+	// ⭐ A master that cannot USE a parameter must not EXPOSE it: the importer then counts the value
+	// as unsupported, which is true, instead of binding it into a void and counting it as bound.
+	//   · `bumpiness` (11 distinct values over 131 terrain uses, modal only 42%) -> normal strength.
+	//   · `specularFalloffMult` -> Roughness by the Blinn-Phong identity sqrt(2/(n+2)), replacing a
+	//     flat 0.85 constant that discarded the whole range.
+	//   · `materialWetnessMultiplier` is the MOST varied terrain value measured (74 distinct over
+	//     135 uses) and is dropped anyway - it is a weather term with no static UE equivalent, and
+	//     inventing one would be the "never invent a mechanism the format lacks" mistake.
+	//   · `bumpSelfShadowAmount` likewise (self-shadowing is not a scalar in UE's shading model).
+	auto* TerBump = Scalar(TEXT("bumpiness"), 1.f, 920);
+	auto* TerFlat = NewObject<UMaterialExpressionConstant3Vector>(M);
+	TerFlat->Constant = FLinearColor(0.f, 0.f, 1.f);
+	TerFlat->MaterialExpressionEditorX = -700; TerFlat->MaterialExpressionEditorY = 980;
+	M->GetExpressionCollection().AddExpression(TerFlat);
+	auto* TerN = NewObject<UMaterialExpressionLinearInterpolate>(M);
+	TerN->A.Expression = TerFlat; TerN->B.Expression = Chain(N, 400); TerN->Alpha.Expression = TerBump;
+	TerN->MaterialExpressionEditorX = -500; TerN->MaterialExpressionEditorY = 900;
+	M->GetExpressionCollection().AddExpression(TerN);
+	EO->Normal.Expression = TerN;
+
+	auto* TerFall = Scalar(TEXT("specularFalloffMult"), 100.f, 860);
+	auto* TerTwo = NewObject<UMaterialExpressionConstant>(M);
+	TerTwo->R = 2.f;
+	TerTwo->MaterialExpressionEditorX = -1000; TerTwo->MaterialExpressionEditorY = 700;
+	M->GetExpressionCollection().AddExpression(TerTwo);
+	auto* TerAdd = NewObject<UMaterialExpressionAdd>(M);
+	TerAdd->A.Expression = TerFall; TerAdd->B.Expression = TerTwo;
+	TerAdd->MaterialExpressionEditorX = -850; TerAdd->MaterialExpressionEditorY = 860;
+	M->GetExpressionCollection().AddExpression(TerAdd);
+	auto* TerDiv = NewObject<UMaterialExpressionDivide>(M);
+	TerDiv->A.Expression = TerTwo; TerDiv->B.Expression = TerAdd;
+	TerDiv->MaterialExpressionEditorX = -700; TerDiv->MaterialExpressionEditorY = 860;
+	M->GetExpressionCollection().AddExpression(TerDiv);
+	auto* TerRough = NewObject<UMaterialExpressionSquareRoot>(M);
+	TerRough->Input.Expression = TerDiv;
+	TerRough->MaterialExpressionEditorX = -550; TerRough->MaterialExpressionEditorY = 860;
+	M->GetExpressionCollection().AddExpression(TerRough);
+	EO->Roughness.Expression = TerRough;
 
 	// ⛔ NOT IMPLEMENTED, AND DELIBERATELY NOT FAKED: heightMapSamplerLayer0-3 with their
 	// heightScale0-3 / heightBias0-3 / parallaxSelfShadowAmount. The measured scales are ~0.015-0.03
@@ -4583,13 +4793,23 @@ FString URudeToolset::RegenerateMasters()
 	// Both generators are idempotent - they return the existing asset untouched when it is healthy -
 	// so calling them unconditionally costs nothing when there is nothing to do. They are NOT counted
 	// in `masters`/`unparsed`, which stay the generated family's numbers.
-	for (int32 NamedIdx = 0; NamedIdx < 2; ++NamedIdx)
+	// ⭐ FOUR, not two, as of 2026-09-11. Foliage and Terrain were left out because neither had a
+	// staleness rule to act on - and that is precisely why both were frozen at their July graphs and
+	// bound no shader values at all. They have rules now, so they are repairable, so they are
+	// repaired HERE rather than only when an import happens to need one.
+	static const TCHAR* kNamedMasters[4] = { TEXT("M_RUDE_Detail"), TEXT("M_RUDE_Cutout"),
+	                                         TEXT("M_RUDE_Foliage"), TEXT("M_RUDE_Terrain") };
+	for (int32 NamedIdx = 0; NamedIdx < 4; ++NamedIdx)
 	{
-		const TCHAR* Named = NamedIdx == 0 ? TEXT("M_RUDE_Detail") : TEXT("M_RUDE_Cutout");
+		const TCHAR* Named = kNamedMasters[NamedIdx];
 		const FString NamedPath = FString::Printf(TEXT("/RUDE/Masters/%s.%s"), Named, Named);
 		UMaterial* Before = LoadObject<UMaterial>(nullptr, *NamedPath);
 		const bool bWasDirty = Before && Before->GetOutermost()->IsDirty();
-		UMaterialInterface* After = NamedIdx == 0 ? EnsureDetailMaster() : EnsureCutoutMaster();
+		UMaterialInterface* After =
+			  NamedIdx == 0 ? EnsureDetailMaster()
+			: NamedIdx == 1 ? EnsureCutoutMaster()
+			: NamedIdx == 2 ? EnsureFoliageMaster()
+			:                 EnsureTerrainMaster();
 		if (After && After->GetOutermost()->IsDirty() && !bWasDirty)
 		{
 			++RegeneratedNamed;
@@ -4611,6 +4831,31 @@ FString URudeToolset::RegenerateMasters()
 	// read as a passed one.
 	int32 CompileFailed = -1;
 	FString FailedNames;
+	// ⛔ AND THE INERT-PARAMETER SCAN, which needs no renderer at all - it is a graph question, not a
+	// shader one. A parameter the importer can bind but that reaches no output is a value read from
+	// the game and thrown away, and nothing we had would have said so (see RudeInertParameters).
+	int32 InertTotal = 0;
+	FString InertJson;
+	{
+		TArray<FAssetData> ScanAssets;
+		ARM.Get().ScanPathsSynchronous({ TEXT("/RUDE/Masters") }, true);
+		ARM.Get().GetAssetsByPath(FName(TEXT("/RUDE/Masters")), ScanAssets, /*bRecursive*/ true);
+		for (const FAssetData& AD : ScanAssets)
+		{
+			const FString N = AD.AssetName.ToString();
+			if (!N.StartsWith(TEXT("M_RUDE_"))) { continue; }
+			UMaterial* Mat = LoadObject<UMaterial>(nullptr, *(AD.PackageName.ToString() + TEXT(".") + N));
+			if (!Mat) { continue; }
+			const TArray<FString> Inert = RudeInertParameters(Mat);
+			if (Inert.Num() == 0) { continue; }
+			InertTotal += Inert.Num();
+			FString Names2;
+			for (const FString& Nm : Inert) { Names2 += FString::Printf(TEXT("%s\"%s\""), Names2.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(Nm)); }
+			InertJson += FString::Printf(TEXT("%s{\"master\":\"%s\",\"params\":[%s]}"),
+				InertJson.IsEmpty() ? TEXT("") : TEXT(","), *RudeJsonEscape(N), *Names2);
+			UE_LOG(LogTemp, Warning, TEXT("[RUDE] master %s declares %d parameter(s) that reach no output"), *N, Inert.Num());
+		}
+	}
 	if (FApp::CanEverRender())
 	{
 		if (GShaderCompilingManager) { GShaderCompilingManager->FinishAllCompilation(); }
@@ -4644,8 +4889,8 @@ FString URudeToolset::RegenerateMasters()
 
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"masters\":%d,\"regenerated\":%d,\"regeneratedNamed\":%d,\"unparsed\":%d,\"compileFailed\":%d,")
-		TEXT("\"compileChecked\":%s,\"failed\":[%s],\"names\":[%s]}"),
-		(Seen > 0 && CompileFailed <= 0) ? TEXT("true") : TEXT("false"), Seen, Regenerated, RegeneratedNamed, Unparsed,
-		CompileFailed, CompileFailed >= 0 ? TEXT("true") : TEXT("false"), *FailedNames, *Names);
+		TEXT("\"compileChecked\":%s,\"inertParameters\":%d,\"inert\":[%s],\"failed\":[%s],\"names\":[%s]}"),
+		(Seen > 0 && CompileFailed <= 0 && InertTotal == 0) ? TEXT("true") : TEXT("false"), Seen, Regenerated, RegeneratedNamed, Unparsed,
+		CompileFailed, CompileFailed >= 0 ? TEXT("true") : TEXT("false"), InertTotal, *InertJson, *FailedNames, *Names);
 }
 
