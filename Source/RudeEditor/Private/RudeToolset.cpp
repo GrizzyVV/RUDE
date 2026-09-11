@@ -332,6 +332,26 @@ struct FRudeMasterSpec
 static const int32 RudeMasterGraphVersion = 3;
 static const TCHAR* RudeMasterGraphVersionParam = TEXT("RudeGraphVersion");
 
+// The stamp, read off the EXPRESSION COLLECTION rather than the compiled parameter list: the
+// parameter is deliberately unconnected, and an unreferenced parameter is not guaranteed to survive
+// into the compiled list, but the expression it was built from always does. -1 = no stamp, which is
+// every master generated before the stamp existed.
+static int32 RudeGraphVersionOf(UMaterial* M)
+{
+	if (!M) { return -1; }
+	for (UMaterialExpression* E : M->GetExpressionCollection().Expressions)
+	{
+		if (UMaterialExpressionScalarParameter* SP = Cast<UMaterialExpressionScalarParameter>(E))
+		{
+			if (SP->ParameterName == FName(RudeMasterGraphVersionParam))
+			{
+				return FMath::RoundToInt(SP->DefaultValue);
+			}
+		}
+	}
+	return -1;
+}
+
 // ---- THE definition of "this master RUDE generates is stale" ----------------------------------
 // ONE rule, in ONE place, because there were three and they disagreed: each generator below kept
 // its own condition, and RudeDoctor RESTATED one of them in order to report it - so when the tint
@@ -363,9 +383,21 @@ ERudeMasterHealth RudeGeneratedMasterHealth(UMaterial* M, const FString& AssetNa
 	// The two NAMED masters the generators also upgrade in place.
 	if (AssetName == TEXT("M_RUDE_Detail"))
 	{
-		if (Has(ScalarInfos, TEXT("DetailAmount"))) { return ERudeMasterHealth::Healthy; }
-		OutWhy = TEXT("detail master with no DetailAmount");
-		return ERudeMasterHealth::Stale;
+		if (!Has(ScalarInfos, TEXT("DetailAmount")))
+		{
+			OutWhy = TEXT("detail master with no DetailAmount");
+			return ERudeMasterHealth::Stale;
+		}
+		// ...and the graph version, so a WIRING change regenerates it (law 49). The generated masters
+		// got this on 2026-09-07; leaving the named ones out is what let M_RUDE_Detail keep the
+		// float3 ComponentMask defect for two more days.
+		if (RudeGraphVersionOf(M) != RudeMasterGraphVersion)
+		{
+			OutWhy = FString::Printf(TEXT("graph version %d, builder writes %d"),
+				RudeGraphVersionOf(M), RudeMasterGraphVersion);
+			return ERudeMasterHealth::Stale;
+		}
+		return ERudeMasterHealth::Healthy;
 	}
 	if (AssetName == TEXT("M_RUDE_Cutout"))
 	{
@@ -412,18 +444,7 @@ ERudeMasterHealth RudeGeneratedMasterHealth(UMaterial* M, const FString& AssetNa
 	// compiled parameter list - the expression it was built from always does.
 	// A master with no stamp reads -1, which is every master generated before this rule: stale, and
 	// regenerated in place, so the instances parented to it pick the fix up with no re-import.
-	int32 Stamped = -1;
-	for (UMaterialExpression* E : M->GetExpressionCollection().Expressions)
-	{
-		if (UMaterialExpressionScalarParameter* SP = Cast<UMaterialExpressionScalarParameter>(E))
-		{
-			if (SP->ParameterName == FName(RudeMasterGraphVersionParam))
-			{
-				Stamped = FMath::RoundToInt(SP->DefaultValue);
-				break;
-			}
-		}
-	}
+	const int32 Stamped = RudeGraphVersionOf(M);
 	if (Stamped != RudeMasterGraphVersion)
 	{
 		OutWhy = FString::Printf(TEXT("graph version %d, builder writes %d"),
@@ -826,6 +847,15 @@ static UMaterialInterface* EnsureDetailMaster()
 	Settings->DefaultValue = FLinearColor(1.f, 0.f, 1.f, 1.f);
 	Add(Settings, -1600, -400);
 
+	// THE STAMP (law 49), extended to the named masters 2026-09-10. Without it this master's health
+	// rule is a single probe for DetailAmount, so a change to its WIRING never regenerates it - which
+	// is exactly how it kept the float3 ComponentMask defect after the six generated masters were
+	// fixed, and why RudeDoctor found it still broken two days later.
+	auto* Stamp = NewObject<UMaterialExpressionScalarParameter>(M);
+	Stamp->ParameterName = RudeMasterGraphVersionParam;
+	Stamp->DefaultValue = (float)RudeMasterGraphVersion;
+	Add(Stamp, -1600, -100);
+
 	auto* Amount = NewObject<UMaterialExpressionScalarParameter>(M);
 	Amount->ParameterName = TEXT("DetailAmount");
 	Amount->DefaultValue = 0.f;          // \u26d4 neutral until a detail texture really bound
@@ -834,9 +864,15 @@ static UMaterialInterface* EnsureDetailMaster()
 	// Detail UV = TexCoord * detailSettings.zw
 	auto* UV = NewObject<UMaterialExpressionTextureCoordinate>(M);
 	Add(UV, -1600, -100);
-	auto* TileZW = NewObject<UMaterialExpressionComponentMask>(M);
-	TileZW->Input.Expression = Settings;
-	TileZW->R = false; TileZW->G = false; TileZW->B = true; TileZW->A = true;
+	// Same defect as the generated masters carried (law 52): a ComponentMask over a VectorParameter's
+	// DEFAULT output asks a float3 for its fourth component and the compiler rejects the WHOLE
+	// material, which then silently becomes the DEFAULT material. Found 2026-09-10 by RudeDoctor's new
+	// compile check on its FIRST run - RegenerateMasters walks /RUDE/Masters/Gen only and never
+	// touches the named masters, so fixing the six generated ones left this seventh one broken.
+	// Channels come off their own pins (1=R 2=G 3=B 4=A) and are appended.
+	auto* TileZW = NewObject<UMaterialExpressionAppendVector>(M);
+	TileZW->A.Connect(3, Settings);   // detailSettings.z - tile U
+	TileZW->B.Connect(4, Settings);   // detailSettings.w - tile V
 	Add(TileZW, -1400, -400);
 	auto* UVMul = NewObject<UMaterialExpressionMultiply>(M);
 	UVMul->A.Expression = UV; UVMul->B.Expression = TileZW;
@@ -2939,11 +2975,35 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 					{
 						if (P->GetAttribute(TEXT("type")) == TEXT("Vector"))
 						{
-							// Only the FIRST float4 is taken here: every parameter RUDE currently
-							// understands is a single vec4, and silently averaging an array would
-							// invent a value. Multi-vec4 params stay in the XML for later.
-							if (const FXmlNode* V = P->FindChildNode(TEXT("Value")))
+							// (2026-09-10) A `type="Vector"` parameter carries x/y/z/w AS ATTRIBUTES ON
+							// ITSELF and is self-closing:
+							//     <Item name="detailSettings" type="Vector" x="0.4" y="0.2" z="9" w="9" />
+							// This used to look for a `<Value>` CHILD instead, which only ever appears
+							// under `type="Array"` (the multi-vec4 form, e.g. gCloudViewProj). So the
+							// branch could never fire and EVERY vector shader parameter was silently
+							// dropped: measured over a 400-file sample, 7,013 of 7,013 use the attribute
+							// form and not one uses a `<Value>` child. The visible cost was detailSettings
+							// - the detail overlay's STRENGTH (.x) and TILING (.zw) - falling back to the
+							// master's placeholder (1, 0, 1, 1), so every detail surface ran at FULL
+							// strength and 1x tiling instead of the authored 0.15-0.4 at 8-9x. Ground and
+							// roads across downtown came out a lurid mottle the moment the masters were
+							// repaired and the overlay actually ran (law 52).
+							// ⛔ `type="Array"` is still NOT read: silently averaging or taking the first
+							// of a multi-vec4 would invent a value. It stays in the XML, unbound and
+							// counted, exactly as before.
+							const FString XAttr = P->GetAttribute(TEXT("x"));
+							if (!XAttr.IsEmpty())
 							{
+								const FVector4 Val(
+									FCString::Atof(*XAttr),
+									FCString::Atof(*P->GetAttribute(TEXT("y"))),
+									FCString::Atof(*P->GetAttribute(TEXT("z"))),
+									FCString::Atof(*P->GetAttribute(TEXT("w"))));
+								Def.Values.Add(P->GetAttribute(TEXT("name")), Val);
+							}
+							else if (const FXmlNode* V = P->FindChildNode(TEXT("Value")))
+							{
+								// Kept for any writer that emits the child form; unused by this corpus.
 								const FVector4 Val(
 									FCString::Atof(*V->GetAttribute(TEXT("x"))),
 									FCString::Atof(*V->GetAttribute(TEXT("y"))),
@@ -4425,7 +4485,7 @@ FString URudeToolset::RegenerateMasters()
 	ARM.Get().ScanPathsSynchronous({ TEXT("/RUDE/Masters/Gen") }, true);
 	TArray<FAssetData> Assets;
 	ARM.Get().GetAssetsByPath(FName(TEXT("/RUDE/Masters/Gen")), Assets, false);
-	int32 Seen = 0, Regenerated = 0, Unparsed = 0;
+	int32 Seen = 0, Regenerated = 0, Unparsed = 0, RegeneratedNamed = 0;
 	FString Names;
 	for (const FAssetData& AD : Assets)
 	{
@@ -4458,6 +4518,30 @@ FString URudeToolset::RegenerateMasters()
 			Names += FString::Printf(TEXT("%s\"%s\""), Names.IsEmpty() ? TEXT("") : TEXT(","), *N);
 		}
 	}
+	// ⭐ THE NAMED MASTERS WITH AN UPGRADE RULE, repaired here too (2026-09-10).
+	// This tool used to walk /RUDE/Masters/Gen ONLY, and the doctor said so in its own advice. That
+	// was survivable while the named masters' rules were single parameter probes, because nothing
+	// could make them stale. Once they carry a graph version (law 49) a WIRING change makes them
+	// stale, and reporting a fault no tool can repair is a worse deal than not reporting it:
+	// M_RUDE_Detail kept the float3 ComponentMask defect for two days after the generated six were
+	// fixed, and the only way to repair it was to import something that happened to need it.
+	// Both generators are idempotent - they return the existing asset untouched when it is healthy -
+	// so calling them unconditionally costs nothing when there is nothing to do. They are NOT counted
+	// in `masters`/`unparsed`, which stay the generated family's numbers.
+	for (int32 NamedIdx = 0; NamedIdx < 2; ++NamedIdx)
+	{
+		const TCHAR* Named = NamedIdx == 0 ? TEXT("M_RUDE_Detail") : TEXT("M_RUDE_Cutout");
+		const FString NamedPath = FString::Printf(TEXT("/RUDE/Masters/%s.%s"), Named, Named);
+		UMaterial* Before = LoadObject<UMaterial>(nullptr, *NamedPath);
+		const bool bWasDirty = Before && Before->GetOutermost()->IsDirty();
+		UMaterialInterface* After = NamedIdx == 0 ? EnsureDetailMaster() : EnsureCutoutMaster();
+		if (After && After->GetOutermost()->IsDirty() && !bWasDirty)
+		{
+			++RegeneratedNamed;
+			Names += FString::Printf(TEXT("%s\"%s\""), Names.IsEmpty() ? TEXT("") : TEXT(","), Named);
+		}
+	}
+
 	// ⛔⛔ DID IT ACTUALLY COMPILE? (law 52, added 2026-09-08 because nothing asked.)
 	// A material that fails to compile does not error, does not refuse and does not disappear - the
 	// engine logs one warning and silently substitutes the DEFAULT material, which reads NO parameters
@@ -4476,7 +4560,14 @@ FString URudeToolset::RegenerateMasters()
 	{
 		if (GShaderCompilingManager) { GShaderCompilingManager->FinishAllCompilation(); }
 		CompileFailed = 0;
-		for (const FAssetData& AD : Assets)
+		// A SECOND, WIDER scan: /RUDE/Masters recursively, so the named masters are checked as well.
+		// The parse loop above deliberately stays on /RUDE/Masters/Gen, because `masters` and
+		// `unparsed` describe the generated family and a named master is not "unparsed", it is simply
+		// not that family.
+		TArray<FAssetData> AllMasterAssets;
+		ARM.Get().ScanPathsSynchronous({ TEXT("/RUDE/Masters") }, true);
+		ARM.Get().GetAssetsByPath(FName(TEXT("/RUDE/Masters")), AllMasterAssets, /*bRecursive*/ true);
+		for (const FAssetData& AD : AllMasterAssets)
 		{
 			const FString N = AD.AssetName.ToString();
 			if (!N.StartsWith(TEXT("M_RUDE_"))) { continue; }
@@ -4497,9 +4588,9 @@ FString URudeToolset::RegenerateMasters()
 	}
 
 	return FString::Printf(
-		TEXT("{\"ok\":%s,\"masters\":%d,\"regenerated\":%d,\"unparsed\":%d,\"compileFailed\":%d,")
+		TEXT("{\"ok\":%s,\"masters\":%d,\"regenerated\":%d,\"regeneratedNamed\":%d,\"unparsed\":%d,\"compileFailed\":%d,")
 		TEXT("\"compileChecked\":%s,\"failed\":[%s],\"names\":[%s]}"),
-		(Seen > 0 && CompileFailed <= 0) ? TEXT("true") : TEXT("false"), Seen, Regenerated, Unparsed,
+		(Seen > 0 && CompileFailed <= 0) ? TEXT("true") : TEXT("false"), Seen, Regenerated, RegeneratedNamed, Unparsed,
 		CompileFailed, CompileFailed >= 0 ? TEXT("true") : TEXT("false"), *FailedNames, *Names);
 }
 

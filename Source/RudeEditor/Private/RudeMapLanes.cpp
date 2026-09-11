@@ -81,6 +81,7 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Engine/LevelStreaming.h"
 #include "ShaderCompiler.h"
+#include "MaterialShared.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "RudeToolsetInternal.h"
@@ -4137,6 +4138,43 @@ FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
 		Note(FString::Printf(TEXT("named master(s) %s are stale by the generator's own rule - RegenerateMasters does NOT cover them (it walks /RUDE/Masters/Gen only); the next import that needs one regenerates it in place"), *StaleNamed));
 	}
 
+	// ---- DID THE MASTERS ACTUALLY COMPILE? (law 52) ------------------------------------------
+	// A material that fails to compile does not error and does not disappear - the engine logs one
+	// warning and substitutes the DEFAULT material, which reads NO parameters. Measured 2026-09-08:
+	// all 6 generated masters with a detail texture were in that state, and 990 of 12,374 material
+	// instances (8.0%) were parented to one of them - including the downtown GROUND, the plaza and
+	// the tower. Nothing asked, so nothing knew. The doctor asks.
+	// Reported as UNKNOWN (-1), never as clean, when the run has no rendering: a question that could
+	// not be asked must not read as one that passed.
+	int32 MastersCompileFailed = -1;
+	FString CompileFailedNames;
+	if (FApp::CanEverRender())
+	{
+		if (GShaderCompilingManager) { GShaderCompilingManager->FinishAllCompilation(); }
+		MastersCompileFailed = 0;
+		for (const FAssetData& AD : MasterAssets)
+		{
+			const FString AssetName = AD.AssetName.ToString();
+			if (!AssetName.StartsWith(TEXT("M_RUDE_"))) { continue; }
+			UMaterial* Mat = LoadObject<UMaterial>(nullptr, *(AD.PackageName.ToString() + TEXT(".") + AssetName));
+			if (!Mat) { continue; }
+			const FMaterialResource* Res = Mat->GetMaterialResource(GMaxRHIShaderPlatform, EMaterialQualityLevel::Num);
+			if (!Res) { continue; }
+			const TArray<FString>& Errors = Res->GetCompileErrors();
+			if (Errors.Num() > 0)
+			{
+				++MastersCompileFailed;
+				CompileFailedNames += FString::Printf(TEXT("%s\"%s: %s\""),
+					CompileFailedNames.IsEmpty() ? TEXT("") : TEXT(","),
+					*RudeJsonEscape(AssetName), *RudeJsonEscape(Errors[0]));
+			}
+		}
+		if (MastersCompileFailed > 0)
+		{
+			Note(FString::Printf(TEXT("%d master(s) FAIL TO COMPILE - every material instance parented to one of them is rendering as Unreal's default material, which ignores every setting RUDE puts on it. Fix the graph, then RegenerateMasters."), MastersCompileFailed));
+		}
+	}
+
 	// ---- the area catalog --------------------------------------------------------------------
 	const TSharedPtr<IPlugin> Self = PM.FindPlugin(TEXT("RUDE"));
 	FString CatalogPath;
@@ -4243,6 +4281,7 @@ FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
 		TEXT("\"plugins\":[%s],\"pluginsEnabled\":%d,")
 		TEXT("\"mastersMounted\":%s,\"masters\":%d,\"generatedMasters\":%d,\"staleMasters\":%d,")
 		TEXT("\"unparsedMasters\":%d,\"staleMasterNames\":[%s],")
+		TEXT("\"mastersCompileFailed\":%d,\"mastersCompileChecked\":%s,\"compileFailedMasters\":[%s],")
 		TEXT("\"catalogPath\":\"%s\",\"catalogPresent\":%s,\"catalogEntries\":%d,")
 		TEXT("\"corpus\":%s,\"headless\":%s,\"unattended\":%s,\"editorWorld\":%s}"),
 		Problems.Num() == 0 ? TEXT("true") : TEXT("false"), Problems.Num(), *ProblemJson,
@@ -4250,6 +4289,7 @@ FString URudeToolset::RudeDoctor(const FString& CorpusRoot)
 		*PluginJson, EnabledPlugins,
 		bMastersMounted ? TEXT("true") : TEXT("false"), MastersTotal, MastersGen, MastersStale,
 		MastersUnparsed, *StaleNames,
+		MastersCompileFailed, MastersCompileFailed >= 0 ? TEXT("true") : TEXT("false"), *CompileFailedNames,
 		*RudeJsonEscape(CatalogPath), bCatalog ? TEXT("true") : TEXT("false"), CatalogEntries,
 		*CorpusJson, bSlate ? TEXT("false") : TEXT("true"),
 		FApp::IsUnattended() ? TEXT("true") : TEXT("false"), bWorld ? TEXT("true") : TEXT("false"));
