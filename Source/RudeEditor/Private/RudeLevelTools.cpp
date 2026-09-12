@@ -1423,7 +1423,18 @@ FString URudeToolset::ProbeWorldPartitionLevel(const FString& LevelPath)
 	FString MapFile;
 	FPackageName::TryConvertLongPackageNameToFilename(Path, MapFile, FPackageName::GetMapPackageExtension());
 	const bool bMapOnDisk = FPaths::FileExists(MapFile);
-	const bool bOk = bAdded && bSavedMap && bSavedAsset && bMapOnDisk;
+	// ⛔ `bSavedMap` MUST NOT BE PART OF `ok` ON A TAKEOVER, and a regression sweep is what showed it.
+	// `RudeSaveMapUnconditional` reports `wroteMap` by comparing the file's size and timestamp before
+	// and after - the law-50 detector, built to catch a save that silently did nothing. On a WORLD
+	// PARTITION level that detector asks the wrong question: WP keeps its actors in
+	// `__ExternalActors__/`, NOT in the `.umap`, so a second takeover that only adds an actor
+	// legitimately leaves the `.umap` byte-identical and the detector correctly reports "not written".
+	// Requiring it made the SECOND run of an idempotent tool fail while everything it claims to do
+	// had in fact happened: `mapOnDisk true`, `headlessSaved 2`, `headlessSaveFailed 0`.
+	// ⚠ The detector is still right and is still REPORTED - what was wrong is treating "the .umap did
+	// not need to change" as a failure. What `ok` actually needs is: the actor went onto the layer,
+	// the asset saved, the map EXISTS, and nothing failed to save.
+	const bool bOk = bAdded && bSavedAsset && bMapOnDisk && GRudeLastSaveFailed == 0;
 	return FString::Printf(TEXT("{\"ok\":%s,\"worldPartition\":true,\"dataLayerInstance\":\"%s\",\"actorAdded\":%s,")
 		TEXT("\"mapSaved\":%s,\"mapOnDisk\":%s,\"assetSaved\":%s,\"headlessSaved\":%d,\"headlessSaveFailed\":%d,\"map\":\"%s\",\"dataLayerAsset\":\"%s\",")
 		TEXT("\"tookOverExistingLevel\":%s,\"dataLayerAssetReused\":%s,\"dataLayerInstanceReused\":%s,\"takeover\":\"%s\"}"),
