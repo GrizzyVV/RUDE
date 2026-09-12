@@ -1553,6 +1553,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Nudge one water quad by x,y,z centimetres. Name it by its kind (water, calming or wave) and its number in the water file.", RudeAudience="agent"))
 	static FString MoveWaterQuad(const FString& Kind, const FString& Index, const FString& DeltaCm);
 
+	UFUNCTION(BlueprintCallable, Category = "RUDE", meta = (AICallable, RudeHelp="Add a NEW patch of water, calming or wave to the map - one that is not in the game's file at all. Give the edges as minX,maxX,minY,maxY and optionally a height, in GAME METRES."))
+	static FString AddWaterQuad(const FString& Kind, const FString& BoundsM, const FString& Options);
+
 	// Position the level-editor perspective viewport and capture a screenshot -
 	// the agent-vision primitive (verify imports/materials without human eyes at
 	// the machine). CamSpec: "x,y,z,pitch,yaw" (UE cm/degrees; ";" also accepted, because

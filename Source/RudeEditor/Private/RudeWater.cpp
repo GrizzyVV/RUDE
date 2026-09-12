@@ -148,6 +148,84 @@ namespace
 	}
 }
 
+// One `<Item>` in the game's own spelling. ONE writer, used by the rewrite path (a quad that moved) AND
+// the ADD path (a quad that never existed), so a new quad and an edited one cannot drift apart in
+// formatting - which in a splice is exactly the kind of difference that shows up as a diff nobody
+// ordered. The repo's rule: lift, never duplicate.
+static FString RudeWaterItemXml(ERudeWaterQuadKind Kind, const URudeWaterQuadComponent* C,
+                                float MinX, float MaxX, float MinY, float MaxY, float Z)
+{
+	FString T;
+	T += TEXT("<Item>\n");
+	T += FString::Printf(TEXT("      <minX value=\"%g\" />\n"), MinX);
+	T += FString::Printf(TEXT("      <maxX value=\"%g\" />\n"), MaxX);
+	T += FString::Printf(TEXT("      <minY value=\"%g\" />\n"), MinY);
+	T += FString::Printf(TEXT("      <maxY value=\"%g\" />\n"), MaxY);
+	switch (Kind)
+	{
+	case ERudeWaterQuadKind::Water:
+		T += FString::Printf(TEXT("      <Type value=\"%d\" />\n"), C->Type);
+		T += FString::Printf(TEXT("      <IsInvisible value=\"%s\" />\n"), C->bIsInvisible ? TEXT("true") : TEXT("false"));
+		T += FString::Printf(TEXT("      <HasLimitedDepth value=\"%s\" />\n"), C->bHasLimitedDepth ? TEXT("true") : TEXT("false"));
+		T += FString::Printf(TEXT("      <z value=\"%g\" />\n"), Z);
+		T += FString::Printf(TEXT("      <a1 value=\"%d\" />\n"), C->A1);
+		T += FString::Printf(TEXT("      <a2 value=\"%d\" />\n"), C->A2);
+		T += FString::Printf(TEXT("      <a3 value=\"%d\" />\n"), C->A3);
+		T += FString::Printf(TEXT("      <a4 value=\"%d\" />\n"), C->A4);
+		T += FString::Printf(TEXT("      <NoStencil value=\"%s\" />\n"), C->bNoStencil ? TEXT("true") : TEXT("false"));
+		break;
+	case ERudeWaterQuadKind::Calming:
+		T += FString::Printf(TEXT("      <fDampening value=\"%g\" />\n"), C->Dampening);
+		break;
+	case ERudeWaterQuadKind::Wave:
+		T += FString::Printf(TEXT("      <Amplitude value=\"%g\" />\n"), C->Amplitude);
+		T += FString::Printf(TEXT("      <XDirection value=\"%g\" />\n"), C->XDirection);
+		T += FString::Printf(TEXT("      <YDirection value=\"%g\" />\n"), C->YDirection);
+		break;
+	}
+	T += TEXT("    </Item>");
+	return T;
+}
+
+// Spawn one water marker. Shared by ImportWater (a quad read from the file) and AddWaterQuad (a quad
+// that never existed) so both produce the SAME kind of actor - the export cannot then treat them
+// differently by accident.
+static AActor* RudeSpawnWaterMarker(UWorld* World, UStaticMesh* Plane, ERudeWaterQuadKind Kind,
+                                    float MinX, float MaxX, float MinY, float MaxY, float Z,
+                                    URudeWaterQuadComponent*& OutComp)
+{
+	AActor* A = World->SpawnActor<AActor>();
+	if (!A) { OutComp = nullptr; return nullptr; }
+	USceneComponent* Root = NewObject<USceneComponent>(A, TEXT("Root"));
+	A->SetRootComponent(Root);
+	Root->SetMobility(EComponentMobility::Movable);
+	Root->RegisterComponent();
+	A->AddInstanceComponent(Root);
+
+	UStaticMeshComponent* SMC = NewObject<UStaticMeshComponent>(A, TEXT("Quad"));
+	SMC->SetStaticMesh(Plane);
+	SMC->SetMobility(EComponentMobility::Movable);
+	SMC->SetupAttachment(Root);
+	SMC->RegisterComponent();
+	A->AddInstanceComponent(SMC);
+	SMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+	// metres -> cm with the Y mirror; the mirror swaps which bound is the UE minimum
+	const double X0 = MinX * 100.0, X1 = MaxX * 100.0;
+	const double Y0 = -MaxY * 100.0, Y1 = -MinY * 100.0;
+	A->SetActorLocation(FVector((X0 + X1) * 0.5, (Y0 + Y1) * 0.5, Z * 100.0));
+	SMC->SetWorldScale3D(FVector(FMath::Abs(X1 - X0) / 100.0, FMath::Abs(Y1 - Y0) / 100.0, 1.0));
+
+	OutComp = NewObject<URudeWaterQuadComponent>(A, TEXT("WaterQuad"));
+	OutComp->RegisterComponent();
+	A->AddInstanceComponent(OutComp);
+	OutComp->Kind = Kind;
+	A->SetFolderPath(FName(TEXT("RUDE_Water")));
+	A->Tags.Add(kWaterTag);
+	A->Tags.Add(FName(*FString::Printf(TEXT("RUDE_WATER_KIND:%s"), KindWord(Kind))));
+	return A;
+}
+
 // ---- ImportWater ---------------------------------------------------------------------------------
 FString URudeToolset::ImportWater(const FString& CorpusRoot, const FString& Filter)
 {
@@ -326,13 +404,14 @@ FString URudeToolset::ExportWater(const FString& CorpusRoot, const FString& OutD
 	TMap<FString, URudeWaterQuadComponent*> ByKey;
 	TMap<FString, AActor*> ActorByKey;
 	int32 InLevel = 0, Orphans = 0;
+	TArray<URudeWaterQuadComponent*> NewQuads;   // SourceIndex < 0: created by AddWaterQuad, not read from the file
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
 		if (!It->Tags.Contains(kWaterTag)) { continue; }
 		URudeWaterQuadComponent* C = It->FindComponentByClass<URudeWaterQuadComponent>();
 		if (!C) { continue; }
 		++InLevel;
-		if (C->SourceIndex < 0) { ++Orphans; continue; }
+		if (C->SourceIndex < 0) { ++Orphans; NewQuads.Add(C); continue; }   // AddWaterQuad's: appended below
 		const FString Key = FString::Printf(TEXT("%s/%d"), KindWord(C->Kind), C->SourceIndex);
 		ByKey.Add(Key, C);
 		ActorByKey.Add(Key, *It);
@@ -391,38 +470,50 @@ FString URudeToolset::ExportWater(const FString& CorpusRoot, const FString& OutD
 			const bool bFieldsSame = C->FieldsKey() == C->SourceFieldsKey;
 			if (bGeomSame && bFieldsSame) { ++Carried; continue; }
 
-			FString T;
-			T += TEXT("<Item>\n");
-			T += FString::Printf(TEXT("      <minX value=\"%g\" />\n"), MinX);
-			T += FString::Printf(TEXT("      <maxX value=\"%g\" />\n"), MaxX);
-			T += FString::Printf(TEXT("      <minY value=\"%g\" />\n"), MinY);
-			T += FString::Printf(TEXT("      <maxY value=\"%g\" />\n"), MaxY);
-			switch (Sec.Kind)
-			{
-			case ERudeWaterQuadKind::Water:
-				T += FString::Printf(TEXT("      <Type value=\"%d\" />\n"), C->Type);
-				T += FString::Printf(TEXT("      <IsInvisible value=\"%s\" />\n"), C->bIsInvisible ? TEXT("true") : TEXT("false"));
-				T += FString::Printf(TEXT("      <HasLimitedDepth value=\"%s\" />\n"), C->bHasLimitedDepth ? TEXT("true") : TEXT("false"));
-				T += FString::Printf(TEXT("      <z value=\"%g\" />\n"), Z);
-				T += FString::Printf(TEXT("      <a1 value=\"%d\" />\n"), C->A1);
-				T += FString::Printf(TEXT("      <a2 value=\"%d\" />\n"), C->A2);
-				T += FString::Printf(TEXT("      <a3 value=\"%d\" />\n"), C->A3);
-				T += FString::Printf(TEXT("      <a4 value=\"%d\" />\n"), C->A4);
-				T += FString::Printf(TEXT("      <NoStencil value=\"%s\" />\n"), C->bNoStencil ? TEXT("true") : TEXT("false"));
-				break;
-			case ERudeWaterQuadKind::Calming:
-				T += FString::Printf(TEXT("      <fDampening value=\"%g\" />\n"), C->Dampening);
-				break;
-			case ERudeWaterQuadKind::Wave:
-				T += FString::Printf(TEXT("      <Amplitude value=\"%g\" />\n"), C->Amplitude);
-				T += FString::Printf(TEXT("      <XDirection value=\"%g\" />\n"), C->XDirection);
-				T += FString::Printf(TEXT("      <YDirection value=\"%g\" />\n"), C->YDirection);
-				break;
-			}
-			T += TEXT("    </Item>");
+			const FString T = RudeWaterItemXml(Sec.Kind, C, MinX, MaxX, MinY, MaxY, Z);
 			Edits.Add({ Items[i].Start, Items[i].End, T });
 			++Rewritten;
 		}
+	}
+
+	// ---- quads that never existed: APPENDED at the end of their own section -------------------
+	// An insertion is a zero-length edit, so it rides the same descending-offset splice as every
+	// rewrite and needs no second pass. A new quad's transform IS its bounds, exactly as for an
+	// imported one - there is no source row to compare against, so nothing is "carried" here.
+	int32 Added = 0;
+	for (int32 si = 0; si < 3; ++si)
+	{
+		const FWaterSection& Sec = kSections[si];
+		TArray<FRawItem> Items;
+		int32 SS = 0, SE = 0;
+		if (!SectionItems(Doc, Sec.Tag, Items, SS, SE)) { continue; }
+		FString Insert;
+		for (URudeWaterQuadComponent* C : NewQuads)
+		{
+			if (!C || C->Kind != Sec.Kind) { continue; }
+			AActor* A = C->GetOwner();
+			float MinX = C->SourceMinX, MaxX = C->SourceMaxX, MinY = C->SourceMinY, MaxY = C->SourceMaxY, Z = C->SourceZ;
+			if (A)
+			{
+				const FVector Loc = A->GetActorLocation();
+				FVector Scale(1, 1, 1);
+				if (UStaticMeshComponent* SMC = A->FindComponentByClass<UStaticMeshComponent>())
+				{
+					Scale = SMC->GetComponentScale();
+				}
+				const double HalfX = FMath::Abs(Scale.X) * 100.0 * 0.5;
+				const double HalfY = FMath::Abs(Scale.Y) * 100.0 * 0.5;
+				MinX = (float)((Loc.X - HalfX) / 100.0);
+				MaxX = (float)((Loc.X + HalfX) / 100.0);
+				MinY = (float)(-(Loc.Y + HalfY) / 100.0);
+				MaxY = (float)(-(Loc.Y - HalfY) / 100.0);
+				Z = (float)(Loc.Z / 100.0);
+			}
+			if (MaxX < MinX || MaxY < MinY) { ++Inverted; }
+			Insert += TEXT("    ") + RudeWaterItemXml(Sec.Kind, C, MinX, MaxX, MinY, MaxY, Z) + TEXT("\n");
+			++Added;
+		}
+		if (!Insert.IsEmpty()) { Edits.Add({ SE, SE, Insert }); }
 	}
 
 	Edits.Sort([](const FEdit& A, const FEdit& B) { return A.Start > B.Start; });
@@ -433,8 +524,20 @@ FString URudeToolset::ExportWater(const FString& CorpusRoot, const FString& OutD
 
 	// ⛔ THE CONSERVATION IDENTITY: every slot the FILE has is either carried or rewritten. If those
 	// do not add up, the export moved something it cannot name and the count says so.
+	// ⛔ THE IDENTITY IS ABOUT THE FILE'S OWN ROWS, and an appended quad must not be allowed to
+	// flatter it: `carried + rewritten` still has to equal the slot count the file HAD. Additions are
+	// counted separately and checked separately - the output must hold exactly slotsInFile + added
+	// items, which is re-counted from the written text rather than assumed.
 	const int32 Accounted = Carried + Rewritten;
-	const bool bConserved = (Accounted == SlotsTotal);
+	bool bConserved = (Accounted == SlotsTotal);
+	int32 ItemsInOutput = 0;
+	for (int32 si = 0; si < 3; ++si)
+	{
+		TArray<FRawItem> OutItems;
+		int32 A2 = 0, B2 = 0;
+		if (SectionItems(Out, kSections[si].Tag, OutItems, A2, B2)) { ItemsInOutput += OutItems.Num(); }
+	}
+	if (ItemsInOutput != SlotsTotal + Added) { bConserved = false; }
 	const bool bIdentical = Out.Equals(Doc, ESearchCase::CaseSensitive);
 	const bool bExpectIdentical = Expect.Equals(TEXT("identical"));
 	const bool bExpectEdited = Expect.Equals(TEXT("edited"));
@@ -454,15 +557,95 @@ FString URudeToolset::ExportWater(const FString& CorpusRoot, const FString& OutD
 
 	return FString::Printf(
 		TEXT("{\"ok\":%s,\"source\":\"%s\",\"out\":\"%s\",\"slotsInFile\":%d,\"quadsInLevel\":%d,")
-		TEXT("\"carriedVerbatim\":%d,\"rewritten\":%d,\"notInLevel\":%d,\"orphans\":%d,\"invertedBounds\":%d,")
+		TEXT("\"carriedVerbatim\":%d,\"rewritten\":%d,\"added\":%d,\"itemsInOutput\":%d,\"notInLevel\":%d,\"orphans\":%d,\"invertedBounds\":%d,")
 		TEXT("\"accountedFor\":%d,\"conserved\":%s,\"identicalToSource\":%s,\"expect\":\"%s\",")
 		TEXT("\"note\":\"a splice, not a regeneration: an untouched quad goes back as its own bytes. A quad "
 		     "missing from the level keeps its original bytes too - this lane will not DELETE water by "
 		     "omission. carriedVerbatim + rewritten must equal slotsInFile.\"}"),
 		bMet ? TEXT("true") : TEXT("false"), *RudeJsonEscape(XmlPath), *RudeJsonEscape(Written),
-		SlotsTotal, InLevel, Carried, Rewritten, NotInLevel, Orphans, Inverted,
+		SlotsTotal, InLevel, Carried, Rewritten, Added, ItemsInOutput, NotInLevel, Orphans, Inverted,
 		Accounted, bConserved ? TEXT("true") : TEXT("false"),
 		bIdentical ? TEXT("true") : TEXT("false"), *RudeJsonEscape(Expect));
+}
+
+// ---- AddWaterQuad ---------------------------------------------------------------------------
+// Water RUDE can CREATE, not only move. A DCC that can shift the ocean but cannot put a pool in a
+// courtyard is not authoring water, it is editing someone else's.
+//
+// ⚠ BOUNDS ARE IN GTA METRES, the file's own units and its own field names - `minX,maxX,minY,maxY,z`.
+// Every other nudge in RUDE takes centimetres, so this is the exception and it is deliberate: a new
+// quad is being described in the same terms `water.xml` describes every existing one, which is how
+// a number read off the file can be typed straight in. The marker still lands in UE centimetres
+// through the same mirror the import uses, so the two kinds of quad are indistinguishable afterwards.
+FString URudeToolset::AddWaterQuad(const FString& Kind, const FString& BoundsM, const FString& Options)
+{
+	auto Fail = [](const FString& Why) { return FString::Printf(TEXT("{\"ok\":false,\"error\":\"%s\"}"), *RudeJsonEscape(Why)); };
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World) { return Fail(TEXT("no editor world")); }
+
+	const FString K = Kind.TrimStartAndEnd().ToLower();
+	ERudeWaterQuadKind Which;
+	if (K == TEXT("water")) { Which = ERudeWaterQuadKind::Water; }
+	else if (K == TEXT("calming")) { Which = ERudeWaterQuadKind::Calming; }
+	else if (K == TEXT("wave")) { Which = ERudeWaterQuadKind::Wave; }
+	else { return Fail(TEXT("Kind must be water, calming or wave")); }
+
+	TArray<FString> B;
+	BoundsM.TrimStartAndEnd().ParseIntoArray(B, TEXT(","), true);
+	if (B.Num() < 4 || B.Num() > 5)
+	{
+		return Fail(TEXT("BoundsM must be minX,maxX,minY,maxY[,z] in GTA metres - the file's own fields"));
+	}
+	const float MinX = FCString::Atof(*B[0]), MaxX = FCString::Atof(*B[1]);
+	const float MinY = FCString::Atof(*B[2]), MaxY = FCString::Atof(*B[3]);
+	const float Z = B.Num() == 5 ? FCString::Atof(*B[4]) : 0.f;
+	// ⛔ The game's own files are min<max on every one of the 1,162 quads measured. A reversed pair
+	// makes a quad of negative extent that still reads plausibly in a verdict, so it is refused here
+	// rather than written and counted later.
+	if (MaxX <= MinX || MaxY <= MinY)
+	{
+		return Fail(FString::Printf(TEXT("bounds must have min < max on both axes (got x %g..%g, y %g..%g)"),
+			MinX, MaxX, MinY, MaxY));
+	}
+
+	UStaticMesh* Plane = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
+	if (!Plane) { return Fail(TEXT("/Engine/BasicShapes/Plane is missing - cannot draw the quad")); }
+
+	URudeWaterQuadComponent* C = nullptr;
+	AActor* A = RudeSpawnWaterMarker(World, Plane, Which, MinX, MaxX, MinY, MaxY, Z, C);
+	if (!A || !C) { return Fail(TEXT("spawn failed")); }
+
+	// SourceIndex stays -1: that IS the mark of a quad with no row in the file, and it is what tells
+	// ExportWater to append rather than splice.
+	C->SourceIndex = -1;
+	C->SourceMinX = MinX; C->SourceMaxX = MaxX; C->SourceMinY = MinY; C->SourceMaxY = MaxY; C->SourceZ = Z;
+
+	// per-kind fields, defaulted to the game's own modal values where one was measured
+	TArray<FString> Parts;
+	Options.ParseIntoArray(Parts, TEXT(";"), true);
+	for (const FString& P : Parts)
+	{
+		FString Key, V;
+		if (!P.Split(TEXT("="), &Key, &V)) { continue; }
+		Key = Key.TrimStartAndEnd().ToLower(); V = V.TrimStartAndEnd();
+		if (Key == TEXT("type")) { C->Type = FCString::Atoi(*V); }
+		else if (Key == TEXT("invisible")) { C->bIsInvisible = V.ToBool(); }
+		else if (Key == TEXT("limiteddepth")) { C->bHasLimitedDepth = V.ToBool(); }
+		else if (Key == TEXT("nostencil")) { C->bNoStencil = V.ToBool(); }
+		else if (Key == TEXT("alpha")) { const int32 N = FCString::Atoi(*V); C->A1 = C->A2 = C->A3 = C->A4 = N; }
+		else if (Key == TEXT("dampening")) { C->Dampening = FCString::Atof(*V); }
+		else if (Key == TEXT("amplitude")) { C->Amplitude = FCString::Atof(*V); }
+		else if (Key == TEXT("xdir")) { C->XDirection = FCString::Atof(*V); }
+		else if (Key == TEXT("ydir")) { C->YDirection = FCString::Atof(*V); }
+	}
+	C->SourceFieldsKey = C->FieldsKey();
+	A->SetActorLabel(FString::Printf(TEXT("WATER_%s_NEW_%d"), KindWord(Which), A->GetUniqueID() & 0xFFFF));
+
+	return FString::Printf(
+		TEXT("{\"ok\":true,\"kind\":\"%s\",\"actor\":\"%s\",\"boundsM\":[%g,%g,%g,%g],\"zM\":%g,\"new\":true,")
+		TEXT("\"note\":\"a quad with NO row in water.xml - ExportWater appends it. Bounds are GTA metres, the "
+		     "file's own units; every other nudge in RUDE is centimetres.\"}"),
+		*K, *RudeJsonEscape(A->GetActorLabel()), MinX, MaxX, MinY, MaxY, Z);
 }
 
 // ---- MoveWaterQuad -------------------------------------------------------------------------------
