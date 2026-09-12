@@ -4184,6 +4184,29 @@ FString ImportDrawableNode(const FXmlNode* DrawableRoot, const FString& MeshName
 						++ValueParamsUnsupported;
 					}
 				}
+				// ---- AlphaTest is not a shader PARAMETER in UE, it is a material PROPERTY ---------
+				// The game's cutout threshold. It lands nowhere in the loop above because UE models it
+				// as `OpacityMaskClipValue`, which an instance overrides through BasePropertyOverrides
+				// rather than through a named parameter - so the loop counted it unsupported, correctly,
+				// and the cutout kept UE's default 0.333 regardless of what the file said.
+				// Measured over a 700-file ydd/yft draw (436 uses, on trees_lod / trees_lod2 /
+				// trees_normal_spec): 0 on 72.5%, **0.5 on 16.7%**, **0.25 on 8.5%**, 1 on 1.1%.
+				// ⛔ ZERO IS NOT A THRESHOLD, IT IS "UNSET", and applying it literally would be a
+				// disaster rather than a subtle error: clipping at 0 discards nothing, so every leaf
+				// card would render as a solid opaque quad. So only a POSITIVE value is honoured, and
+				// the zeros are left to UE's default deliberately - the one reading of this parameter
+				// that cannot be checked from the data is what 0 was intended to mean, so it is not
+				// guessed at.
+				if (const FVector4* AT = Def->Values.Find(TEXT("AlphaTest")))
+				{
+					if (AT->X > 0.f && AT->X <= 1.f && MIC->BlendMode != BLEND_Opaque)
+					{
+						MIC->BasePropertyOverrides.bOverride_OpacityMaskClipValue = true;
+						MIC->BasePropertyOverrides.OpacityMaskClipValue = (float)AT->X;
+						++ValueParamsBound;
+						--ValueParamsUnsupported;
+					}
+				}
 				MIC->PostEditChange();
 				MIPackage->MarkPackageDirty();
 				FAssetRegistryModule::AssetCreated(MIC);

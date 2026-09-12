@@ -3495,8 +3495,19 @@ FString URudeToolset::InspectMesh(const FString& AssetPath)
 				}
 			}
 		}
-		MatsJson += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"master\":\"%s\",\"diffuse\":\"%s\",\"textureParams\":[%s],\"scalarParams\":[%s],\"vectorParams\":[%s]}"), MatsJson.IsEmpty() ? TEXT("") : TEXT(","),
-			*RudeJsonEscape(SM.MaterialSlotName.ToString()), *RudeJsonEscape(MatPath), *RudeJsonEscape(Master), *RudeJsonEscape(Diffuse), *Params, *Scalars, *Vectors);
+		// The cutout threshold is a material PROPERTY, not a named parameter, so it never appeared in
+		// scalarParams and an override was invisible from here. The game's `AlphaTest` lands on it
+		// (positive values only - 0 means unset, and clipping at 0 would render every leaf card solid).
+		FString ClipJson = TEXT("\"inherited\"");
+		if (const UMaterialInstance* AsMI = Cast<UMaterialInstance>(SM.MaterialInterface))
+		{
+			if (AsMI->BasePropertyOverrides.bOverride_OpacityMaskClipValue)
+			{
+				ClipJson = FString::Printf(TEXT("%g"), AsMI->BasePropertyOverrides.OpacityMaskClipValue);
+			}
+		}
+		MatsJson += FString::Printf(TEXT("%s{\"slot\":\"%s\",\"material\":\"%s\",\"master\":\"%s\",\"diffuse\":\"%s\",\"textureParams\":[%s],\"scalarParams\":[%s],\"vectorParams\":[%s],\"opacityMaskClipValue\":%s}"), MatsJson.IsEmpty() ? TEXT("") : TEXT(","),
+			*RudeJsonEscape(SM.MaterialSlotName.ToString()), *RudeJsonEscape(MatPath), *RudeJsonEscape(Master), *RudeJsonEscape(Diffuse), *Params, *Scalars, *Vectors, *ClipJson);
 	}
 	return FString::Printf(TEXT("{\"ok\":true,\"mesh\":\"%s\",\"renderBoundsM\":\"%.1fx%.1fx%.1f\",\"boundsCenterM\":\"%.1f,%.1f,%.1f\",")
 		TEXT("\"lod0Verts\":%d,\"lod0Tris\":%d,\"vertexMinM\":\"%.1f,%.1f,%.1f\",\"vertexMaxM\":\"%.1f,%.1f,%.1f\",")
